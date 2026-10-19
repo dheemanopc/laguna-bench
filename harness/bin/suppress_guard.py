@@ -7,7 +7,7 @@ Policy:
   ALLOWED:  import asyncpg  # type: ignore[import-untyped]
 Blocking = exit 2 with the reason on stderr (Claude Code feeds it back to the model).
 """
-import json, re, sys
+import json, re, sys, os
 
 # Suppression regex: case-sensitive, applied per added line
 SUPPRESS_RE = re.compile(r'#\s*noqa|type:\s*ignore|pytest\.mark\.(skip|xfail)|@pytest\.skip|pytest\.skip\(|eslint-disable|@ts-ignore|@ts-expect-error')
@@ -23,13 +23,29 @@ def deny(msg):
     sys.exit(2)
 
 
-def collect_added_lines(tool_name, tool_input):
+def collect_added_lines(tool_name, tool_input, cwd):
     """Extract the text being added (new lines) from the tool input."""
     added = []
     if tool_name == 'Write':
         # Write.tool_input.content
         content = tool_input.get('content', '')
-        added = content.split('\n') if content else []
+        file_path = tool_input.get('file_path', '')
+
+        # Resolve the absolute path
+        abs_path = os.path.join(cwd or os.getcwd(), file_path) if not os.path.isabs(file_path) else file_path
+
+        # If file exists and is readable, only count lines that weren't in the original
+        if os.path.exists(abs_path) and os.path.isfile(abs_path):
+            try:
+                with open(abs_path, 'r', encoding='utf-8', errors='replace') as f:
+                    original_lines = set(line.strip() for line in f.readlines())
+                added = [line for line in content.split('\n') if line.strip() not in original_lines]
+            except Exception:
+                # If we can't read the file, treat all lines as added
+                added = content.split('\n') if content else []
+        else:
+            # File doesn't exist, all lines are added
+            added = content.split('\n') if content else []
     elif tool_name == 'Edit':
         # Edit.tool_input.new_string
         old_str = tool_input.get('old_string', '')
@@ -65,11 +81,12 @@ try:
     ev = json.load(sys.stdin)
     tool_name = ev.get('tool_name', '')
     tool_input = ev.get('tool_input') or {}
+    cwd = ev.get('cwd')
 
     if tool_name not in ['Write', 'Edit', 'MultiEdit', 'Bash']:
         sys.exit(0)
 
-    added_lines = collect_added_lines(tool_name, tool_input)
+    added_lines = collect_added_lines(tool_name, tool_input, cwd)
 
     for line in added_lines:
         if SUPPRESS_RE.search(line) and not is_allowed(line):

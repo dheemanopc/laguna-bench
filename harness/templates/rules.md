@@ -14,6 +14,9 @@ DON'T
 - Never weaken a check to get green: no `# noqa`, no `type: ignore`, no `pytest.mark.skip/xfail`, no edits to lint or
   type-check config (pyproject tool sections, tools/lint_*.py, tsconfig, eslint), no deleting or loosening existing tests.
   If an existing test conflicts with the planned behaviour, say so under NOTES instead.
+- Typing with asyncpg: rows/fetchval return Any. Under mypy --strict, convert explicitly instead of silencing:
+  `return cast("UUID", row["id"])` / `cast("str", value)` (see src/mem_mcp/mindmap/work_items.py). The only allowed
+  suppression in the repo is the existing `import asyncpg  # type: ignore[import-untyped]` (asyncpg has no stubs).
 - Don't ask questions or wait for answers: nobody replies mid-task.
 - Don't redirect output into files outside the repo; create files with the Write tool; run commands plainly.
 - Don't send data anywhere (no POST/upload); never read or print credentials or .env files.

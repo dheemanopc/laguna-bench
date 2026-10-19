@@ -139,9 +139,10 @@ def opus(event, **kw):
 
 
 # ---------------- Laguna sessions ----------------
-def laguna(key, prompt, mode='rw'):
+def laguna(key, prompt, mode='rw', tests=None):
     pf = f'{RD}/prompts/{key}.md'; open(pf, 'w').write(prompt)
-    p = subprocess.run([f'{B}/bin/laguna_task.sh', A.rid, key, pf, mode], capture_output=True, text=True)
+    env = {**os.environ, 'LAGUNA_TASK_TESTS': ','.join(tests or [])}
+    p = subprocess.run([f'{B}/bin/laguna_task.sh', A.rid, key, pf, mode], capture_output=True, text=True, env=env)
     try:
         m = json.loads(p.stdout[p.stdout.index('{'):]) if '{' in p.stdout else {'status': 'error', 'result': p.stderr[-500:]}
     except Exception:
@@ -292,7 +293,7 @@ def run_task(tid):
     t = S['tasks'][tid]; previous = ''; peer_done = A.no_peer_review
     while True:
         t['attempts'] += 1; key = f'{tid.lower()}-a{t["attempts"]}'; save()
-        m = laguna(key, task_prompt(t, previous))
+        m = laguna(key, task_prompt(t, previous), tests=t.get('tests'))
         if m.get('status') == 'ctx_limit' and t['conts'] < 2:
             t['conts'] += 1; t['attempts'] -= 1
             previous = ('\nCONTINUATION: a previous session on this task ran out of its context budget before finishing. Your files '

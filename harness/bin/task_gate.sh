@@ -31,9 +31,9 @@ if [ ${#PT[@]} -gt 0 ]; then
 else
   [ -n "$TESTS" ] && { fail=1; echo "- tests: FAIL — none of the planned test files exist ($TESTS)"; } || echo "- tests: none planned"
 fi
-# red flags: weakened checks in this task's diff; lint/type config edits anywhere
+# red flags: weakened checks in this task's diff; lint/type config edits anywhere (2026-10-19: allow-list asyncpg import)
 git add -N -- "${F[@]}" 2>/dev/null
-flags=$(git diff -U0 HEAD -- "${F[@]}" 2>/dev/null | grep -E '^\+' | grep -v '^+++' | grep -n -E '#\s*noqa|type:\s*ignore|pytest\.mark\.(skip|xfail)|@pytest\.skip|pytest\.skip\(|eslint-disable|@ts-ignore|@ts-expect-error' | head -5)
+flags=$(git diff -U0 HEAD -- "${F[@]}" 2>/dev/null | grep -E '^\+' | grep -v '^+++' | grep -v -E 'import asyncpg\s+# type: ignore\[import-untyped\]' | grep -n -E '#\s*noqa|type:\s*ignore|pytest\.mark\.(skip|xfail)|@pytest\.skip|pytest\.skip\(|eslint-disable|@ts-ignore|@ts-expect-error' | head -5)
 cfg=$(git status --porcelain -- pyproject.toml setup.cfg mypy.ini ruff.toml tools/ web/tsconfig.json 'web/.eslintrc*' web/eslint.config.mjs 2>/dev/null | head -5)
 if [ -n "$flags$cfg" ]; then fail=1; echo "- RED FLAG: weakened checks or lint/type config changed — remove them (the harness rejects these):"
   [ -n "$flags" ] && echo "$flags" | sed 's/^/    added: /'; [ -n "$cfg" ] && echo "$cfg" | sed 's/^/    config: /'; fi

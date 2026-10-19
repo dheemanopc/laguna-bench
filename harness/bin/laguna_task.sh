@@ -8,6 +8,10 @@
 #     above CTX_LIMIT (default 100k) the session is stopped and the scheduler hands the task to a continuation session
 #   - the path guard (repo + /tmp; GET-only web on a docs allow-list), no MCP, no subagents, user CLAUDE.md excluded
 #   - ro = review mode (read + git diff only)
+# LAGUNA_GUARDS (2026-10-19): when set to 1, enables:
+#   - suppress_guard.py: PreToolUse hook rejecting # noqa, type: ignore, pytest suppressions (except asyncpg import)
+#   - finish_guard.py: Stop hook ensuring planned test files (LAGUNA_TASK_TESTS) exist before finishing
+# LAGUNA_TASK_TESTS (2026-10-19): comma-separated list of planned test file paths; passed to finish_guard hook
 # Writes runs/<id>/t/<key>.json (claude result), <key>.stderr, <key>.meta.json; prints the meta JSON.
 set -uo pipefail
 RID="$1"; KEY="$2"; PROMPT="$3"; MODE="${4:-rw}"; B=$HOME/laguna-bench; RD=$B/runs/$RID; T=$RD/t; mkdir -p $T
@@ -41,9 +45,19 @@ if [ "${LAGUNA_BACKEND:-}" = anthropic ]; then MODEL_ARG=$MODEL; E2=()
   for e in "${ENVV[@]}"; do case "$e" in ANTHROPIC_*|MAX_THINKING_TOKENS=*|CLAUDE_CODE_SUBAGENT_MODEL=*|CLAUDE_CODE_AUTO_COMPACT_WINDOW=*|API_TIMEOUT_MS=*) ;; *) E2+=("$e");; esac; done
   ENVV=("${E2[@]}"); fi
 while IFS= read -r l; do l=${l#export }; [ -n "$l" ] && ENVV+=("${l//\'/}"); done <<< "$DSN"
-SETTINGS=$(jq -nc --arg cmd "python3 $B/bin/path_guard.py $RD/repo" --arg home "$HOME" \
-  '{autoMemoryEnabled:false, claudeMdExcludes:[($home+"/.claude/CLAUDE.md"),"**/.claude/CLAUDE.md"],
-    hooks:{PreToolUse:[{matcher:"Bash|Read|Edit|Write|MultiEdit|Glob|Grep|NotebookEdit|WebFetch",hooks:[{type:"command",command:$cmd}]}]}}')
+# Add test file list and guards flag if present
+[ -n "${LAGUNA_TASK_TESTS:-}" ] && ENVV+=(LAGUNA_TASK_TESTS="$LAGUNA_TASK_TESTS")
+[ "${LAGUNA_GUARDS:-}" = 1 ] && ENVV+=(LAGUNA_GUARDS=1)
+# Build SETTINGS JSON with conditional guards (2026-10-19)
+if [ "${LAGUNA_GUARDS:-}" = 1 ]; then
+  SETTINGS=$(jq -nc --arg cmd "python3 $B/bin/path_guard.py $RD/repo" --arg suppress "python3 $B/bin/suppress_guard.py" --arg finish "python3 $B/bin/finish_guard.py" --arg home "$HOME" \
+    '{autoMemoryEnabled:false, claudeMdExcludes:[($home+"/.claude/CLAUDE.md"),"**/.claude/CLAUDE.md"],
+      hooks:{PreToolUse:[{matcher:"Bash|Read|Edit|Write|MultiEdit|Glob|Grep|NotebookEdit|WebFetch",hooks:[{type:"command",command:$cmd}]},{matcher:"Bash|Edit|Write|MultiEdit",hooks:[{type:"command",command:$suppress}]}],Stop:[{hooks:[{type:"command",command:$finish}]}]}}')
+else
+  SETTINGS=$(jq -nc --arg cmd "python3 $B/bin/path_guard.py $RD/repo" --arg home "$HOME" \
+    '{autoMemoryEnabled:false, claudeMdExcludes:[($home+"/.claude/CLAUDE.md"),"**/.claude/CLAUDE.md"],
+      hooks:{PreToolUse:[{matcher:"Bash|Read|Edit|Write|MultiEdit|Glob|Grep|NotebookEdit|WebFetch",hooks:[{type:"command",command:$cmd}]}]}}')
+fi
 TURNS=()
 if [ "$MODE" = ro ]; then
   # F2-4: a read-only review sprawled to 74 tool calls / 32 min / 156k for a 2-file task -> hard cap turns + context
