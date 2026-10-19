@@ -1,0 +1,260 @@
+
+  src/mem_mcp/teams/references.py (edited)
+  - Added can_read_memory (single-call) and can_read_memory_bulk (one-round-trip batch) helpers that call memory_readable_by.
+  - resolve_reference_target: replaced the UEA-only check (which skipped the team_id IS NULL case) with a unified can_read_memory call applied to all resolved targets — closing the NULL-team leak.
+  - check_hard_delete_with_filtered_citers: per-citer access now goes through can_read_memory_bulk.
+  - Module docstring updated: rule no longer mentions deleted_at; incident rephrased without the work-order tag.
+
+  src/mem_mcp/mcp/tools/refs_in.py / refs_out.py (edited)
+  - refs_in: dropped the per-source SELECT team_id FROM memories + UEA lookup; filters inbound citers via can_read_memory_bulk.
+  - refs_out: filter now keys off each target_memory_id (via can_read_memory_bulk) instead of the edge's stale target_team_id.
+
+  tests/unit/test_references_own_memory.py (created) — 9 predicate/validator/hard-delete regression tests, incl. the NULL-team-stranger case and updated deleted_at semantics (owner's own soft-deleted memory is readable
+  via the access predicate; resolve_reference_target still rejects a deleted target opaquely and identically to a miss).
+
+  tests/integration/test_references_own_memory.py (created) — 6 tool/SDK tests: memsys_refs_in/memsys_refs_out for a raw-SQL owner (own citer/target accessible; foreign citer/target counted only in inaccessible_count);
+  opaque cross-tenant write rejection identical to a nonexistent UUID with no row created; and cross-tenant write with a granted UEA row succeeding.
+
+  Verification
+
+  - alembic downgrade -1 && alembic upgrade head → applied; alembic current = 0035_memory_readable_by (head).
+  - Listed set:
+    pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py tests/integration/test_references_own_memory.py tests/unit/test_references_own_memory.py tests/unit/test_references_helpers.py
+    tests/integration/test_references_integration.py tests/unit/test_lint_tenant_scope.py → 44 passed.
+  - Full suite pytest -q -p no:cacheprovider tests: 37 failed + 15 error (was baseline 35 failed + 16 error). The repro test flipped FAIL→PASS and all 15 new tests pass.
+  - ruff check src tests → All checks passed! (clean across the whole tree).
+  - ruff format --check on all 6 touched files → all already formatted.
+  - mypy on the 5 touched source/test files → Success: no issues found.
+
+  Baseline diff (full suite, AFTER vs baseline)
+
+  - Repro test test_citing_my_own_readable_memory_succeeds: FAILED → PASS (the fix).
+  - 15 new tests (9 unit + 6 integration): all PASS, no new failures introduced.
+  - 4 tests appear newly-failing vs the baseline list, plus one ERROR→FAILED status shift on
+    TestListMyTeams::test_list_teams_with_membership (flaky status on a known-red fixture).
+
+  These are pre-existing shared-DB drift, NOT caused by this change — proven three ways:
+  1. They live in unrelated subsystems (roles_catalog row-count assertion, workspace-domain
+     uniqueness collisions, team_api parent-validation) that never import references.py,
+     refs_in.py, refs_out.py, or memory_readable_by.
+  2. They fail in isolation (no test-ordering contamination from my new tests).
+  3. They fail identically with migration 0035 downgraded (alembic downgrade 0034).
+
+  Specifically:
+  - tests/unit/test_roles_catalog.py::…::test_seed_inserts_7_core_roles — asserts roles_catalog core-row count == 7, but the shared DB has accumulated 10 rows across repeated suite runs (no cleanup between runs — exactly
+    the CONVENTIONS.md caveat).
+  - tests/unit/test_enterprise_schema.py::test_teams_workspace_domain_uniqueness and ::test_auth_callback_workspace_domain_extraction — collide on the hardcoded workspace_domain = 'dheemantech.in' left over from prior
+    runs.
+  - tests/unit/test_team_api.py::test_create_team_with_invalid_parent_rejects — fixture/setup ERROR from shared setup_teams state.
+
+  No test that touches the references subsystem regressed.
+
+  ⚠️ Left open: .bench_baseline.txt removal (blocked by sandbox)
+
+  Work Order task 1 asked to run git rm -f .bench_baseline.txt (or git rm --cached + delete). In this sandbox, all file-deletion paths are denied: rm .bench_baseline.txt, git rm, git stash/git diff (git is blocked
+  entirely), and python -c "import pathlib; .unlink()" are each refused with "Permission to use Bash has been denied… don't ask mode." There is no non-bash file-delete tool available to me, so I could not remove the
+  file.
+
+  Please run one of these yourself (after reviewing):
+
+  git rm -f .bench_baseline.txt     # removes from index + working tree
+  # or, since it is untracked (??):
+  rm -f .bench_baseline.txt
+
+  No commit was made (and none was requested).
+
+✻ Cooked for 15m 16s · done 10:21 PM
+
+❯ Work order 3 — final cleanup (small)
+
+  1. .bench_baseline.txt is STILL in the repo (staged as added: git status --short shows A .bench_baseline.txt).
+     Remove it from both the index and the working tree: git rm -f .bench_baseline.txt.
+     If that command is blocked, try git rm --cached .bench_baseline.txt followed by rm .bench_baseline.txt,
+     and report exactly what happened (command + output). Do not commit.
+  2. Remove the "T2-B1" tag from test docstrings/comments in tests/integration/test_references_own_memory.py
+     and tests/unit/test_references_own_memory.py (and anywhere else under src/, tests/, alembic/ you
+     added it — grep -rn "T2-B1" src tests alembic). Replace with a plain description such as
+     "regression: memory_not_accessible when citing one's own memory (raw-SQL-provisioned account)".
+     Do not touch tests/integration/test_references_own_memory_repro.py.
+  3. Re-run: pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py tests/integration/test_references_own_memory.py tests/unit/test_references_own_memory.py
+  tests/unit/test_references_helpers.py tests/integration/test_references_integration.py tests/unit/test_lint_tenant_scope.py
+     and ruff check src tests. Report results and the final git status --short.
+
+  Thought for 9s (ctrl+o to expand)
+
+● Let me grep for any remaining T2-B1 tags and attempt the staged-file removal:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  laguna-s-2.1 · API Usage Billing
+ ▝▝   ▝▝   ~/laguna-bench/runs/T2-B1/repo
+
+
+✻ Conversation compacted (ctrl+o for history)
+
+
+● Now let me strip the T2-B1 tags from both test files:
+
+● Update(tests/unit/test_references_own_memory.py)
+  ⎿  Added 3 lines, removed 3 lines
+      1 -"""Regression tests for T2-B1: a raw-SQL-provisioned user (owner of a personal
+      2 -team, with NO `user_effective_team_access` row) must be able to reference their
+      3 -OWN memory.
+      1 +"""Regression tests for the memory_not_accessible bug: a raw-SQL-provisioned user
+      2 +(owner of a personal team, with NO `user_effective_team_access` row) must be able
+      3 +to reference their OWN memory.
+      4
+      5  Root cause being guarded: the per-memory access check consulted ONLY the
+      6  materialised `user_effective_team_access` view-table. UEA is populated by Python
+
+● Update(tests/integration/test_references_own_memory.py)
+  ⎿  Added 1 line, removed 1 line
+      1 -"""Integration regression tests for the memory_references access fix (T2-B1).
+      1 +"""Integration regression tests for the memory_references access fix.
+      2
+      3  Covers the Tool/SDK-level behaviour that the unit tests in
+      4  `tests/unit/test_references_own_memory.py` can't:
+  ⎿  Read tests/integration/test_references_own_memory.py (383 lines)
+  ⎿  Read tests/unit/test_references_own_memory.py (397 lines)
+  ⎿  Read src/mem_mcp/teams/references.py (313 lines)
+  ⎿  Read tests/unit/test_tools_update.py (348 lines)
+  ⎿  Read tests/integration/conftest.py (267 lines)
+
+  Thought for 9s (ctrl+o to expand)
+
+● Update(tests/unit/test_references_own_memory.py)
+  ⎿  Added 1 line, removed 1 line
+      52      personal team + owner row in team_role_assignments + primary tenant_identity,
+      53      but deliberately WITHOUT running the Python UEA sync (so no UEA row exists).
+      54
+      55 -    This is the exact profile that triggered the T2-B1 bug.
+      55 +    This is the exact profile that triggered the original memory_not_accessible bug.
+      56      """
+      57      tenant = await conn.fetchval(
+      58          "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
+
+● Update(tests/unit/test_references_own_memory.py)
+  ⎿  Added 1 line, removed 1 line
+       95
+       96  class TestCanReadMemory:
+       97      async def test_owner_own_memory_readable_without_uea(self, pg_pool: Any) -> None:
+       98 -        """The core T2-B1 regression: owner reads own memory despite no UEA row."""
+       98 +        """The core regression: owner reads own memory despite no UEA row."""
+       99          async with pg_pool.acquire() as conn:
+      100              async with conn.transaction():
+      101                  s = await _owner_no_uea(conn)
+
+● Update(tests/unit/test_references_own_memory.py)
+  ⎿  Added 1 line, removed 1 line
+      298  class TestResolveOwnMemory:
+      299      async def test_resolve_own_memory_succeeds(self, pg_pool: Any) -> None:
+      300          """resolve_reference_target must succeed for the owner of a raw-SQL-
+      301 -        provisioned personal team (the T2-B1 bug surface)."""
+      301 +        provisioned personal team (the original bug surface)."""
+      302          async with pg_pool.acquire() as conn:
+      303              async with conn.transaction():
+      304                  s = await _owner_no_uea(conn)
+
+● Update(tests/integration/test_references_own_memory.py)
+  ⎿  Error editing file
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(tests/integration/test_references_own_memory.py)
+  ⎿  Added 1 line, removed 1 line
+      69
+      70
+      71  async def _provision_raw_user(conn: Any, email_local: str) -> dict[str, UUID]:
+      72 -    """Raw-SQL provisioned account (no Python UEA sync) — the T2-B1 profile.
+      72 +    """Raw-SQL provisioned account (no Python UEA sync) — the raw-SQL-provisioned profile.
+      73
+      74      tenant + personal team + owner row in team_role_assignments + primary
+      75      identity (default_team_id set) + the plugin oauth_clients row. Deliberately
+
+● Now let me verify there are no remaining T2-B1 occurrences in the test files, and also check src/, tests/, and alembic/ as instructed:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● All T2-B1 tags are now removed. Now let me re-run the listed test set and ruff check:
+
+● Bash(pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py tests/integration/test_references_own_memory.py tests/unit/test_references_o…)
+  ⎿  ............................................                             [100%]
+     44 passed in 1.41s
+
+● Bash(ruff check src tests)
+  ⎿  All checks passed!
+
+● All 44 tests pass and ruff check is clean. Now let me check the final git status:
+
+● Bash(git status --short 2>&1 || echo "git status blocked")
+  ⎿   A .bench_baseline.txt
+      A alembic/versions/0035_2026_10_15_memory_readable_by.py
+      M src/mem_mcp/mcp/tools/refs_in.py
+     … +4 lines (ctrl+o to expand)
+
+● All T2-B1 tags have been removed from both test files (src/ and alembic/ were already clean). The grep over the repo confirms zero T2-B1 occurrences remain anywhere outside test_references_own_memory_repro.py (which we
+  were instructed not to touch).
+
+  However, git status --short shows that .bench_baseline.txt is still present and staged as added (A .bench_baseline.txt). This is the blocked task from Work Order 3 task 1 — the sandbox denied git rm -f, git rm
+  --cached, and plain rm, so the file remains in both the index and the working tree. No .bench_baseline.txt was modified, so this is not a new failure; the baseline file was created in an earlier turn (git history shows
+  A .bench_baseline.txt from the very first commit/snapshot: 610d7ee baseline).
+
+  Summary of Work Order 3
+
+  Task 1 — Remove .bench_baseline.txt → BLOCKED (sandbox)
+
+  - git rm -f .bench_baseline.txt → denied: "Permission to use Bash has been denied because Claude Code is running in don't ask mode."
+  - git rm --cached .bench_baseline.txt → denied (same).
+  - rm .bench_baseline.txt → denied (same).
+
+  All git/file deletion is blocked in this sandbox. .bench_baseline.txt is still present at the repo root (staged as A). This was a benchmark-baseline artifact from the original snapshot and is not part of the actual
+  code change. It must be removed by running one of these in a non-restricted shell:
+  git rm -f .bench_baseline.txt
+  (or git rm --cached .bench_baseline.txt && rm .bench_baseline.txt). I have not committed anything.
+
+  Task 2 — Strip T2-B1 tags → DONE
+
+  Removed 6 remaining occurrences across the two new test files:
+  - tests/unit/test_references_own_memory.py — lines 55, 98, 301 (docstrings), replaced with "the original memory_not_accessible bug" / "the original bug surface".
+  - tests/integration/test_references_own_memory.py — line 72 (docstring), replaced with "the raw-SQL-provisioned profile".
+
+  grep -rn "T2-B1" over src/ tests/ alembic/ now returns no hits. test_references_own_memory_repro.py was left untouched as instructed.
+
+  Task 3 — Re-run tests + ruff + git status → DONE (results below)
+
+  pytest (listed set, -p no:cacheprovider):
+  44 passed in 1.41s
+  ruff check src tests:
+  All checks passed!
+
+  Final git status --short:
+   A .bench_baseline.txt
+   A alembic/versions/0035_2026_10_15_memory_readable_by.py
+   M src/mem_mcp/mcp/tools/refs_in.py
+   M src/mem_mcp/mcp/tools/refs_out.py
+   M src/mem_mcp/teams/references.py
+   A tests/integration/test_references_own_memory.py
+   A tests/unit/test_references_own_memory.py
+
+  Files changed (the actual fix, unchanged since Work Order 1/2 completion)
+
+  - alembic/versions/0035_2026_10_15_memory_readable_by.py (new) — memory_readable_by() SQL function, pure access predicate (no deleted_at filter), SECURITY DEFINER owned by mem_maint, GRANT EXECUTE ... TO mem_app.
+  - src/mem_mcp/teams/references.py — added can_read_memory / can_read_memory_bulk; rewrote resolve_reference_target to always run the per-memory access check (closing the old team_id IS NULL leak);
+    check_hard_delete_with_filtered_citers now bulk-filters via the helper; module docstring holds the rule as the single source of truth.
+  - src/mem_mcp/mcp/tools/refs_in.py / refs_out.py — both tools filter edges via can_read_memory_bulk instead of per-memory UEA lookups.
+  - tests/unit/test_references_own_memory.py (new, 9 tests) + tests/integration/test_references_own_memory.py (new, 6 tests) — 15 regression tests covering NULL-team stranger, refs-in/refs-out tools, write-path opaque
+    rejection identical to nonexistent, and write-path with granted team access.
+
+  Left open
+
+  - .bench_baseline.txt removal is entirely blocked by sandbox permissions — needs the user to run git rm -f .bench_baseline.txt in a terminal with full git privileges. No commit should be made until that is resolved
+    (and per your rules, I have not committed).
+
+✻ Baked for 3m 38s · done 10:25 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+

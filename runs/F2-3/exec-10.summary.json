@@ -1,0 +1,22 @@
+{
+  "status": "ok",
+  "exit_code": 0,
+  "call": 10,
+  "wall_s": 2628,
+  "files_changed": [
+    "alembic/versions/0048_2026_10_16_team_workflows.py",
+    "docs/feature/01-analysis.md",
+    "docs/feature/02-design.md",
+    "docs/feature/03-plan.md",
+    "tests/security/test_workflow_visibility.py"
+  ],
+  "executor_report": "Confirmed pre-existing: it's about `MemoryStatsTool` registry dispatch (`memory.stats` method-not-found), no relation to migration 0048's tables or RLS policies — I introduced no new failures.\n\n## Report\n\n### What I changed\n\n**`alembic/versions/0048_2026_10_16_team_workflows.py`** — three migration defects, all now applied:\n- **Bug 1 (seed INSERT):** replaced inline f-string JSON interpolation of `DEFAULT_STATUSES`/`DEFAULT_TRANSITIONS` (whose `:` tokens `text()` mis-parsed as bind params, raising `bind parameter 'false'`) with `.bindparams()`-passed values.\n- **Bug 2 (deny policies):** added `DROP POLICY IF EXISTS …` before the two `CREATE POLICY work_item_history_{update,delete}_deny` so a re-apply no longer hits `DuplicateObject`.\n- **Bug 3 (approvals predicate — the blocker):** `work_item_signoff_approvals` has no `team_id` column, so the shared `_team_pred` (`… = team_id`) raised `UndefinedColumn: column \"team_id\" does not exist`. Added a table-specific `_approvals_pred` that joins through `work_item_signoff_requests` to derive the team, and selected it per-table in both the SELECT-policy and INSERT-policy loops. All other 5 tables keep `_team_pred` (they have a real `team_id`).\n\n**`tests/security/test_workflow_visibility.py`** (new, written to disk) — fail-closed + team-scope isolation test, modeled on the probing patterns and `tests/integration/conftest.py::multi_tenant_team_setup`:\n- `test_non_member_sees_nothing_without_tenant_guc` — under `SET LOCAL ROLE mem_app` with no `app.current_tenant_id`, a physically-present `team_workflow_versions` row returns `[]` (Spec S-3 fail-closed).\n- `test_active_member_reads_own_team_rows` — control (member tenant with GUC set reads its row) + cross-tenant isolation (a second unrelated tenant still reads `[]`).\n\n**`tests/security/test_zzz_probe_role.py`** — deleted (throwaway diagnostic, its job done).\n\n### Verification\n- `alembic upgrade head` — applies cleanly; `alembic current` = `0048_team_workflows (head)`; re-running `upgrade head` is a no-op (idempotent).\n- `pytest tests/security/test_workflow_visibility.py -p no:cacheprovider -q` → **2 passed**.\n- `pytest tests/security -p no:cacheprovider -q` → 41 passed, 29 skipped (`--live-aws`, expected to skip per env rules), 1 pre-existing failure (`test_scope_enforcement.py::test_stats_tool_requires_read_scope` — MCP tool-dispatch, unrelated to this work; not introduced by me).\n- `ruff check` on both files → **All checks passed!**\n\n### Role/RLS finding (resolved, drives the test)\n`pg_pool` connects as `mem_test` — a **superuser** (`rolbypassrls=true`) — so naive reads bypass RLS. `tenant_tx`/`system_tx` only set (or omit) the `app.current_tenant_id` GUC and never `SET ROLE`, so they do **not** activate RLS against the test pool either. The test therefore does `SET LOCAL ROLE mem_app` (transaction-scoped, prod-equivalent: LOGIN, no BYPASSRLS) to actually exercise the policies, exactly as `docs/feature/03-plan.md` lines 131–134 specify.\n\n### Notes / open items\n- The test asserts on `team_workflow_versions` as the representative team-scoped table. Bug 3's fix (the approvals JOIN predicate) is verified by the migration applying cleanly — the prior `UndefinedColumn` error is gone — but no test directly reads `work_item_signoff_approvals` under RLS; that's a possible follow-up if you want coverage of the approvals policy specifically.\n- No DB reset/downgrade was needed: the DB was sitting at `0045` (pre-0048) when I started, so a single `alembic upgrade head` brought it through 0046→0047→0048.",
+  "turns": 86,
+  "is_error": null,
+  "tokens": {
+    "in": 8664363,
+    "out": 126235
+  },
+  "stderr_tail": null,
+  "next": "Review with: git -C <repo> diff (and git -C <repo> status). Send fixes via a NEW order file + run_executor.sh."
+}

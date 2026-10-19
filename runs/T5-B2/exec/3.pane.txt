@@ -1,0 +1,260 @@
+● Tests are failing on the error data structure shape and files need trailing newlines. Let me read the test to understand the expected error format:
+
+  Thought for 8s, read 2 files (ctrl+o to expand)
+
+● Now I see the mismatch. The tests expect e.data["code"] and e.data["current_revision"] (flat structure), but my code uses e.data["error"]["type"]. Let me also check what the unit tests expect:
+
+  Thought for 15s, searched for 2 patterns (ctrl+o to expand)
+
+● I see — the tests expect a flat e.data["code"] and e.data["current_revision"]/e.data["current_id"] structure. My code wraps them in {"error": {...}}. Let me read the unit test's superseded chain test to get the full
+  picture:
+
+  Thought for 4s, read 1 file (ctrl+o to expand)
+
+● Let me also check the unit test for the case where the chain finds a current row:
+
+  Thought for 2m 1s, read 1 file (ctrl+o to expand)
+
+● I see the issue. The tests expect a flat error data structure (e.data["code"], e.data["current_revision"], e.data["current_id"]), not nested in e.data["error"]. Let me also check the happy-path unit tests to ensure my
+  changes won't break them, and check what fields they provide:
+
+  Thought for 3s, read 1 file (ctrl+o to expand)
+
+● Let me also check the versioned stale revision test and the rest of the conflict tests:
+
+  Thought for 1m 40s, read 1 file (ctrl+o to expand)
+
+● Now I have a clear picture. The tests expect a flat error data structure: {"code": "update_conflict", "current_revision": ...} and {"code": "update_conflict", "current_id": ..., "current_revision": ...}. My code
+  currently nests these under {"error": {...}}. Let me also read the integration test for the same-valid-revision case:
+
+  Thought for 15s, read 1 file (ctrl+o to expand)
+
+● Let me also read the fork test and the sequential superseded test to understand all conflict expectations:
+
+  Thought for 8s, read 1 file (ctrl+o to expand)
+
+● Now I have the complete picture. I need to fix the error data structure to be flat ({"code": "update_conflict", ...}) instead of nested ({"error": {"type": ...}}), and update _find_current_in_chain to include
+  updated_at and use .get() for mock compatibility. Let me make all fixes:
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 2 lines, removed 4 lines
+      126                          -32000,
+      127                          "update_conflict",
+      128                          data={
+      129 -                            "error": {
+      130 -                                "type": "update_conflict",
+      131 -                                "current_revision": current_rev,
+      132 -                            }
+      129 +                            "code": "update_conflict",
+      130 +                            "current_revision": current_rev,
+      131                          },
+      132                      )
+      133
+
+  Thought for 2s (ctrl+o to expand)
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 5 lines, removed 4 lines
+      140                          -32000,
+      141                          "update_conflict",
+      142                          data={
+      143 -                            "error": {
+      144 -                                "type": "update_conflict",
+      145 -                                "current_id": str(live["id"]),
+      146 -                            }
+      143 +                            "code": "update_conflict",
+      144 +                            "current_id": str(live["id"]),
+      145 +                            "current_revision": compute_revision(
+      146 +                                str(live["id"]), live["updated_at"]
+      147 +                            ),
+      148                          },
+      149                      )
+      150
+
+  Thought for 9s (ctrl+o to expand)
+
+● Now update _find_current_in_chain to select updated_at and use .get() for mock compatibility:
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 15 lines, removed 6 lines
+      367      ) -> dict[str, Any] | None:
+      368          """Walk the superseded_by chain from a non-current row to find the live head.
+      369
+      370 -        Returns the current row dict if found, or None if the chain is broken.
+      370 +        Returns the current row dict if found, or the last row in the chain
+      371 +        if no current row exists (so the caller can report current_id).
+      372 +        Returns None only if the chain is empty (no rows at all).
+      373          """
+      374          current_id = start_id
+      375 +        seen: set[UUID] = set()
+      376 +        last_row: dict[str, Any] | None = None
+      377          for _ in range(100):  # safety guard against cycles
+      378              row = await conn.fetchrow(
+      379                  """
+      376 -                SELECT id, is_current, superseded_by
+      380 +                SELECT id, is_current, superseded_by, updated_at
+      381                  FROM memories
+      382                  WHERE superseded_by = $1 AND tenant_id = $2
+      383                  """,
+     ...
+      385                  tenant_id,
+      386              )
+      387              if row is None:
+      384 -                return None
+      385 -            if row["is_current"]:
+      386 -                return row
+      388 +                return last_row
+      389 +            last_row = dict(row)
+      390 +            if row.get("is_current"):
+      391 +                return last_row
+      392 +            next_id = row.get("superseded_by")
+      393 +            if next_id is None or row["id"] in seen:
+      394 +                return last_row
+      395 +            seen.add(row["id"])
+      396              current_id = row["id"]
+      388 -        return None
+      397 +        return last_row
+      398
+      399      def _compute_tags(
+      400          self,
+
+  Thought for 3s (ctrl+o to expand)
+
+● Now fix the trailing newline (W292) ruff errors in all 3 files:
+
+● Update(src/mem_mcp/memory/versioning.py)
+  ⎿  Added 1 line, removed 1 line
+      28      epoch_seconds = dt.timestamp()
+      29      epoch_micros = int(epoch_seconds * 1_000_000)
+      30      raw = f"{memory_id}:{epoch_micros}"
+      31 -    return hashlib.sha256(raw.encode()).hexdigest()[:24]
+      31   No newline at end of file
+      32 +    return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+● Update(src/mem_mcp/mcp/tools/get.py)
+  ⎿  Added 1 line, removed 1 line
+      228          return MemoryGetOutput(
+      229              memory=MemoryRecord(**dict(row)),
+      230              history=[MemoryRecord(**h) for h in history],
+      231 -        )
+      231   No newline at end of file
+      232 +        )
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 1 line, removed 1 line
+      418          else:  # tags_op == "remove"
+      419              # Remove specified tags
+      420              remove_set = set(new_tags or [])
+      421 -            return [t for t in existing_tags if t not in remove_set]
+      421   No newline at end of file
+      422 +            return [t for t in existing_tags if t not in remove_set]
+
+  Thought for 3s (ctrl+o to expand)
+
+● Now let me run the unit tests first (fast feedback) to verify the error data structure fix:
+
+● Bash(python -m pytest tests/unit/test_tools_update_concurrency.py -q -p no:cacheprovider 2>&1 | tail -30)
+  ⎿          """Both None → still non-empty."""
+     >       r = compute_revision(None, None)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     … +27 lines (ctrl+o to expand)
+
+  Thought for 4s (ctrl+o to expand)
+
+● Three compute_revision unit test failures. Let me read those tests to understand expected behavior:
+
+  Thought for 1m 30s, read 1 file (ctrl+o to expand)
+
+● The compute_revision function needs to handle naive datetimes (treat as UTC) and None values. Let me fix it:
+
+  Thought for 7s, read 1 file (ctrl+o to expand)
+
+● Update(src/mem_mcp/memory/versioning.py)
+  ⎿  Added 1 line, removed 1 line
+       7  from __future__ import annotations
+       8
+       9  import hashlib
+      10 -from datetime import datetime
+      10 +from datetime import datetime, timezone
+      11  from typing import Final
+      12
+      13  VERSIONED_TYPES: Final[frozenset[str]] = frozenset({"decision", "fact"})
+
+● Update(src/mem_mcp/memory/versioning.py)
+  ⎿  Added 12 lines, removed 6 lines
+      14  NON_VERSIONED_TYPES: Final[frozenset[str]] = frozenset({"note", "snippet", "question"})
+      15
+      16
+      17 -def compute_revision(memory_id: str, updated_at: datetime | str) -> str:
+      17 +def compute_revision(memory_id: str, updated_at: datetime | str | None) -> str:
+      18      """Compute an opaque revision token for optimistic concurrency control.
+      19
+      20      Format: sha256("{memory_id}:{epoch_micros}")[:24]
+      21 -    Uses integer microseconds to avoid float rounding collisions at the
+      22 -    µs=999999 boundary (e.g., 1.999999s → 2.000000s via float rounding).
+      21 +    Naive datetimes are treated as UTC.  ``updated_at=None`` yields epoch_micros=0
+      22 +    so the function still returns a non-empty, deterministic token.
+      23      """
+      24 -    if isinstance(updated_at, str):
+      24 +    if updated_at is None:
+      25 +        epoch_micros = 0
+      26 +    elif isinstance(updated_at, str):
+      27          dt = datetime.fromisoformat(updated_at)
+      28 +        if dt.tzinfo is None:
+      29 +            dt = dt.replace(tzinfo=timezone.utc)
+      30 +        epoch_micros = int(dt.timestamp() * 1_000_000)
+      31      else:
+      32          dt = updated_at
+      28 -    epoch_seconds = dt.timestamp()
+      29 -    epoch_micros = int(epoch_seconds * 1_000_000)
+      33 +        if dt.tzinfo is None:
+      34 +            dt = dt.replace(tzinfo=timezone.utc)
+      35 +        epoch_micros = int(dt.timestamp() * 1_000_000)
+      36      raw = f"{memory_id}:{epoch_micros}"
+      37      return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+  Thought for 3s (ctrl+o to expand)
+
+● Now let me run the unit tests again to verify both the compute_revision and error data fixes:
+
+● Bash(python -m pytest tests/unit/test_tools_update_concurrency.py -q -p no:cacheprovider 2>&1 | tail -20)
+  ⎿  ................                                                         [100%]
+     16 passed in 0.36s
+
+  Thought for 3s (ctrl+o to expand)
+
+● All 16 unit tests pass. Now running the integration tests:
+
+● Bash(python -m pytest tests/integration/test_update_concurrency.py -q -p no:cacheprovider 2>&1 | tail -20)
+  ⎿  ../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+         result, stmt = await self._do_execute(
+     ../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2012: in _do_execute
+     … +17 lines (ctrl+o to expand)
+  ⎿  (timeout 5m)
+
+  Thought for 43s (ctrl+o to expand)
+
+● The INSERT statement can't reference the updated_at column being inserted (PostgreSQL restriction). I need to use clock_timestamp() directly instead of GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+  in the INSERT. The GREATEST pattern is only valid in UPDATE where updated_at already has a value:
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 1 line, removed 1 line
+      199                          source_client_id, source_kind,
+      200                          type, tags, metadata,
+      201                          version, supersedes, is_current, updated_at
+      202 -                    ) VALUES ($1, $2, $3, $4::vector, $5, 'api', $6, $7, $8::jsonb, $9, $10, true, GREATEST(clock_timestamp(), updated_at + interval '1 microsecond'))
+      202 +                    ) VALUES ($1, $2, $3, $4::vector, $5, 'api', $6, $7, $8::jsonb, $9, $10, true, clock_timestamp())
+      203                      RETURNING id, version, updated_at
+      204                      """,
+      205                      ctx.tenant_id,
+
+● Thinking for 3s… (ctrl+o to expand)
+  ⎿  Now let me run the integration tests again to see if the INSERT fix works.
+
+* Frosting… (28m 41s · ↓ 44.5k tokens · thinking)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · esc to interrupt · ← for agents
+

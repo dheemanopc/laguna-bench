@@ -1,0 +1,260 @@
+      63 +            for r in visible
+      64 +        ]
+      65
+      66          return RefsInOutput(
+      67              accessible_count=len(accessible),
+
+● Update(src/mem_mcp/mcp/tools/refs_in.py)
+  ⎿  Added 1 line, removed 1 line
+      10  from mem_mcp.db import system_tx
+      11  from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+      12  from mem_mcp.mcp.tools._base import BaseTool, ToolContext
+      13 -from mem_mcp.teams.references import get_inbound_refs
+      13 +from mem_mcp.teams.references import filter_refs_by_access, get_inbound_refs
+      14
+      15
+      16  class RefsInInput(BaseModel):
+
+● Update(src/mem_mcp/mcp/tools/refs_out.py)
+  ⎿  Added 17 lines, removed 22 lines
+      44          assert isinstance(inp, RefsOutInput)
+      45          async with system_tx(ctx.db_pool) as conn:
+      46              raw = await get_outbound_refs(conn, source_memory_id=inp.memory_id)
+      47 +            visible, inaccessible_count = await filter_refs_by_access(
+      48 +                conn,
+      49 +                refs=raw,
+      50 +                memory_id_key="target_memory_id",
+      51 +                caller_user_id=ctx.tenant_id,
+      52 +            )
+      53
+      48 -            accessible: list[OutboundRef] = []
+      49 -            inaccessible_count = 0
+      50 -            for r in raw:
+      51 -                access = await conn.fetchval(
+      52 -                    "SELECT 1 FROM user_effective_team_access "
+      53 -                    "WHERE user_id = $1 AND resource_team_id = $2",
+      54 -                    ctx.tenant_id,
+      55 -                    r["target_team_id"],
+      56 -                )
+      57 -                if access is None:
+      58 -                    inaccessible_count += 1
+      59 -                    continue
+      60 -                accessible.append(
+      61 -                    OutboundRef(
+      62 -                        source_memory_id=str(r["source_memory_id"]),
+      63 -                        target_memory_id=str(r["target_memory_id"]),
+      64 -                        target_team_id=str(r["target_team_id"]),
+      65 -                        target_fragment=r["target_fragment"],
+      66 -                        reference_kind=r["reference_kind"],
+      67 -                        refs_version=r["refs_version"],
+      68 -                    )
+      69 -                )
+      54 +        accessible = [
+      55 +            OutboundRef(
+      56 +                source_memory_id=str(r["source_memory_id"]),
+      57 +                target_memory_id=str(r["target_memory_id"]),
+      58 +                target_team_id=str(r["target_team_id"]),
+      59 +                target_fragment=r["target_fragment"],
+      60 +                reference_kind=r["reference_kind"],
+      61 +                refs_version=r["refs_version"],
+      62 +            )
+      63 +            for r in visible
+      64 +        ]
+      65
+      66          return RefsOutOutput(
+      67              accessible_count=len(accessible),
+
+● Update(src/mem_mcp/mcp/tools/refs_out.py)
+  ⎿  Added 1 line, removed 1 line
+      10  from mem_mcp.db import system_tx
+      11  from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+      12  from mem_mcp.mcp.tools._base import BaseTool, ToolContext
+      13 -from mem_mcp.teams.references import get_outbound_refs
+      13 +from mem_mcp.teams.references import filter_refs_by_access, get_outbound_refs
+      14
+      15
+      16  class RefsOutInput(BaseModel):
+
+● Now I need the ToolContext fixture pattern for the tests.
+
+  Searched for 4 patterns, read 1 file (ctrl+o to expand)
+
+● Write(tests/integration/test_references_memory_readable_by.py)
+  ⎿  Wrote 428 lines to tests/integration/test_references_memory_readable_by.py
+      1 """Regression: referencing one's OWN memory failed with `memory_not_accessible`.
+      2
+      3 Bug: the references machinery (resolve_reference_target,
+      4 check_hard_delete_with_filtered_citers, refs_in, refs_out) decided per-memory
+      5 visibility solely by a `user_effective_team_access` (UEA) row for the memory's
+      6 team. UEA is a materialised cache that raw-SQL provisioning (the 0026 backfill)
+      7 never fills, so a user's own memory looked inaccessible while `memory_get` read
+      8 it fine. Fix: one canonical predicate, DB function `memory_readable_by()`
+      9 (migration 0035), reached through `teams.references.accessible_memory_ids`.
+     … +418 lines (ctrl+o to expand)
+
+● The fix and regression tests are written, but I couldn't run anything: Bash was denied partway through the session ("don't ask mode"). None of the verification steps in the acceptance list have been done.
+
+  Changes
+
+  - alembic/versions/0035_2026_06_01_memory_readable_by.py (new, revision 0035_memory_readable_by, down_revision 0034_safe_current_tenant_id):
+    - Adds memory_readable_by(p_memory_id uuid, p_user_id uuid DEFAULT NULL) → boolean, written as LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public.
+    - The predicate is: memory exists, not deleted, and (owner OR a UEA row for its team).
+    - A NULL user falls back to safe_current_tenant_id(), and a NULL result gives false.
+    - Granted to PUBLIC, matching 0034's safe_current_tenant_id(). I used PUBLIC rather than mem_app because that is the established pattern in 0034.
+    - downgrade() drops the function.
+  - src/mem_mcp/teams/references.py:
+    - New helpers accessible_memory_ids (batch, one query), memory_accessible_to, and filter_refs_by_access.
+    - resolve_reference_target now gates through the helper for both the UUID and slug-tuple paths, with the same error message. The team_id IS NULL bypass is removed.
+    - check_hard_delete_with_filtered_citers classifies citers with the helper.
+    - Module and function docstrings updated to describe the new rule and why.
+  - src/mem_mcp/mcp/tools/refs_in.py and refs_out.py: the per-row UEA SQL is gone and both call filter_refs_by_access (keyed on source_memory_id and target_memory_id respectively). Output shape is unchanged.
+  - tests/integration/test_references_memory_readable_by.py (new): 11 tests covering:
+    - resolve_reference_target (UUID, slug tuple, NULL team, foreign opaque, foreign with UEA)
+    - hard-delete citers (own plus foreign, own only)
+    - RefsInTool and RefsOutTool
+    - the SQL function directly (owner, foreign, deleted, missing, NULL user, GUC fallback)
+    - two SDK end-to-end tests (own memory by slug tuple, and no-access envelope equals nonexistent-UUID envelope)
+
+  The existing references.py entry in the tenant-scope linter's exempt list already covers the new SQL there. The tools no longer contain memory SQL, so no lint change should be needed.
+
+  Not verified (needs running)
+
+  I haven't run any of these, so they are unconfirmed:
+  - alembic upgrade head, then alembic downgrade -1 && alembic upgrade head
+  - pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py
+  - pytest -q -p no:cacheprovider tests/integration/test_references_memory_readable_by.py
+  - pytest -q -p no:cacheprovider tests against the baseline via git stash (pass/fail counts and failing ids)
+  - ruff check src tests, mypy, tests/unit/test_lint_tenant_scope.py
+
+  Things most likely to need a tweak on first run:
+  - Test-file typing: the # type: ignore[attr-defined] comments in the test file may be flagged by mypy as unused.
+  - ruff format: a few of the lines I wrote may need reformatting.
+  - Memory inserts: my raw INSERT INTO memories relies on defaults for visibility and source_client_id, copied from test_slugs_integration.py.
+  - Slug resource type: I used resource_type="decision" for slugs, as that file does.
+  - SDK error attributes: I read .code on the SDK error as the repro's comment implies, but haven't confirmed the attribute name.
+
+  To finish verification, either allow Bash for this session or run the commands above with the ! prefix.
+
+✻ Worked for 1m 49s · done 6:26 AM
+
+❯ Work order 2 — verify order 1 (run everything)
+
+  Your order-1 code changes look right on review; keep the design. Last session, Bash was
+  unavailable, so nothing was verified. This session's job is to run the verification and fix
+  whatever breaks. Use Bash for each command below and paste the exact summary lines into your report.
+
+  1. alembic upgrade head (uses MEM_MCP_DB_MAINT_DSN), then alembic downgrade -1, then
+     alembic upgrade head again. Confirm alembic current shows 0035_memory_readable_by.
+  2. pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py
+  3. pytest -q -p no:cacheprovider tests/integration/test_references_memory_readable_by.py
+     — fix any failures in your new code or tests. For example: the memory INSERT may need
+     source_client_id, check the SDK error's attribute name (.code), and check ToolContext
+     constructor args.
+  4. pytest -q -p no:cacheprovider tests/unit/test_references_helpers.py tests/integration/test_references_integration.py tests/unit/test_lint_tenant_scope.py
+  5. Full suite: pytest -q -p no:cacheprovider tests. Record the pass/fail counts and the failing test ids.
+  6. Baseline comparison: first git stash -u, then run pytest -q -p no:cacheprovider tests again and
+     record the failing ids. Leave the DB at 0035; the function is additive. Run git stash pop
+     afterwards, then confirm with git status that all your files are back. Report the set difference:
+     failures present with your change but not at baseline. That set must be empty, apart from the repro
+     test, which should flip from fail to pass.
+  7. ruff check src tests, ruff format --check on the files you changed, and mypy. Fix
+     any findings in files you changed. Remove # type: ignore comments that mypy reports as unused,
+     or narrow the output type with assert isinstance(out, RefsInOutput) instead.
+
+  Do not modify existing tests. Report the exact command outputs (summary lines) and the files changed.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_01Rt4suaMrW1SvzfEPSPgM8E
+
+● Bash(alembic upgrade head 2>&1 | tail -5; alembic downgrade -1 2>&1 | tail -3; alembic upgrade head 2>&1 | tail -3; alembic current 2>&1 | tail -2)
+  ⎿  0035_memory_readable_by (head)
+
+● Bash(pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py 2>&1 | tail -15; pytest -q -p no:cacheprovider tests/integration/test_refere…)
+  ⎿  .                                                                        [100%]
+     1 passed in 0.41s
+             spine writes. `references` rides the IT-08-honoring resolver — bad refs
+     … +39 lines (ctrl+o to expand)
+
+● Only the SDK slug test fails: decision writes require slug_clue, and the write mints the slug itself. I'll fix the test to use that.
+
+● Update(tests/integration/test_references_memory_readable_by.py)
+  ⎿  Added 7 lines, removed 10 lines
+      366  ) -> None:
+      367      a, _ = two_users
+      368      sdk = sdk_client_factory(tenant_id=a["tenant"], plugin_id="rbw-refs")
+      369 -    target_id = await sdk.write(content=f"slug target {uuid4()}", type="decision")
+      369 +    target_id = await sdk.write(
+      370 +        content=f"slug target {uuid4()}", type="decision", slug_clue="sdk-own-slug"
+      371 +    )
+      372      async with pg_pool.acquire() as conn:
+      373          row = await conn.fetchrow(
+      372 -            "SELECT team_id FROM memories WHERE id = $1", UUID(str(target_id))
+      374 +            "SELECT s.team_id, s.slug FROM slugs s WHERE s.memory_id = $1",
+      375 +            UUID(str(target_id)),
+      376          )
+      374 -        slug = await insert_slug_with_retry(
+      375 -            conn,
+      376 -            team_id=row["team_id"],
+      377 -            resource_type="decision",
+      378 -            clue="sdk-own-slug",
+      379 -            memory_id=UUID(str(target_id)),
+      380 -            title="SDK own slug",
+      381 -        )
+      377 +    assert row is not None
+      378 +    slug = row["slug"]
+      379      citer = await sdk.write(
+      380          content=f"citer {uuid4()}",
+      381          type="note",
+
+● Bash(pytest -q -p no:cacheprovider tests/integration/test_references_memory_readable_by.py 2>&1 | tail -5; pytest -q -p no:cacheprovider tests/unit/test_references_h…)
+  ⎿  ............                                                             [100%]
+     12 passed in 0.94s
+     ........................                                                 [100%]
+     … +5 lines (ctrl+o to expand)
+
+● Bash(S=/tmp/claude-1000/-home-anand-laguna-bench-runs-T2-A1-repo/a944525a-cedd-4f4b-8ae9-2573fdfcae29/scratchpad; grep -E "passed|failed" $S/after.txt | grep -v "^FA…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+● Steps 1–5 are done and green on my own work; steps 6 and 7 are not done. Bash was denied again, right as I started git stash -u.
+
+  Results
+
+  1. Migration: alembic upgrade head, downgrade -1, upgrade head ran, and alembic current shows 0035_memory_readable_by (head). The first three commands printed nothing to my tail, so the only output line I saw is the
+     current one.
+  2. Repro test: 1 passed in 0.41s.
+  3. New regression tests: the first run had 1 failed, 11 passed. The failure was my SDK slug test, because decision writes require slug_clue and the write mints the slug itself. I changed the test to pass slug_clue and
+     read the slug from slugs. The rerun gave 12 passed in 0.94s.
+  4. Related suites (test_references_helpers, test_references_integration, test_lint_tenant_scope): 24 passed in 0.65s.
+  5. Full suite (with my changes): 34 failed, 1046 passed, 31 skipped, 52 warnings, 16 errors in 11.58s, which is 50 failing or erroring ids. They are saved in scratchpad/after.txt.
+
+  Not done
+
+  - Baseline comparison (step 6): not run, so I can't yet say whether the 50 failures all pre-existed. The ones I saw in the output look like unrelated schema and fixture tests (test_slugs_schema,
+    test_team_role_assignments_schema, test_user_effective_team_access_schema). That is not a verified comparison.
+  - Stash state: the denied command was the first thing in the chain, so I believe no stash happened and the working tree is intact. I couldn't confirm that with git status.
+  - ruff check, ruff format --check, mypy (step 7): not run, so the # type: ignore[attr-defined] comments in the new test file are still unchecked.
+
+  Files changed this session
+
+  Only tests/integration/test_references_memory_readable_by.py, which is my own new file. There are no source changes.
+
+  To finish
+
+  Allow Bash, or run these with the ! prefix:
+  git status --short
+  git stash -u && pytest -q -p no:cacheprovider tests 2>&1 | grep -E "^(FAILED|ERROR)|passed|failed" | sort > /tmp/base.txt; git stash pop
+  ruff check src tests; ruff format --check src/mem_mcp/teams/references.py src/mem_mcp/mcp/tools/refs_in.py src/mem_mcp/mcp/tools/refs_out.py tests/integration/test_references_memory_readable_by.py
+  alembic/versions/0035_2026_06_01_memory_readable_by.py; mypy
+  Then diff /tmp/base.txt against scratchpad/after.txt.
+
+✻ Churned for 43s · done 6:27 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Bash is allowed now, finish steps 6 and 7
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

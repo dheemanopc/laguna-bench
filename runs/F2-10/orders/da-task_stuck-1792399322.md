@@ -1,0 +1,3 @@
+```json
+{"action":"retry","guidance":"Last attempt died on an API 402 credit error, not a code problem, so retry.\n1) work_items.py:463: remove the `# type: ignore[return-value]`. Do not add any other ignore. Fix the typing properly, e.g. `wid = row[\"workflow_id\"]; assert isinstance(wid, UUID); return wid`, or use `cast(UUID, row[\"workflow_id\"])`.\n2) Create the missing tests/unit/mindmap/test_workflow_moves.py. Cover the move happy path, a blocked move with its reason, and sign-off from someone other than the owner.\n3) Run `ruff check src tests`, `mypy`, and `pytest tests/unit/mindmap -q` before finishing. Do not touch lint or type config.","new_tasks":[]}
+```

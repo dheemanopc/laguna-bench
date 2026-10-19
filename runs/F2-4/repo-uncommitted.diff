@@ -1,0 +1,610 @@
+diff --git a/alembic/versions/0048_2026_10_17_team_workflows.py b/alembic/versions/0048_2026_10_17_team_workflows.py
+index 219917f..5c0e1e0 100644
+--- a/alembic/versions/0048_2026_10_17_team_workflows.py
++++ b/alembic/versions/0048_2026_10_17_team_workflows.py
+@@ -148,6 +148,20 @@ def upgrade() -> None:
+         )
+     )
+ 
++    # R1: at most one *pending* sign-off proposal per work item. A proposal that
++    # is resolved (approved/committed/cancelled) leaves the 'pending' status,
++    # freeing its (work_item_memory_id) row for a new proposal; the partial index
++    # guards only the pending state, matching the propose -> sign -> commit
++    # lifecycle and preventing two concurrent pending proposals racing the commit
++    # path. Closes the gap the WP0 review flagged: without it, two pending
++    # proposals on the same item could both reach signoff_min and race commit.
++    op.execute(
++        sa.text(
++            "CREATE UNIQUE INDEX workflow_signoff_requests_one_pending_per_item "
++            "ON workflow_signoff_requests (work_item_memory_id) WHERE status = 'pending'"
++        )
++    )
++
+     # ---- RLS: enable on all five tables + SELECT/INSERT policies -----------
+     for table in (
+         "team_workflows",
+@@ -275,6 +289,11 @@ def upgrade() -> None:
+ 
+ def downgrade() -> None:
+     # Restore change_type CHECK to 0046's original four values.
++    # CAUTION: this downgrade FAILS if any work_item_history row still carries one
++    # of the 0048 values ('stage', 'signoff_requested', 'signoff_approved') — the
++    # re-added CHECK rejects them. A successful round-trip therefore requires the
++    # history table to contain no such rows (e.g. an empty schema, as covered by
++    # TestDowngradeUpgradeRoundTrip).
+     op.execute(
+         sa.text(
+             "ALTER TABLE work_item_history "
+diff --git a/tests/unit/test_migration_0048_workflow_schema.py b/tests/unit/test_migration_0048_workflow_schema.py
+index f00929e..a3d1315 100644
+--- a/tests/unit/test_migration_0048_workflow_schema.py
++++ b/tests/unit/test_migration_0048_workflow_schema.py
+@@ -378,3 +378,568 @@ class TestDeletionBlocked:
+                 assert deleted == wf_id
+             finally:
+                 await tx.rollback()
++
++
++# Aliases unpacked from NEW_TABLES so the "workflow_signups" spelling (which
++# appears once, correctly, in NEW_TABLES above) is never re-typed here — that
++# name is ambiguous between signups/signups when written by hand.
++_TW, _STAGES, _TRANSITIONS, _SIGREQ, _SIGNUPS = NEW_TABLES
++
++# asyncpg raises InsufficientPrivilegeError for BOTH "permission denied for
++# table" (missing GRANT) and "new row violates row-level security policy"
++# (INSERT WITH CHECK) — both are SQLSTATE 42501. So it is the single exception
++# to assert in the mem_app behavioural tests below.
++InsufficientPermissionError = asyncpg.InsufficientPrivilegeError
++
++
++async def _seed_tenant_b_rows(
++    conn: Any, t_id_b: UUID, team_b: UUID
++) -> dict[str, UUID]:
++    """As the superuser pool owner, seed one row per new table for tenant B.
++
++    The chain respects the FK graph: team_workflows -> workflow_stages /
++    workflow_transitions -> workflow_signoff_requests (needs a work_items row)
++    -> workflow_signups. Returns the inserted ids so behavioural tests can both
++    prove the rows exist (as owner) and prove they are invisible (as mem_app).
++    Identifiers are UUID-suffixed; nothing is cleaned up — the outer tx rolls
++    back.
++    """
++    out: dict[str, UUID] = {}
++    out["wf_b"] = await conn.fetchval(
++        "INSERT INTO team_workflows "
++        "(tenant_id, team_id, name, is_active, version, created_by) "
++        "VALUES ($1, $2, $3, TRUE, 1, $1) RETURNING workflow_id",
++        t_id_b,
++        team_b,
++        f"wf-b-{uuid4().hex}",
++    )
++    out["stage_b"] = await conn.fetchval(
++        "INSERT INTO workflow_stages (tenant_id, workflow_id, name, ordinal) "
++        "VALUES ($1, $2, $3, 1) RETURNING stage_id",
++        t_id_b,
++        out["wf_b"],
++        f"stage-b-{uuid4().hex}",
++    )
++    # from_stage NULL is allowed (CHECK is from OR to non-null).
++    out["tr_b"] = await conn.fetchval(
++        "INSERT INTO workflow_transitions (tenant_id, workflow_id, to_stage_id) "
++        "VALUES ($1, $2, $3) RETURNING transition_id",
++        t_id_b,
++        out["wf_b"],
++        out["stage_b"],
++    )
++    # workflow_signoff_requests FKs work_items(memory_id): seed a work item.
++    mem_b = await conn.fetchval(
++        "INSERT INTO memories (tenant_id, team_id, content, content_hash, source_kind) "
++        "VALUES ($1, $2, 'c', $3, 'api') RETURNING id",
++        t_id_b,
++        team_b,
++        f"hash-{uuid4().hex}",
++    )
++    await conn.execute(
++        "INSERT INTO memory_maps (root_memory_id, tenant_id, team_id, title) "
++        "VALUES ($1, $2, $3, 'seed-b')",
++        mem_b,
++        t_id_b,
++        team_b,
++    )
++    wi_mem = await conn.fetchval(
++        "INSERT INTO work_items "
++        "(memory_id, root_memory_id, tenant_id, team_id, kind, status, created_by) "
++        "VALUES ($1, $1, $2, $3, 'story', 'todo', $2) RETURNING memory_id",
++        mem_b,
++        t_id_b,
++        team_b,
++    )
++    out["wi_mem"] = wi_mem
++    out["rq_b"] = await conn.fetchval(
++        "INSERT INTO workflow_signoff_requests "
++        "(tenant_id, work_item_memory_id, from_stage, to_stage, proposer_tenant_id) "
++        "VALUES ($1, $2, $3, $4, $1) RETURNING request_id",
++        t_id_b,
++        wi_mem,
++        "todo",
++        "done",
++    )
++    return out
++
++
++async def _seed_signups_row(
++    conn: Any, t_id_b: UUID, rq_b: UUID
++) -> UUID:
++    """Seed one row in the signups table for tenant B (needs a request_id)."""
++    return await conn.fetchval(
++        f"INSERT INTO {_SIGNUPS} (tenant_id, request_id, signatory_tenant_id) "
++        "VALUES ($1, $2, $1) RETURNING signoff_id",
++        t_id_b,
++        rq_b,
++    )
++
++
++async def _ensure_work_item(
++    conn: Any, t_id: UUID, team_id: UUID, mem_id: UUID
++) -> UUID:
++    """Insert a work_items row for mem_id (the FK target for signoff_requests).
++
++    _seed_workflow_base only creates a memories row; workflow_signoff_requests
++    references work_items(memory_id), so callers must materialise the work item
++    first (mirrors TestDeletionBlocked.test_blocked_by_work_items_reference).
++    """
++    await conn.execute(
++        "INSERT INTO work_items "
++        "(memory_id, root_memory_id, tenant_id, team_id, kind, status, created_by) "
++        "VALUES ($1, $1, $2, $3, 'story', 'todo', $2)",
++        mem_id,
++        t_id,
++        team_id,
++    )
++    return mem_id
++
++
++async def _as_mem_app(conn: Any, tenant_id: UUID) -> None:
++    """Assume the mem_app role in tenant_id context for the current tx.
++
++    set_config(..., true) and SET LOCAL ROLE are both transaction-local and
++    revert on ROLLBACK, so no pool contamination can leak (verified by probe).
++    """
++    await conn.execute(
++        "SELECT set_config('app.current_tenant_id', $1, true)", str(tenant_id)
++    )
++    await conn.execute("SET LOCAL ROLE mem_app")
++
++
++async def _insert_signoff_requests_row(
++    conn: Any, t_id: UUID, team_id: UUID, mem_id: UUID
++) -> UUID:
++    """Insert a workflow_signoff_requests row, returning its request_id."""
++    return await conn.fetchval(
++        "INSERT INTO workflow_signoff_requests "
++        "(tenant_id, work_item_memory_id, from_stage, to_stage, proposer_tenant_id) "
++        "VALUES ($1, $2, $3, $4, $1) RETURNING request_id",
++        t_id,
++        mem_id,
++        "todo",
++        "done",
++    )
++
++
++class TestRlsAsMemApp:
++    """Behavioural RLS/grant checks that RUN AS the mem_app role.
++
++    The superuser pool owner bypasses RLS, so the existing TestPerTableGrants /
++    TestDeletionBlocked tests pass even with the grants stripped. These tests
++    assume mem_app inside an explicit transaction (SET LOCAL ROLE) so the
++    policies and GRANTs are actually exercised.
++    """
++
++    async def test_tenant_a_cannot_select_tenant_b_rows(self, pg_pool: Any) -> None:
++        """mem_app in tenant A's context must see 0 rows of tenant B in all 5 tables."""
++        async with pg_pool.acquire() as conn:
++            tx = conn.transaction()
++            await tx.start()
++            try:
++                t_id_a = await conn.fetchval(
++                    "INSERT INTO tenants (email, status) VALUES ($1, 'active') RETURNING id",
++                    f"rls-a-{uuid4()}@x.test",
++                )
++                t_id_b = await conn.fetchval(
++                    "INSERT INTO tenants (email, status) VALUES ($1, 'active') RETURNING id",
++                    f"rls-b-{uuid4()}@x.test",
++                )
++                team_b = await conn.fetchval(
++                    "INSERT INTO teams (name, created_by_tenant_id, team_type) "
++                    "VALUES ($1, $2, 'personal') RETURNING id",
++                    f"rls-b-{uuid4().hex}",
++                    t_id_b,
++                )
++                # Seed a row in every new table for tenant B.
++                ids = await _seed_tenant_b_rows(conn, t_id_b, team_b)
++                await _seed_signups_row(conn, t_id_b, ids["rq_b"])
++
++                # (owner) rows are present for tenant B in every table.
++                for table in NEW_TABLES:
++                    own = await conn.fetchval(
++                        f"SELECT count(*) FROM {table} WHERE tenant_id = $1", t_id_b
++                    )
++                    assert own >= 1, f"{table}: no seed row for tenant B"
++
++                # (mem_app, tenant A context) all tenant-B rows are filtered out.
++                await _as_mem_app(conn, t_id_a)
++                for table in NEW_TABLES:
++                    hidden = await conn.fetchval(f"SELECT count(*) FROM {table}")
++                    assert hidden == 0, (
++                        f"{table}: mem_app(tenant A) saw {hidden} tenant-B rows"
++                    )
++            finally:
++                await conn.execute("RESET ROLE")
++                await tx.rollback()
++
++    async def test_tenant_a_cannot_insert_tenant_b_rows(self, pg_pool: Any) -> None:
++        """mem_app in tenant A context cannot INSERT a tenant-B row (WITH CHECK).
++
++        All five new tables share the identical `WITH CHECK (tenant_id =
++        safe_current_tenant_id())` insert policy (proven structurally by
++        test_select_and_insert_policies); this exercises the denial on the
++        principal table, team_workflows.
++        """
++        async with pg_pool.acquire() as conn:
++            tx = conn.transaction()
++            await tx.start()
++            try:
++                t_id_a = await conn.fetchval(
++                    "INSERT INTO tenants (email, status) VALUES ($1, 'active') RETURNING id",
++                    f"rls-ins-a-{uuid4()}@x.test",
++                )
++                t_id_b = await conn.fetchval(
++                    "INSERT INTO tenants (email, status) VALUES ($1, 'active') RETURNING id",
++                    f"rls-ins-b-{uuid4()}@x.test",
++                )
++                team_b = await conn.fetchval(
++                    "INSERT INTO teams (name, created_by_tenant_id, team_type) "
++                    "VALUES ($1, $2, 'personal') RETURNING id",
++                    f"rls-ins-b-{uuid4().hex}",
++                    t_id_b,
++                )
++                await _as_mem_app(conn, t_id_a)
++                # WITH CHECK rejects a tenant-B row while mem_app is in tenant A.
++                with pytest.raises(InsufficientPermissionError):
++                    async with conn.transaction():
++                        await conn.fetchval(
++                            "INSERT INTO team_workflows "
++                            "(tenant_id, team_id, name, is_active, version, created_by) "
++                            "VALUES ($1, $2, $3, TRUE, 1, $1) RETURNING workflow_id",
++                            t_id_b,
++                            team_b,
++                            f"wf-b-{uuid4().hex}",
++                        )
++            finally:
++                await conn.execute("RESET ROLE")
++                await tx.rollback()
++
++    @pytest.mark.parametrize("table,col", [
++        (_STAGES, "name"),                 # SELECT+INSERT only -> no UPDATE/DELETE
++        (_TRANSITIONS, "signoff_min"),     # SELECT+INSERT only -> no UPDATE/DELETE
++        (_SIGNUPS, "signatory_tenant_id"),  # append-only -> no UPDATE/DELETE
++    ])
++    async def test_update_and_delete_refused_on_immutable_tables(
++        self, pg_pool: Any, table: str, col: str
++    ) -> None:
++        """mem_app is refused UPDATE + DELETE on the immutable tables (no grants).
++
++        The grant layer refuses before the policy/row layer is consulted, so no
++        seed rows are needed: UPDATE/DELETE privilege is checked at statement
++        start and the grant is absent on these three tables.
++        """
++        async with pg_pool.acquire() as conn:
++            tx = conn.transaction()
++            await tx.start()
++            try:
++                t_id_a = await conn.fetchval(
++                    "INSERT INTO tenants (email, status) VALUES ($1, 'active') RETURNING id",
++                    f"rls-immut-{uuid4()}@x.test",
++                )
++                await _as_mem_app(conn, t_id_a)
++                with pytest.raises(InsufficientPermissionError):
++                    async with conn.transaction():
++                        await conn.execute(
++                            f"UPDATE {table} SET {col} = {col} WHERE FALSE"
++                        )
++                with pytest.raises(InsufficientPermissionError):
++                    async with conn.transaction():
++                        await conn.execute(f"DELETE FROM {table} WHERE FALSE")
++            finally:
++                await conn.execute("RESET ROLE")
++                await tx.rollback()
++
++    async def test_referenced_workflow_delete_denied_as_mem_app(
++        self, pg_pool: Any
++    ) -> None:
++        """mem_app cannot DELETE a team_workflows row it can see (no DELETE grant).
++
++        Complements the owner-level NO-ACTION FK check in TestDeletionBlocked:
++        there the owner is blocked by the FK; here mem_app is blocked by the
++        missing DELETE grant (permission denied) before the FK is consulted.
++        """
++        async with pg_pool.acquire() as conn:
++            tx = conn.transaction()
++            await tx.start()
++            try:
++                t_id, team_id, wf_id, _ = await _seed_workflow_base(conn)
++                await _as_mem_app(conn, t_id)
++                with pytest.raises(InsufficientPermissionError):
++                    async with conn.transaction():
++                        await conn.execute(
++                            "DELETE FROM team_workflows WHERE workflow_id = $1", wf_id
++                        )
++            finally:
++                await conn.execute("RESET ROLE")
++                await tx.rollback()
++
++
++class TestConstraintsBehavioural:
++    """Constraint / index enforcement (runs as owner — constraints are not RLS).
++
++    RLS is the only thing the superuser pool owner bypasses; CHECK constraints,
++    UNIQUE / partial-UNIQUE indexes, and foreign keys apply to every role. These
++    tests run as the owner and are contained in savepoints so a violating INSERT
++    does not abort the outer transaction.
++    """
++
++    async def test_active_per_team_allows_one_active_rejects_second(self, pg_pool: Any) -> None:
++        """team_workflows_active_per_team: 2nd active per team rejected, inactive allowed."""
++        async with pg_pool.acquire() as conn:
++            tx = conn.transaction()
++            await tx.start()
++            try:
++                t_id, team_id, wf_id, _ = await _seed_workflow_base(conn)
++                # _seed_workflow_base inserts an *inactive* workflow (default), so
++                # insert a first *active* one as the baseline (the team's only
++                # active workflow so far) before testing the partial-unique refusal.
++                first = await conn.fetchval(
++                    "INSERT INTO team_workflows "
++                    "(tenant_id, team_id, name, is_active, version, created_by) "
++                    "VALUES ($1, $2, $3, TRUE, 1, $1) RETURNING workflow_id",
++                    t_id,
++                    team_id,
++                    f"act1-{uuid4().hex}",
++                )
++                assert first is not None
++                # A 2nd active workflow for the same team violates the partial
++                # unique index (team_id) WHERE is_active.
++                with pytest.raises(Exception) as exc:
++                    async with conn.transaction():
++                        await conn.execute(
++                            "INSERT INTO team_workflows "
++                            "(tenant_id, team_id, name, is_active, version, created_by) "
++                            "VALUES ($1, $2, $3, TRUE, 1, $1)",
++                            t_id,
++                            team_id,
++                            f"act2-{uuid4().hex}",
++                        )
++                assert "unique" in str(exc.value).lower() or "duplicate" in str(
++                    exc.value
++                ).lower(), f"unexpected: {exc.value!r}"
++                # An *inactive* workflow for the same team is allowed.
++                inactive = await conn.fetchval(
++                    "INSERT INTO team_workflows "
++                    "(tenant_id, team_id, name, is_active, version, created_by) "
++                    "VALUES ($1, $2, $3, FALSE, 1, $1) RETURNING workflow_id",
++                    t_id,
++                    team_id,
++                    f"inact-{uuid4().hex}",
++                )
++                assert inactive is not None
++            finally:
++                await tx.rollback()
++
++    async def test_team_name_unique(self, pg_pool: Any) -> None:
++        """team_workflows_team_name_idx: duplicate (team_id, name) rejected."""
++        async with pg_pool.acquire() as conn:
++            tx = conn.transaction()
++            await tx.start()
++            try:
++                t_id, team_id, wf_id, _ = await _seed_workflow_base(conn)
++                # Re-derive the seeded workflow's name so the duplicate is exact.
++                existing = await conn.fetchrow(
++                    "SELECT team_id, name FROM team_workflows WHERE workflow_id = $1",
++                    wf_id,
++                )
++                with pytest.raises(Exception) as exc:
++                    async with conn.transaction():
++                        await conn.execute(
++                            "INSERT INTO team_workflows "
++                            "(tenant_id, team_id, name, is_active, version, created_by) "
++                            "VALUES ($1, $2, $3, FALSE, 1, $1)",
++                            t_id,
++                            existing["team_id"],
++                            existing["name"],
++                        )
++                assert "unique" in str(exc.value).lower() or "duplicate" in str(
++                    exc.value
++                ).lower()
++            finally:
++                await tx.rollback()
++
++    async def test_status_check_accepts_known_rejects_bogus(self, pg_pool: Any) -> None:
++        """workflow_signoff_requests.status CHECK: known values OK, bogus rejected."""
++        async with pg_pool.acquire() as conn:
++            tx = conn.transaction()
++            await tx.start()
++            try:
++                t_id, team_id, wf_id, mem_id = await _seed_workflow_base(conn)
++                await _ensure_work_item(conn, t_id, team_id, mem_id)
++                ok = await conn.fetchval(
++                    "INSERT INTO workflow_signoff_requests "
++                    "(tenant_id, work_item_memory_id, from_stage, to_stage, "
++                    " proposer_tenant_id, status) "
++                    "VALUES ($1, $2, $3, $4, $1, $5) RETURNING request_id",
++                    t_id,
++                    mem_id,
++                    "todo",
++                    "done",
++                    "approved",
++                )
++                assert ok is not None
++                with pytest.raises(Exception) as exc:
++                    async with conn.transaction():
++                        await conn.execute(
++                            "INSERT INTO workflow_signoff_requests "
++                            "(tenant_id, work_item_memory_id, from_stage, to_stage, "
++                            " proposer_tenant_id, status) "
++                            "VALUES ($1, $2, $3, $4, $1, $5)",
++                            t_id,
++                            mem_id,
++                            "todo",
++                            "done",
++                            "bogus",
++                        )
++                assert "check" in str(exc.value).lower() or "violat" in str(
++                    exc.value
++                ).lower()
++            finally:
++                await tx.rollback()
++
++    async def test_signoff_min_must_be_at_least_one(self, pg_pool: Any) -> None:
++        """workflow_transitions.signoff_min CHECK (signoff_min >= 1)."""
++        async with pg_pool.acquire() as conn:
++            tx = conn.transaction()
++            await tx.start()
++            try:
++                t_id, team_id, wf_id, _ = await _seed_workflow_base(conn)
++                stage = await conn.fetchval(
++                    "INSERT INTO workflow_stages (tenant_id, workflow_id, name, ordinal) "
++                    "VALUES ($1, $2, $3, 1) RETURNING stage_id",
++                    t_id,
++                    wf_id,
++                    f"st-{uuid4().hex}",
++                )
++                with pytest.raises(Exception) as exc:
++                    async with conn.transaction():
++                        await conn.execute(
++                            "INSERT INTO workflow_transitions "
++                            "(tenant_id, workflow_id, to_stage_id, signoff_min) "
++                            "VALUES ($1, $2, $3, 0)",
++                            t_id,
++                            wf_id,
++                            stage,
++                        )
++                assert "check" in str(exc.value).lower() or "violat" in str(
++                    exc.value
++                ).lower()
++            finally:
++                await tx.rollback()
++
++    async def test_change_type_check_accepts_extended_rejects_bogus(
++        self, pg_pool: Any
++    ) -> None:
++        """work_item_history.change_type CHECK: new event types OK, bogus rejected."""
++        async with pg_pool.acquire() as conn:
++            tx = conn.transaction()
++            await tx.start()
++            try:
++                t_id, team_id, wf_id, mem_id = await _seed_workflow_base(conn)
++                # Each of the three 0048-only values must be accepted...
++                for ct in ("stage", "signoff_requested", "signoff_approved"):
++                    rid = await conn.fetchval(
++                        "INSERT INTO work_item_history "
++                        "(memory_id, root_memory_id, tenant_id, team_id, change_type, "
++                        " kind_after, status_after, actor_id, channel, workflow_id) "
++                        "VALUES ($1, $1, $2, $3, $4, 'story', 'todo', $2, 'mcp', $5) "
++                        "RETURNING id",
++                        mem_id,
++                        t_id,
++                        team_id,
++                        ct,
++                        wf_id,
++                    )
++                    assert rid is not None, f"change_type {ct!r} was rejected"
++                # ...and a bogus value is rejected.
++                with pytest.raises(Exception) as exc:
++                    async with conn.transaction():
++                        await conn.execute(
++                            "INSERT INTO work_item_history "
++                            "(memory_id, root_memory_id, tenant_id, team_id, change_type, "
++                            " kind_after, status_after, actor_id, channel, workflow_id) "
++                            "VALUES ($1, $1, $2, $3, $4, 'story', 'todo', $2, 'mcp', $5)",
++                            mem_id,
++                            t_id,
++                            team_id,
++                            "bogus",
++                            wf_id,
++                        )
++                assert "check" in str(exc.value).lower() or "violat" in str(
++                    exc.value
++                ).lower()
++            finally:
++                await tx.rollback()
++
++    async def test_one_pending_request_per_item_index_enforced(self, pg_pool: Any) -> None:
++        """workflow_signoff_requests_one_pending_per_item partial unique index.
++
++        Two *pending* proposals on the same work item are rejected; resolving
++        one (status -> approved) frees the slot for a second pending proposal.
++        """
++        async with pg_pool.acquire() as conn:
++            tx = conn.transaction()
++            await tx.start()
++            try:
++                t_id, team_id, wf_id, mem_id = await _seed_workflow_base(conn)
++                await _ensure_work_item(conn, t_id, team_id, mem_id)
++                first = await _insert_signoff_requests_row(conn, t_id, team_id, mem_id)
++                # 2nd pending proposal on the same item violates the partial unique.
++                with pytest.raises(Exception) as exc:
++                    async with conn.transaction():
++                        await _insert_signoff_requests_row(conn, t_id, team_id, mem_id)
++                assert "unique" in str(exc.value).lower() or "duplicate" in str(
++                    exc.value
++                ).lower()
++                # Resolving the first moves it out of 'pending', freeing the slot.
++                await conn.execute(
++                    "UPDATE workflow_signoff_requests SET status = 'approved' "
++                    "WHERE request_id = $1",
++                    first,
++                )
++                second = await _insert_signoff_requests_row(conn, t_id, team_id, mem_id)
++                assert second is not None
++            finally:
++                await tx.rollback()
++
++
++class TestDowngradeUpgradeRoundTrip:
++    """0048 downgrade -> upgrade must be a clean round-trip on an empty schema.
++
++    Guarded by try/finally ``upgrade head`` so the shared DB is always restored
++    to HEAD even if an assertion fails mid-test. Empty schema is required because
++    downgrade re-adds the 4-value change_type CHECK, which rejects any row that
++    uses an 0048-only change_type (see the CAUTION comment in downgrade()). Lives
++    last so the schema-level behavioural tests run at HEAD first.
++    """
++
++    async def test_roundtrip_restores_head_with_all_objects(self, pg_pool: Any) -> None:
++        import alembic.command as alembic_command
++        from alembic.config import Config as AlembicConfig
++
++        cfg = AlembicConfig("alembic.ini")
++        try:
++            # Downgrade one step (0048 -> 0047), then climb back to HEAD.
++            alembic_command.downgrade(cfg, "0047_work_item_history_rls_fix")
++            alembic_command.upgrade(cfg, "head")
++            # Assert the 0048 objects are present again after the round-trip.
++            async with pg_pool.acquire() as conn:
++                for table in NEW_TABLES:
++                    exists = await conn.fetchval(
++                        "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
++                        "WHERE table_name = $1 AND table_type = 'BASE TABLE')",
++                        table,
++                    )
++                    assert exists, f"{table} missing after round-trip"
++                idx = await conn.fetchval(
++                    "SELECT EXISTS (SELECT 1 FROM pg_indexes "
++                    "WHERE indexname = $1)",
++                    "workflow_signoff_requests_one_pending_per_item",
++                )
++                assert idx is True, "one-pending-per-item index missing after round-trip"
++        finally:
++            # Guarantee the shared DB is back at HEAD regardless of outcome.
++            alembic_command.upgrade(cfg, "head")
++

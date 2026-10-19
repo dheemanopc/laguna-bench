@@ -1,0 +1,1713 @@
+diff --git a/src/mem_mcp/mindmap/workflow_crud.py b/src/mem_mcp/mindmap/workflow_crud.py
+new file mode 100644
+index 0000000..3efceb0
+--- /dev/null
++++ b/src/mem_mcp/mindmap/workflow_crud.py
+@@ -0,0 +1,661 @@
++"""Team-workflow CRUD: create, activate, get, legacy materialisation, remap.
++
++Owns the write/read side of the *team workflow definition* itself — stages,
++transitions, and sign-off rules. The sign-off *moves* (propose/sign/cancel)
++and the per-item reads live in ``workflow_moves`` / ``workflow_reads`` so each
++file has exactly one owning task (see ``docs/feature/wp1.md``).
++
++Every function takes an ``Any`` from ``tenant_tx``; it never
++imports FastAPI or ``JsonRpcError``. All SQL carries an explicit
++``tenant_id = $n`` clause in addition to the RLS policies defined in alembic
++0048 (defence in depth). The mutating entry points (``create_team_workflow`` /
++``activate_workflow`` / ``remap_workflow_stages``) gate on
++``TEAM_WRITE_MEMORY`` via ``auth.rbac.get_team_role`` + ``auth.permissions.
++ROLE_PERMISSIONS``; reads are team-role-open (any role on the team may view).
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import datetime
++from typing import Any
++from uuid import UUID, uuid4
++
++from mem_mcp.auth.permissions import ROLE_PERMISSIONS, Permission
++from mem_mcp.auth.rbac import get_team_role
++from mem_mcp.mindmap import work_items
++from mem_mcp.mindmap.workflow_errors import (
++    KindNotAllowedError,
++    StageNotFoundError,
++    WorkflowAlreadyActiveError,
++    WorkflowError,
++    WorkflowNotFoundError,
++    WorkflowPermissionDeniedError,
++)
++
++__all__ = [
++    "LEGACY_WORKFLOW_NAME",
++    "StageSpec",
++    "TransitionSpec",
++    "WorkflowStage",
++    "WorkflowTransition",
++    "Workflow",
++    "create_team_workflow",
++    "activate_workflow",
++    "get_workflow",
++    "materialise_legacy_workflow",
++    "remap_workflow_stages",
++]
++
++# Reserved name for the lazily-materialised legacy workflow. Kept inactive
++# (is_active=false) so it never collides with the one-active-per-team partial
++# UNIQUE index (alembic 0048 ``team_workflows_active_per_team``).
++LEGACY_WORKFLOW_NAME = "_legacy"
++
++
++# ---------------------------------------------------------------------------
++# Data structures
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class StageSpec:
++    """Specification for a stage passed to ``create_team_workflow``."""
++
++    name: str
++    is_initial: bool = False
++    is_terminal: bool = False
++
++
++@dataclass(frozen=True)
++class TransitionSpec:
++    """Specification for a transition passed to ``create_team_workflow``."""
++
++    from_stage: str | None
++    to_stage: str
++    requires_reason: bool = False
++    requires_signoff: bool = False
++    signoff_min: int = 1
++    signoff_roles: list[str] | None = None
++    allowed_kinds: list[str] | None = None
++
++
++@dataclass(frozen=True)
++class WorkflowStage:
++    """A stage as read back from a workflow definition."""
++
++    stage_id: UUID
++    name: str
++    ordinal: int
++    is_initial: bool
++    is_terminal: bool
++
++
++@dataclass(frozen=True)
++class WorkflowTransition:
++    """A transition as read back from a workflow definition."""
++
++    transition_id: UUID
++    from_stage: str | None
++    to_stage: str
++    requires_reason: bool
++    requires_signoff: bool
++    signoff_min: int
++    signoff_roles: tuple[str, ...] | None
++    allowed_kinds: tuple[str, ...] | None
++
++
++@dataclass(frozen=True)
++class Workflow:
++    """A complete team workflow definition (stages + transitions)."""
++
++    workflow_id: UUID
++    team_id: UUID
++    name: str
++    is_active: bool
++    version: int
++    created_by: UUID
++    created_at: datetime
++    stages: list[WorkflowStage]
++    transitions: list[WorkflowTransition]
++
++
++# ---------------------------------------------------------------------------
++# Permission / validation helpers
++# ---------------------------------------------------------------------------
++
++
++async def _check_team_write_permission(
++    conn: Any, actor_tenant_id: UUID, team_id: UUID
++) -> None:
++    """Gate a mutating operation on ``TEAM_WRITE_MEMORY`` for the caller's role.
++
++    Raises ``WorkflowPermissionDeniedError`` if the caller has no role on the
++    team or their role lacks ``TEAM_WRITE_MEMORY``. "Not on the team" and "lacks
++    permission" are deliberately indistinguishable — they both surface the same
++    denial — per the not-found == no-access contract (CONVENTIONS §error model).
++    """
++    role = await get_team_role(conn, actor_tenant_id, team_id)
++    if role is None or Permission.TEAM_WRITE_MEMORY not in ROLE_PERMISSIONS.get(role, set()):
++        raise WorkflowPermissionDeniedError(Permission.TEAM_WRITE_MEMORY, team_id)
++
++
++async def _check_team_access(
++    conn: Any, actor_tenant_id: UUID, team_id: UUID
++) -> None:
++    """Gate a read on team membership (any role may read; reads are role-open).
++
++    Raises ``WorkflowNotFoundError`` (opaque) if the caller is not a member of
++    the team — indistinguishable from "this team has no workflow".
++    """
++    if await get_team_role(conn, actor_tenant_id, team_id) is None:
++        raise WorkflowNotFoundError(team_id)
++
++
++def _validate_workflow_specs(
++    workflow_id: UUID,
++    stages: list[StageSpec],
++    transitions: list[TransitionSpec],
++) -> None:
++    """Validate stage/transition specs before inserting a workflow.
++
++    Raises ``WorkflowError`` for structural problems and
++    ``StageNotFoundError`` / ``KindNotAllowedError`` for references that don't
++    resolve — surfacing the workflow_id so callers can tie errors to the WIP.
++    """
++    if not stages:
++        raise WorkflowError("workflow must define at least one stage")
++    names = [s.name for s in stages]
++    if len(set(names)) != len(names):
++        raise WorkflowError("duplicate stage name in workflow definition")
++    if not any(s.is_initial for s in stages):
++        raise WorkflowError("workflow must define at least one initial stage")
++
++    name_set = set(names)
++    for spec in transitions:
++        if spec.to_stage not in name_set:
++            raise StageNotFoundError(spec.to_stage, workflow_id)
++        if spec.from_stage is not None and spec.from_stage not in name_set:
++            raise StageNotFoundError(spec.from_stage, workflow_id)
++        if spec.allowed_kinds:
++            for kind in spec.allowed_kinds:
++                if kind not in work_items.WORK_KINDS:
++                    raise KindNotAllowedError(kind, work_items.WORK_KINDS)
++        if spec.signoff_min < 1:
++            raise WorkflowError(
++                f"transition {spec.from_stage!r}->{spec.to_stage!r}: "
++                f"signoff_min must be >= 1, got {spec.signoff_min}"
++            )
++        if not spec.requires_signoff:
++            if spec.signoff_roles or spec.signoff_min != 1:
++                raise WorkflowError(
++                    f"transition {spec.from_stage!r}->{spec.to_stage!r}: "
++                    "signoff_roles/signoff_min require requires_signoff=True"
++                )
++
++
++# ---------------------------------------------------------------------------
++# Loading helpers (return the rich Workflow dataclass)
++# ---------------------------------------------------------------------------
++
++
++async def _load_stages(
++    conn: Any, workflow_id: UUID, tenant_id: UUID
++) -> list[WorkflowStage]:
++    rows = await conn.fetch(
++        """
++        SELECT stage_id, name, ordinal, is_initial, is_terminal
++        FROM workflow_stages
++        WHERE workflow_id = $1 AND tenant_id = $2
++        ORDER BY ordinal
++        """,
++        workflow_id,
++        tenant_id,
++    )
++    return [
++        WorkflowStage(
++            stage_id=r["stage_id"],
++            name=r["name"],
++            ordinal=r["ordinal"],
++            is_initial=bool(r["is_initial"]),
++            is_terminal=bool(r["is_terminal"]),
++        )
++        for r in rows
++    ]
++
++
++async def _load_transitions(
++    conn: Any, workflow_id: UUID, tenant_id: UUID
++) -> list[WorkflowTransition]:
++    # Stage names are resolved via a join on stage_id; stage rows for a workflow
++    # always carry the workflow's own tenant_id, so the join is unambiguous.
++    rows = await conn.fetch(
++        """
++        SELECT wt.transition_id,
++               sf.name        AS from_stage,
++               st.name        AS to_stage,
++               wt.requires_reason,
++               wt.requires_signoff,
++               wt.signoff_min,
++               wt.signoff_roles,
++               wt.allowed_kinds
++        FROM workflow_transitions wt
++        LEFT JOIN workflow_stages sf ON sf.stage_id = wt.from_stage_id
++        JOIN workflow_stages st      ON st.stage_id = wt.to_stage_id
++        WHERE wt.workflow_id = $1 AND wt.tenant_id = $2
++        """,
++        workflow_id,
++        tenant_id,
++    )
++    out: list[WorkflowTransition] = []
++    for r in rows:
++        signoff_roles = r["signoff_roles"]
++        allowed_kinds = r["allowed_kinds"]
++        out.append(
++            WorkflowTransition(
++                transition_id=r["transition_id"],
++                from_stage=r["from_stage"],
++                to_stage=r["to_stage"],
++                requires_reason=bool(r["requires_reason"]),
++                requires_signoff=bool(r["requires_signoff"]),
++                signoff_min=r["signoff_min"],
++                signoff_roles=tuple(signoff_roles) if signoff_roles else None,
++                allowed_kinds=tuple(allowed_kinds) if allowed_kinds else None,
++            )
++        )
++    return out
++
++
++async def _load_full_workflow(
++    conn: Any,
++    tenant_id: UUID,
++    team_id: UUID,
++    workflow_id: UUID,
++) -> Workflow:
++    """Load a workflow (with ordered stages + resolved transitions) by id.
++
++    Raises ``WorkflowNotFoundError`` if no row matches — visible only for the
++    caller's tenant/team (RLS + explicit filter).
++    """
++    row = await conn.fetchrow(
++        """
++        SELECT workflow_id, team_id, name, is_active, version, created_by, created_at
++        FROM team_workflows
++        WHERE workflow_id = $1 AND tenant_id = $2 AND team_id = $3
++        """,
++        workflow_id,
++        tenant_id,
++        team_id,
++    )
++    if row is None:
++        raise WorkflowNotFoundError(team_id, workflow_id)
++    stages = await _load_stages(conn, workflow_id, tenant_id)
++    transitions = await _load_transitions(conn, workflow_id, tenant_id)
++    return Workflow(
++        workflow_id=row["workflow_id"],
++        team_id=row["team_id"],
++        name=row["name"],
++        is_active=bool(row["is_active"]),
++        version=row["version"],
++        created_by=row["created_by"],
++        created_at=row["created_at"],
++        stages=stages,
++        transitions=transitions,
++    )
++
++
++# ---------------------------------------------------------------------------
++# Insertion helper shared by create + legacy materialisation
++# ---------------------------------------------------------------------------
++
++
++async def _insert_stages_and_transitions(
++    conn: Any,
++    workflow_id: UUID,
++    tenant_id: UUID,
++    stages: list[StageSpec],
++    transitions: list[TransitionSpec],
++) -> None:
++    """Insert stages then transitions for a freshly-created workflow.
++
++    Stage names are mapped to the generated ``stage_id`` so transitions can
++    reference them by name in the spec while storing FK id's in the rows.
++    """
++    stage_id_by_name: dict[str, UUID] = {}
++    for ordinal, spec in enumerate(stages, start=1):
++        stage_id = uuid4()
++        await conn.execute(
++            """
++            INSERT INTO workflow_stages
++                (stage_id, tenant_id, workflow_id, name, ordinal, is_initial, is_terminal)
++            VALUES ($1, $2, $3, $4, $5, $6, $7)
++            """,
++            stage_id,
++            tenant_id,
++            workflow_id,
++            spec.name,
++            ordinal,
++            spec.is_initial,
++            spec.is_terminal,
++        )
++        stage_id_by_name[spec.name] = stage_id
++
++    for tspec in transitions:
++        from_stage_id: UUID | None
++        if tspec.from_stage is None:
++            from_stage_id = None
++        else:
++            from_stage_id = stage_id_by_name[tspec.from_stage]
++        to_stage_id = stage_id_by_name[tspec.to_stage]
++        await conn.execute(
++            """
++            INSERT INTO workflow_transitions
++                (transition_id, tenant_id, workflow_id, from_stage_id, to_stage_id,
++                 requires_reason, requires_signoff, signoff_min, signoff_roles, allowed_kinds)
++            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
++            """,
++            uuid4(),
++            tenant_id,
++            workflow_id,
++            from_stage_id,
++            to_stage_id,
++            tspec.requires_reason,
++            tspec.requires_signoff,
++            tspec.signoff_min,
++            tspec.signoff_roles,
++            tspec.allowed_kinds,
++        )
++
++
++# ---------------------------------------------------------------------------
++# Public: create / activate / get / materialise_legacy / remap
++# ---------------------------------------------------------------------------
++
++
++async def create_team_workflow(
++    conn: Any,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    name: str,
++    stages: list[StageSpec],
++    transitions: list[TransitionSpec],
++    created_by: UUID,
++) -> Workflow:
++    """Create a new (inactive, version=1) team workflow atomically.
++
++    Requires ``TEAM_WRITE_MEMORY`` on ``team_id``; otherwise raises
++    ``WorkflowPermissionDeniedError``. Inserts ``team_workflows`` + stages +
++    transitions in one transaction, so a failure rolls back the whole set.
++    Raises ``WorkflowError`` (or a documented subclass) for invalid specs, and
++    ``WorkflowPermissionDeniedError`` on the write gate.
++    """
++    # tenant_id is the acting tenant here (no separate actor arg on create),
++    # matching the work_items permission pattern.
++    await _check_team_write_permission(conn, tenant_id, team_id)
++
++    workflow_id = uuid4()
++    _validate_workflow_specs(workflow_id, stages, transitions)
++
++    async with conn.transaction():
++        try:
++            await conn.execute(
++                """
++                INSERT INTO team_workflows
++                    (workflow_id, tenant_id, team_id, name, is_active, version, created_by)
++                VALUES ($1, $2, $3, $4, FALSE, 1, $5)
++                """,
++                workflow_id,
++                tenant_id,
++                team_id,
++                name,
++                created_by,
++            )
++        # asyncpg's UniqueViolationError carries SQLSTATE '23505'; we detect it
++        # by sqlstate rather than by class so this module need not import
++        # asyncpg (it is untyped and would otherwise require a ``type: ignore``).
++        except Exception as exc:
++            if getattr(exc, "sqlstate", None) == "23505":
++                raise WorkflowError(
++                    f"workflow {name!r} already exists for team {team_id}"
++                ) from exc
++            raise
++        await _insert_stages_and_transitions(conn, workflow_id, tenant_id, stages, transitions)
++
++    return await _load_full_workflow(conn, tenant_id, team_id, workflow_id)
++
++
++async def activate_workflow(
++    conn: Any,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    workflow_id: UUID,
++    actor_tenant_id: UUID,
++) -> Workflow:
++    """Activate a team's workflow, deactivating any prior active one.
++
++    Requires ``TEAM_WRITE_MEMORY`` (checked against ``actor_tenant_id``);
++    otherwise raises ``WorkflowPermissionDeniedError``. Honours the partial
++    UNIQUE (team_id) WHERE is_active by flipping the previous active workflow
++    inactive *before* activating the target, and bumps ``version``. Raises
++    ``WorkflowNotFoundError`` if the id isn't a workflow of this team, and
++    ``WorkflowAlreadyActiveError`` if it's already the active one.
++    """
++    await _check_team_write_permission(conn, actor_tenant_id, team_id)
++
++    async with conn.transaction():
++        exists = await conn.fetchval(
++            """
++            SELECT 1 FROM team_workflows
++            WHERE workflow_id = $1 AND team_id = $2 AND tenant_id = $3
++            """,
++            workflow_id,
++            team_id,
++            tenant_id,
++        )
++        if exists is None:
++            raise WorkflowNotFoundError(team_id, workflow_id)
++
++        was_active = await conn.fetchval(
++            """
++            SELECT is_active FROM team_workflows
++            WHERE workflow_id = $1 AND tenant_id = $2
++            """,
++            workflow_id,
++            tenant_id,
++        )
++        if was_active:
++            raise WorkflowAlreadyActiveError(workflow_id)
++
++        # Deactivate any prior active workflow for this team/tenant FIRST, so the
++        # partial unique index (team_id WHERE is_active) is never violated.
++        await conn.execute(
++            """
++            UPDATE team_workflows
++            SET is_active = FALSE
++            WHERE team_id = $1 AND tenant_id = $2 AND is_active = TRUE
++              AND workflow_id <> $3
++            """,
++            team_id,
++            tenant_id,
++            workflow_id,
++        )
++
++        # Activate the target and bump its version.
++        await conn.execute(
++            """
++            UPDATE team_workflows
++            SET is_active = TRUE, version = version + 1
++            WHERE workflow_id = $1 AND tenant_id = $2
++            """,
++            workflow_id,
++            tenant_id,
++        )
++
++    return await _load_full_workflow(conn, tenant_id, team_id, workflow_id)
++
++
++async def get_workflow(
++    conn: Any,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    workflow_id: UUID | None = None,
++) -> Workflow:
++    """Return a team's active workflow, or the named workflow by id.
++
++    Reads are team-role-open (any role on the team may view). If the caller has
++    no role on the team, or the team has no active workflow (when ``workflow_id``
++    is None), or the named id doesn't belong to the team/tenant, raises
++    ``WorkflowNotFoundError``. The returned stages are ordered by ordinal and
++    transitions carry their resolved stage names.
++    """
++    await _check_team_access(conn, tenant_id, team_id)
++
++    if workflow_id is None:
++        wid = await conn.fetchval(
++            """
++            SELECT workflow_id FROM team_workflows
++            WHERE team_id = $1 AND tenant_id = $2 AND is_active = TRUE
++            """,
++            team_id,
++            tenant_id,
++        )
++        if wid is None:
++            raise WorkflowNotFoundError(team_id)
++        workflow_id = wid
++
++    return await _load_full_workflow(conn, tenant_id, team_id, workflow_id)
++
++
++async def materialise_legacy_workflow(
++    conn: Any,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++) -> UUID:
++    """Lazily materialise the team's default legacy workflow, idempotently.
++
++    Inserts a workflow named ``_legacy`` (``is_active=false``) using
++    ``INSERT … ON CONFLICT (team_id, name) DO NOTHING`` semantics (the
++    upsert returns the canonical workflow_id whether this call inserted or lost
++    the race). Stages/transitions are derived from the hardcoded
++    ``WORK_STATUSES`` / ``TRANSITIONS`` in ``work_items`` (no sign-off; the
++    ``requires_reason`` flag is copied from the transition table). Idempotent
++    under concurrency: the workflow row is upserted, then locked via ``FOR
++    UPDATE``, and stages/transitions are inserted only if absent.
++
++    This is an internal helper (called from ``_resolve_workflow`` in T3); it
++    performs no permission check — callers are already authenticated/tenant-
++    scoped by their domain transaction.
++    """
++    legacy_stages: list[StageSpec] = [
++        StageSpec(
++            name=status,
++            is_initial=(status == "todo"),
++            is_terminal=(status in ("done", "cancelled")),
++        )
++        for status in work_items.WORK_STATUSES
++    ]
++    legacy_transitions: list[TransitionSpec] = [
++        TransitionSpec(
++            from_stage=frm,
++            to_stage=to,
++            requires_reason=requires_reason,
++            requires_signoff=False,
++            signoff_min=1,
++        )
++        for (frm, to), requires_reason in work_items.TRANSITIONS.items()
++    ]
++
++    async with conn.transaction():
++        # Upsert the workflow row; on conflict, return the EXISTING workflow_id
++        # (DO UPDATE SET workflow_id = team_workflows.workflow_id is a self-referential
++        # no-op that still satisfies RETURNING). The conflict target is the full
++        # UNIQUE(team_id, name) — never the partial active index, since the row is
++        # always is_active=false.
++        workflow_id_raw = await conn.fetchval(
++            """
++            INSERT INTO team_workflows
++                (workflow_id, tenant_id, team_id, name, is_active, version, created_by)
++            VALUES ($1, $2, $3, $4, FALSE, 1, $5)
++            ON CONFLICT (team_id, name) DO UPDATE
++               SET workflow_id = team_workflows.workflow_id
++            RETURNING workflow_id
++            """,
++            uuid4(),
++            tenant_id,
++            team_id,
++            LEGACY_WORKFLOW_NAME,
++            tenant_id,
++        )
++        assert workflow_id_raw is not None  # RETURNING always yields a row (insert or existing)
++        workflow_id: UUID = workflow_id_raw
++
++        # Lock the workflow row so concurrent materialisations serialise; only the
++        # first inserts stages/transitions, the rest see them and skip.
++        await conn.execute(
++            "SELECT 1 FROM team_workflows WHERE workflow_id = $1 AND tenant_id = $2 FOR UPDATE",
++            workflow_id,
++            tenant_id,
++        )
++
++        already_built = await conn.fetchval(
++            "SELECT 1 FROM workflow_stages WHERE workflow_id = $1 AND tenant_id = $2 LIMIT 1",
++            workflow_id,
++            tenant_id,
++        )
++        if already_built is None:
++            await _insert_stages_and_transitions(
++                conn, workflow_id, tenant_id, legacy_stages, legacy_transitions
++            )
++
++    return workflow_id
++
++
++async def remap_workflow_stages(
++    conn: Any,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    mappings: dict[str, str],
++    actor_tenant_id: UUID,
++) -> int:
++    """Remap ``work_items.current_stage`` values for a team's workflow change.
++
++    Requires ``TEAM_WRITE_MEMORY`` (checked against ``actor_tenant_id``). For
++    every mapping ``{old_stage: new_stage}``, updates rows whose
++    ``current_stage`` equals ``old_stage`` to ``new_stage``. Returns the number
++    of rows updated. Rows whose ``current_stage`` is not a mapping key (including
++    the ``NULL`` current_stage of legacy, workflow-less items) are left untouched
++    — those unmapped items are surfaced on the board instead.
++    """
++    await _check_team_write_permission(conn, actor_tenant_id, team_id)
++
++    if not mappings:
++        return 0
++
++    old_stages = list(mappings.keys())
++    new_stages = [mappings[k] for k in old_stages]
++
++    status = await conn.execute(
++        """
++        WITH m(old_stage, new_stage) AS (
++            SELECT o, n
++            FROM unnest($1::text[], $2::text[]) AS u(o, n)
++        )
++        UPDATE work_items w
++        SET current_stage = m.new_stage
++        FROM m
++        WHERE w.tenant_id = $3
++          AND w.team_id = $4
++          AND w.current_stage = m.old_stage
++        """,
++        old_stages,
++        new_stages,
++        tenant_id,
++        team_id,
++    )
++    # asyncpg returns the command tag, e.g. "UPDATE 3".
++    return int(status.split()[-1])
+diff --git a/tests/unit/mindmap/test_workflow_crud.py b/tests/unit/mindmap/test_workflow_crud.py
+new file mode 100644
+index 0000000..d699384
+--- /dev/null
++++ b/tests/unit/mindmap/test_workflow_crud.py
+@@ -0,0 +1,1040 @@
++"""DB-backed unit tests for ``mem_mcp.mindmap.workflow_crud``.
++
++Covers the WP1-T2 acceptance surface:
++* ``create_team_workflow`` — TEAM_WRITE_MEMORY gate, atomic insert of
++  team_workflows + stages + transitions, is_active=false / version=1;
++* ``activate_workflow`` — TEAM_WRITE_MEMORY gate, one-active-per-team, version bump;
++* ``get_workflow`` — active workflow (ordered stages/transitions) or named id;
++* ``materialise_legacy_workflow`` — idempotent ``_legacy`` workflow whose
++  stages/transitions mirror ``WORK_STATUSES`` / ``TRANSITIONS``;
++* ``remap_workflow_stages`` — TEAM_WRITE_MEMORY gate, bulk current_stage remap + count.
++
++Fixtures mirror ``tests/unit/test_work_items_service.py`` (UUID-suffixed tenants /
++teams). Every read of a tenant-scoped table runs inside ``tenant_tx`` because the
++RLS policies use ``safe_current_tenant_id()``.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++from uuid import UUID, uuid4
++
++import pytest
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mindmap import work_items
++from mem_mcp.mindmap.workflow_crud import (
++    StageSpec,
++    TransitionSpec,
++    Workflow,
++    activate_workflow,
++    create_team_workflow,
++    get_workflow,
++    materialise_legacy_workflow,
++    remap_workflow_stages,
++)
++from mem_mcp.mindmap.workflow_errors import (
++    KindNotAllowedError,
++    StageNotFoundError,
++    WorkflowAlreadyActiveError,
++    WorkflowError,
++    WorkflowNotFoundError,
++    WorkflowPermissionDeniedError,
++)
++from mem_mcp.teams.assignments import assign_role
++
++pytestmark = pytest.mark.asyncio
++
++
++# ---------------------------------------------------------------------------
++# Fixtures
++# ---------------------------------------------------------------------------
++
++
+<email>
++async def tenant_a(pg_pool: Any) -> UUID:
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"tenant-a-{uuid4()}@example.test",
++            )
++            return tid  # type: ignore[no-any-return]
++
++
+<email>
++async def team_a(pg_pool: Any, tenant_a: UUID) -> UUID:
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++                f"team-a-{uuid4().hex[:8]}",
++                tenant_a,
++            )
++            await assign_role(
++                conn,
++                parent_team_id=tid,
++                member_kind="user",
++                member_id=tenant_a,
++                role_key="owner",
++                assigned_by_user_id=tenant_a,
++            )
++            return tid  # type: ignore[no-any-return]
++
++
+<email>
++async def viewer_tenant(pg_pool: Any, tenant_a: UUID, team_a: UUID) -> UUID:
++    """A different tenant, member of team_a as a read-only 'viewer'."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"viewer-{uuid4()}@example.test",
++            )
++            await assign_role(
++                conn,
++                parent_team_id=team_a,
++                member_kind="user",
++                member_id=tid,
++                role_key="viewer",
++                assigned_by_user_id=tenant_a,
++            )
++            return tid  # type: ignore[no-any-return]
++
++
+<email>
++async def stranger_tenant(pg_pool: Any) -> UUID:
++    """A tenant that is NOT a member of team_a at all."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"stranger-{uuid4()}@example.test",
++            )
++            return tid  # type: ignore[no-any-return]
++
++
++# ---------------------------------------------------------------------------
++# Shared spec / helpers
++# ---------------------------------------------------------------------------
++
++
++def _sample_specs() -> tuple[list[StageSpec], list[TransitionSpec]]:
++    """A small three-stage workflow with a reason requirement on one edge."""
++    stages = [
++        StageSpec(name="backlog", is_initial=True),
++        StageSpec(name="in_progress"),
++        StageSpec(name="done", is_terminal=True),
++    ]
++    transitions = [
++        TransitionSpec(from_stage=None, to_stage="backlog"),
++        TransitionSpec(from_stage="backlog", to_stage="in_progress"),
++        TransitionSpec(from_stage="in_progress", to_stage="done"),
++        TransitionSpec(from_stage="in_progress", to_stage="backlog", requires_reason=True),
++    ]
++    return stages, transitions
++
++
++async def _count_workflow_rows(
++    pg_pool: Any, tenant_id: UUID, team_id: UUID
++) -> dict[str, int]:
++    """Count workflow/stage/transition rows for a team, as seen by ``tenant_id``."""
++    async with tenant_tx(pg_pool, tenant_id) as conn:
++        return {
++            "workflows": await conn.fetchval(
++                "SELECT COUNT(*) FROM team_workflows WHERE tenant_id = $1 AND team_id = $2",
++                tenant_id,
++                team_id,
++            ),
++            "stages": await conn.fetchval(
++                "SELECT COUNT(*) FROM workflow_stages ws "
++                "JOIN team_workflows tw ON tw.workflow_id = ws.workflow_id "
++                "WHERE tw.tenant_id = $1 AND tw.team_id = $2",
++                tenant_id,
++                team_id,
++            ),
++            "transitions": await conn.fetchval(
++                "SELECT COUNT(*) FROM workflow_transitions wt "
++                "JOIN team_workflows tw ON tw.workflow_id = wt.workflow_id "
++                "WHERE tw.tenant_id = $1 AND tw.team_id = $2",
++                tenant_id,
++                team_id,
++            ),
++        }
++
++
++async def _read_workflow_row(
++    pg_pool: Any, tenant_id: UUID, workflow_id: UUID
++) -> dict[str, Any] | None:
++    async with tenant_tx(pg_pool, tenant_id) as conn:
++        row = await conn.fetchrow(
++            "SELECT workflow_id, team_id, name, is_active, version, created_by "
++            "FROM team_workflows WHERE workflow_id = $1 AND tenant_id = $2",
++            workflow_id,
++            tenant_id,
++        )
++        return dict(row) if row else None
++
++
++# ---------------------------------------------------------------------------
++# create_team_workflow
++# ---------------------------------------------------------------------------
++
++
++async def test_create_requires_team_write_memory(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    viewer_tenant: UUID,
++) -> None:
++    """A viewer (no TEAM_WRITE_MEMORY) is denied and nothing is written."""
++    stages, transitions = _sample_specs()
++    with pytest.raises(WorkflowPermissionDeniedError) as exc_info:
++        async with tenant_tx(pg_pool, viewer_tenant) as conn:
++            await create_team_workflow(
++                conn,
++                tenant_id=viewer_tenant,
++                team_id=team_a,
++                name="viewer-wf",
++                stages=stages,
++                transitions=transitions,
++                created_by=viewer_tenant,
++            )
++    assert exc_info.value.permission is not None
++    assert exc_info.value.team_id == team_a
++
++    counts = await _count_workflow_rows(pg_pool, viewer_tenant, team_a)
++    assert counts == {"workflows": 0, "stages": 0, "transitions": 0}
++
++
++async def test_create_non_member_denied(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    stranger_tenant: UUID,
++) -> None:
++    """A tenant with no role on the team is denied."""
++    stages, transitions = _sample_specs()
++    with pytest.raises(WorkflowPermissionDeniedError):
++        async with tenant_tx(pg_pool, stranger_tenant) as conn:
++            await create_team_workflow(
++                conn,
++                tenant_id=stranger_tenant,
++                team_id=team_a,
++                name="stranger-wf",
++                stages=stages,
++                transitions=transitions,
++                created_by=stranger_tenant,
++            )
++
++
++async def test_create_inserts_inactive_version_one(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """Created workflow is inactive, version=1, and carries the spec rows."""
++    stages, transitions = _sample_specs()
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf = await create_team_workflow(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            name="sample",
++            stages=stages,
++            transitions=transitions,
++            created_by=tenant_a,
++        )
++    assert isinstance(wf, Workflow)
++    assert wf.name == "sample"
++    assert wf.is_active is False
++    assert wf.version == 1
++    assert wf.created_by == tenant_a
++    assert len(wf.stages) == 3
++    assert len(wf.transitions) == 4
++
++    counts = await _count_workflow_rows(pg_pool, tenant_a, team_a)
++    assert counts == {"workflows": 1, "stages": 3, "transitions": 4}
++
++
++async def test_create_stages_ordered_and_transitions_resolved(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """Returned stages are ordinal-ordered; transitions carry resolved names."""
++    stages, transitions = _sample_specs()
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf = await create_team_workflow(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            name="ordered",
++            stages=stages,
++            transitions=transitions,
++            created_by=tenant_a,
++        )
++    ordinals = [s.ordinal for s in wf.stages]
++    assert ordinals == [1, 2, 3]
++    names = [s.name for s in wf.stages]
++    assert names == ["backlog", "in_progress", "done"]
++
++    by_pair = {(t.from_stage, t.to_stage): t for t in wf.transitions}
++    entry = by_pair[(None, "backlog")]
++    assert entry.requires_reason is False
++    signalled = by_pair[("in_progress", "backlog")]
++    assert signalled.requires_reason is True
++    # Entry transition has a NULL from_stage_id; resolved name is None.
++    assert entry.from_stage is None
++    assert entry.to_stage == "backlog"
++
++
++async def test_create_invalid_kind_raises(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """allowed_kinds must be a subset of WORK_KINDS."""
++    stages = [StageSpec(name="s1", is_initial=True), StageSpec(name="s2")]
++    transitions = [
++        TransitionSpec(
++            from_stage=None,
++            to_stage="s2",
++            allowed_kinds=["story", "not-a-kind"],
++        )
++    ]
++    with pytest.raises(KindNotAllowedError) as exc_info:
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await create_team_workflow(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                name="bad-kind",
++                stages=stages,
++                transitions=transitions,
++                created_by=tenant_a,
++            )
++    assert exc_info.value.kind == "not-a-kind"
++    assert "story" in exc_info.value.allowed
++    # Validation happens before insert -> nothing persisted.
++    counts = await _count_workflow_rows(pg_pool, tenant_a, team_a)
++    assert counts == {"workflows": 0, "stages": 0, "transitions": 0}
++
++
++async def test_create_unknown_transition_stage_raises(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """A transition referencing an undefined stage raises before any insert."""
++    stages = [StageSpec(name="s1", is_initial=True)]
++    transitions = [TransitionSpec(from_stage="nope", to_stage="s1")]
++    with pytest.raises(StageNotFoundError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await create_team_workflow(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                name="bad-ref",
++                stages=stages,
++                transitions=transitions,
++                created_by=tenant_a,
++            )
++    # Validation happens before insert -> nothing persisted (atomic-by-construction).
++    counts = await _count_workflow_rows(pg_pool, tenant_a, team_a)
++    assert counts == {"workflows": 0, "stages": 0, "transitions": 0}
++
++
++async def test_create_duplicate_name_rolls_back_atomically(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """A duplicate name fails atomically: no stray stages/transitions written."""
++    stages, transitions = _sample_specs()
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await create_team_workflow(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            name="dup",
++            stages=stages,
++            transitions=transitions,
++            created_by=tenant_a,
++        )
++    with pytest.raises(WorkflowError) as exc_info:
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await create_team_workflow(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                name="dup",
++                stages=stages,
++                transitions=transitions,
++                created_by=tenant_a,
++            )
++    assert "already exists" in str(exc_info.value)
++    # Exactly one workflow survived — the failed attempt wrote nothing extra.
++    counts = await _count_workflow_rows(pg_pool, tenant_a, team_a)
++    assert counts == {"workflows": 1, "stages": 3, "transitions": 4}
++
++
++# ---------------------------------------------------------------------------
++# activate_workflow
++# ---------------------------------------------------------------------------
++
++
++async def test_activate_requires_team_write_memory(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    viewer_tenant: UUID,
++) -> None:
++    """A viewer cannot activate, even though the workflow is the owner's."""
++    stages, transitions = _sample_specs()
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf = await create_team_workflow(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            name="to-activate",
++            stages=stages,
++            transitions=transitions,
++            created_by=tenant_a,
++        )
++    with pytest.raises(WorkflowPermissionDeniedError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await activate_workflow(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                workflow_id=wf.workflow_id,
++                actor_tenant_id=viewer_tenant,
++            )
++
++
++async def test_activate_sets_active_and_deactivates_prior(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """Activating B flips the prior active A inactive and bumps version."""
++    stages, transitions = _sample_specs()
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf_a = await create_team_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, name="wf-a",
++            stages=stages, transitions=transitions, created_by=tenant_a,
++        )
++        await activate_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf_a.workflow_id,
++            actor_tenant_id=tenant_a,
++        )
++        wf_b = await create_team_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, name="wf-b",
++            stages=stages, transitions=transitions, created_by=tenant_a,
++        )
++
++    # Only one active per team (partial UNIQUE).
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        active = await conn.fetchval(
++            "SELECT workflow_id FROM team_workflows "
++            "WHERE team_id = $1 AND tenant_id = $2 AND is_active = TRUE",
++            team_a, tenant_a,
++        )
++    assert active == wf_a.workflow_id
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf_b_activated = await activate_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf_b.workflow_id,
++            actor_tenant_id=tenant_a,
++        )
++    assert wf_b_activated.is_active is True
++    assert wf_b_activated.version == 2  # created at v1; activation bumps to v2
++
++    # The prior active (A) is now inactive; B is the sole active.
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        rows = await conn.fetch(
++            "SELECT workflow_id, is_active FROM team_workflows "
++            "WHERE team_id = $1 AND tenant_id = $2 ORDER BY name",
++            team_a, tenant_a,
++        )
++        n_active = await conn.fetchval(
++            "SELECT COUNT(*) FROM team_workflows WHERE team_id = $1 AND tenant_id = $2 AND is_active",
++            team_a, tenant_a,
++        )
++    by_id = {r["workflow_id"]: bool(r["is_active"]) for r in rows}
++    assert by_id[wf_a.workflow_id] is False
++    assert by_id[wf_b.workflow_id] is True
++    assert n_active == 1
++
++
++async def test_activate_already_active_raises(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """Activating the already-active workflow raises WorkflowAlreadyActiveError."""
++    stages, transitions = _sample_specs()
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf = await create_team_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, name="active",
++            stages=stages, transitions=transitions, created_by=tenant_a,
++        )
++        await activate_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf.workflow_id,
++            actor_tenant_id=tenant_a,
++        )
++    with pytest.raises(WorkflowAlreadyActiveError) as exc_info:
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await activate_workflow(
++                conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf.workflow_id,
++                actor_tenant_id=tenant_a,
++            )
++    assert exc_info.value.workflow_id == wf.workflow_id
++
++
++async def test_activate_not_found_raises(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """Activating a workflow id that doesn't belong to the team raises."""
++    bogus = uuid4()
++    with pytest.raises(WorkflowNotFoundError) as exc_info:
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await activate_workflow(
++                conn, tenant_id=tenant_a, team_id=team_a, workflow_id=bogus,
++                actor_tenant_id=tenant_a,
++            )
++    assert exc_info.value.team_id == team_a
++    assert exc_info.value.workflow_id == bogus
++
++
++async def test_activate_version_bumps_each_time(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """Re-activating a workflow bumps its version each time it is activated."""
++    stages, transitions = _sample_specs()
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf_a = await create_team_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, name="v-a",
++            stages=stages, transitions=transitions, created_by=tenant_a,
++        )
++        await activate_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf_a.workflow_id,
++            actor_tenant_id=tenant_a,
++        )
++        # Deactivate A by activating B, then re-activate A.
++        wf_b = await create_team_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, name="v-b",
++            stages=stages, transitions=transitions, created_by=tenant_a,
++        )
++        await activate_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf_b.workflow_id,
++            actor_tenant_id=tenant_a,
++        )
++        await activate_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf_a.workflow_id,
++            actor_tenant_id=tenant_a,
++        )
++
++    # version starts at 1; A is activated twice (1->2, then 2->3).
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        version_a = await conn.fetchval(
++            "SELECT version FROM team_workflows WHERE workflow_id = $1 AND tenant_id = $2",
++            wf_a.workflow_id, tenant_a,
++        )
++    assert version_a == 3
++
++
++# ---------------------------------------------------------------------------
++# get_workflow
++# ---------------------------------------------------------------------------
++
++
++async def test_get_active_workflow(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    stages, transitions = _sample_specs()
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf = await create_team_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, name="for-get",
++            stages=stages, transitions=transitions, created_by=tenant_a,
++        )
++        await activate_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf.workflow_id,
++            actor_tenant_id=tenant_a,
++        )
++        fetched = await get_workflow(conn, tenant_id=tenant_a, team_id=team_a)
++    assert fetched.workflow_id == wf.workflow_id
++    assert fetched.is_active is True
++    assert fetched.name == "for-get"
++    assert [s.ordinal for s in fetched.stages] == [1, 2, 3]
++    assert len(fetched.transitions) == 4
++
++
++async def test_get_named_workflow(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    stages, transitions = _sample_specs()
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf = await create_team_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, name="named",
++            stages=stages, transitions=transitions, created_by=tenant_a,
++        )
++        fetched = await get_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf.workflow_id,
++        )
++    assert fetched.workflow_id == wf.workflow_id
++    assert fetched.is_active is False  # not activated, but fetchable by id
++
++
++async def test_get_no_active_workflow_raises(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    # A workflow exists but is inactive (create leaves is_active=false).
++    stages, transitions = _sample_specs()
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await create_team_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, name="inactive",
++            stages=stages, transitions=transitions, created_by=tenant_a,
++        )
++    with pytest.raises(WorkflowNotFoundError) as exc_info:
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await get_workflow(conn, tenant_id=tenant_a, team_id=team_a)
++    assert exc_info.value.workflow_id is None
++
++
++async def test_get_named_workflow_not_found(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    bogus = uuid4()
++    with pytest.raises(WorkflowNotFoundError) as exc_info:
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await get_workflow(
++                conn, tenant_id=tenant_a, team_id=team_a, workflow_id=bogus,
++            )
++    assert exc_info.value.workflow_id == bogus
++
++
++async def test_get_workflow_non_member_denied(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    stranger_tenant: UUID,
++) -> None:
++    """A tenant that isn't on the team cannot read workflows (opaque denial)."""
++    stages, transitions = _sample_specs()
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf = await create_team_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, name="secret",
++            stages=stages, transitions=transitions, created_by=tenant_a,
++        )
++    # stranger is the caller; access check rejects them before the row is loaded.
++    with pytest.raises(WorkflowNotFoundError):
++        async with tenant_tx(pg_pool, stranger_tenant) as conn:
++            await get_workflow(
++                conn, tenant_id=stranger_tenant, team_id=team_a, workflow_id=wf.workflow_id,
++            )
++
++
++async def test_get_workflow_cross_tenant_invisible(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """A second tenant cannot see tenant_a's workflows (opaque to non-members)."""
++    stages, transitions = _sample_specs()
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await create_team_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, name="a-only",
++            stages=stages, transitions=transitions, created_by=tenant_a,
++        )
++    # tenant_b exists but is not a member of team_a.
++    tenant_b = await pg_pool.fetchval(
++        "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++        f"t-b-{uuid4()}@test.invalid",
++    )
++    with pytest.raises(WorkflowNotFoundError):
++        async with tenant_tx(pg_pool, tenant_b) as conn:
++            await get_workflow(conn, tenant_id=tenant_b, team_id=team_a)
++
++
++# ---------------------------------------------------------------------------
++# materialise_legacy_workflow
++# ---------------------------------------------------------------------------
++
++
++async def test_materialise_legacy_inserts_inactive(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wid = await materialise_legacy_workflow(conn, tenant_id=tenant_a, team_id=team_a)
++    row = await _read_workflow_row(pg_pool, tenant_a, wid)
++    assert row is not None
++    assert row["name"] == "_legacy"
++    assert row["is_active"] is False
++    assert row["version"] == 1
++    assert row["team_id"] == team_a
++    assert row["created_by"] == tenant_a
++
++
++async def test_materialise_legacy_stages_and_transitions_match_hardcoded(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """Legacy stages/transitions must mirror work_items.WORK_STATUSES/TRANSITIONS."""
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wid = await materialise_legacy_workflow(conn, tenant_id=tenant_a, team_id=team_a)
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        stage_rows = await conn.fetch(
++            "SELECT name, ordinal, is_initial, is_terminal FROM workflow_stages "
++            "WHERE workflow_id = $1 AND tenant_id = $2 ORDER BY ordinal",
++            wid, tenant_a,
++        )
++    names = [r["name"] for r in stage_rows]
++    assert names == list(work_items.WORK_STATUSES)
++    assert [s["ordinal"] for s in stage_rows] == list(
++        range(1, len(work_items.WORK_STATUSES) + 1)
++    )
++    initials = [s["name"] for s in stage_rows if s["is_initial"]]
++    assert initials == ["todo"]
++    terminals = [s["name"] for s in stage_rows if s["is_terminal"]]
++    assert set(terminals) == {"done", "cancelled"}
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        trans_rows = await conn.fetch(
++            "SELECT sf.name AS from_stage, st.name AS to_stage, "
++            "wt.requires_reason, wt.requires_signoff, wt.signoff_min "
++            "FROM workflow_transitions wt "
++            "LEFT JOIN workflow_stages sf ON sf.stage_id = wt.from_stage_id "
++            "JOIN workflow_stages st ON st.stage_id = wt.to_stage_id "
++            "WHERE wt.workflow_id = $1 AND wt.tenant_id = $2",
++            wid, tenant_a,
++        )
++    assert len(trans_rows) == len(work_items.TRANSITIONS)
++    actual = {(r["from_stage"], r["to_stage"]): r for r in trans_rows}
++    for (frm, to), requires_reason in work_items.TRANSITIONS.items():
++        assert (frm, to) in actual
++        row = actual[(frm, to)]
++        assert row["requires_reason"] is requires_reason
++        assert row["requires_signoff"] is False
++        assert row["signoff_min"] == 1
++
++
++async def test_materialise_legacy_idempotent(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """Repeated calls return the same workflow_id and don't duplicate stages."""
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wid1 = await materialise_legacy_workflow(conn, tenant_id=tenant_a, team_id=team_a)
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wid2 = await materialise_legacy_workflow(conn, tenant_id=tenant_a, team_id=team_a)
++    assert wid1 == wid2
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        n_wf = await conn.fetchval(
++            "SELECT COUNT(*) FROM team_workflows "
++            "WHERE team_id = $1 AND tenant_id = $2 AND name = '_legacy'",
++            team_a, tenant_a,
++        )
++        n_stages = await conn.fetchval(
++            "SELECT COUNT(*) FROM workflow_stages WHERE workflow_id = $1 AND tenant_id = $2",
++            wid1, tenant_a,
++        )
++        n_trans = await conn.fetchval(
++            "SELECT COUNT(*) FROM workflow_transitions WHERE workflow_id = $1 AND tenant_id = $2",
++            wid1, tenant_a,
++        )
++    assert n_wf == 1
++    assert n_stages == len(work_items.WORK_STATUSES)
++    assert n_trans == len(work_items.TRANSITIONS)
++
++
++async def test_materialise_legacy_per_team(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> None:
++    """Each team gets its own _legacy workflow row."""
++    team_b = await pg_pool.fetchval(
++        "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++        f"team-b-{uuid4().hex[:8]}", tenant_a,
++    )
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wid_a = await materialise_legacy_workflow(conn, tenant_id=tenant_a, team_id=team_a)
++        wid_b = await materialise_legacy_workflow(conn, tenant_id=tenant_a, team_id=team_b)
++    assert wid_a != wid_b
++
++
++# ---------------------------------------------------------------------------
++# remap_workflow_stages
++# ---------------------------------------------------------------------------
++
++
+<email>
++async def work_items_on_map(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++) -> list[UUID]:
++    """Three work items on a live map, returned as node memory ids.
++
++    Items are created under tenant_a at status='todo' with ``current_stage`` NULL
++    (legacy, no workflow assigned); individual tests set ``current_stage`` as
++    needed before remapping.
++    """
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            root_mem_id = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash,
++                                     embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'Root', $3,
++                        array_fill(0::real, ARRAY[1024])::vector, 'api', 'question', 'team')
++                RETURNING id
++                """,
++                tenant_a, team_a, f"hash-root-{uuid4().hex}",
++            )
++            await conn.execute(
++                "INSERT INTO memory_maps (root_memory_id, tenant_id, team_id, title, state) "
++                "VALUES ($1, $2, $3, $4, 'live')",
++                root_mem_id, tenant_a, team_a, f"map-{uuid4().hex[:8]}",
++            )
++            map_key = f"map-{root_mem_id.hex[:8]}"
++            await conn.execute(
++                "INSERT INTO slugs (memory_id, team_id, resource_type, slug, title) "
++                "VALUES ($1, $2, 'map', $3, $4)",
++                root_mem_id, team_a, map_key, "Remap Map",
++            )
++            node_ids: list[UUID] = []
++            for i in range(3):
++                nid = await conn.fetchval(
++                    """
++                    INSERT INTO memories (tenant_id, team_id, content, content_hash,
++                                         embedding, source_kind, type, visibility)
++                    VALUES ($1, $2, $3, $4,
++                            array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++                    RETURNING id
++                    """,
++                    tenant_a, team_a, f"node-{i}-{uuid4().hex}",
++                    f"hash-n{i}-{uuid4().hex}",
++                )
++                await conn.execute(
++                    "INSERT INTO memory_map_membership "
++                    "(memory_id, root_memory_id, tenant_id, node_role, turn, authored_by) "
++                    "VALUES ($1, $2, $3, 'position', 'owner', 'owner')",
++                    nid, root_mem_id, tenant_a,
++                )
++                await conn.execute(
++                    "INSERT INTO work_items "
++                    "(memory_id, root_memory_id, tenant_id, team_id, created_by, "
++                    "kind, status, status_changed_at) "
++                    "VALUES ($1, $2, $3, $4, $5, 'story', 'todo', now())",
++                    nid, root_mem_id, tenant_a, team_a, tenant_a,
++                )
++                node_ids.append(nid)
++            return node_ids
++
++
++async def _set_current_stage(
++    pg_pool: Any, tenant_id: UUID, team_id: UUID, node_id: UUID, stage: str | None
++) -> None:
++    async with tenant_tx(pg_pool, tenant_id) as conn:
++        await conn.execute(
++            "UPDATE work_items SET current_stage = $1, updated_at = now() "
++            "WHERE memory_id = $2 AND tenant_id = $3 AND team_id = $4",
++            stage, node_id, tenant_id, team_id,
++        )
++
++
++async def _read_current_stage(
++    pg_pool: Any, tenant_id: UUID, team_id: UUID, node_id: UUID
++) -> str | None:
++    async with tenant_tx(pg_pool, tenant_id) as conn:
++        return await conn.fetchval(
++            "SELECT current_stage FROM work_items "
++            "WHERE memory_id = $1 AND tenant_id = $2 AND team_id = $3",
++            node_id, tenant_id, team_id,
++        )
++
++
++async def test_remap_requires_team_write_memory(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    viewer_tenant: UUID,
++    work_items_on_map: list[UUID],
++) -> None:
++    with pytest.raises(WorkflowPermissionDeniedError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await remap_workflow_stages(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                mappings={"todo": "queued"},
++                actor_tenant_id=viewer_tenant,
++            )
++    # Nothing moved.
++    for nid in work_items_on_map:
++        assert await _read_current_stage(pg_pool, tenant_a, team_a, nid) is None
++
++
++async def test_remap_updates_mapped_and_returns_count(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    work_items_on_map: list[UUID],
++) -> None:
++    n0, n1, n2 = work_items_on_map
++    await _set_current_stage(pg_pool, tenant_a, team_a, n0, "todo")
++    await _set_current_stage(pg_pool, tenant_a, team_a, n1, "in_progress")
++    await _set_current_stage(pg_pool, tenant_a, team_a, n2, "done")
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        count = await remap_workflow_stages(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            mappings={"todo": "queued", "in_progress": "doing"},
++            actor_tenant_id=tenant_a,
++        )
++    assert count == 2
++    assert await _read_current_stage(pg_pool, tenant_a, team_a, n0) == "queued"
++    assert await _read_current_stage(pg_pool, tenant_a, team_a, n1) == "doing"
++    # n2 mapped from 'done' -> untouched.
++    assert await _read_current_stage(pg_pool, tenant_a, team_a, n2) == "done"
++
++
++async def test_remap_unmapped_and_null_untouched(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    work_items_on_map: list[UUID],
++) -> None:
++    n0, n1, n2 = work_items_on_map
++    await _set_current_stage(pg_pool, tenant_a, team_a, n0, "todo")
++    await _set_current_stage(pg_pool, tenant_a, team_a, n1, None)
++    await _set_current_stage(pg_pool, tenant_a, team_a, n2, "done")
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        count = await remap_workflow_stages(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            mappings={"todo": "queued"},
++            actor_tenant_id=tenant_a,
++        )
++    assert count == 1
++    assert await _read_current_stage(pg_pool, tenant_a, team_a, n0) == "queued"
++    assert await _read_current_stage(pg_pool, tenant_a, team_a, n1) is None
++    assert await _read_current_stage(pg_pool, tenant_a, team_a, n2) == "done"
++
++
++async def test_remap_empty_mappings_returns_zero(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    work_items_on_map: list[UUID],
++) -> None:
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        count = await remap_workflow_stages(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            mappings={},
++            actor_tenant_id=tenant_a,
++        )
++    assert count == 0
++    for nid in work_items_on_map:
++        assert await _read_current_stage(pg_pool, tenant_a, team_a, nid) is None
++
++
++async def test_remap_does_not_cross_team(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    work_items_on_map: list[UUID],
++) -> None:
++    """Remap scoped to team_a must not touch team_b's items."""
++    team_b = await pg_pool.fetchval(
++        "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++        f"team-b-{uuid4().hex[:8]}", tenant_a,
++    )
++    # A work item on team_b with current_stage 'todo'.
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            root_b = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash,
++                                     embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'RootB', $3,
++                        array_fill(0::real, ARRAY[1024])::vector, 'api', 'question', 'team')
++                RETURNING id
++                """,
++                tenant_a, team_b, f"hash-root-b-{uuid4().hex}",
++            )
++            node_b = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash,
++                                     embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'NodeB', $3,
++                        array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++                RETURNING id
++                """,
++                tenant_a, team_b, f"hash-node-b-{uuid4().hex}",
++            )
++            await conn.execute(
++                "INSERT INTO memory_maps (root_memory_id, tenant_id, team_id, title, state) "
++                "VALUES ($1, $2, $3, $4, 'live')",
++                root_b, tenant_a, team_b, "Cross-team Map",
++            )
++            await conn.execute(
++                "INSERT INTO memory_map_membership "
++                "(memory_id, root_memory_id, tenant_id, node_role, turn, authored_by) "
++                "VALUES ($1, $2, $3, 'position', 'owner', 'owner')",
++                node_b, root_b, tenant_a,
++            )
++            await conn.execute(
++                "INSERT INTO work_items "
++                "(memory_id, root_memory_id, tenant_id, team_id, created_by, "
++                "kind, status, current_stage, status_changed_at) "
++                "VALUES ($1, $2, $3, $4, $5, 'story', 'todo', 'todo', now())",
++                node_b, root_b, tenant_a, team_b, tenant_a,
++            )
++
++    # One team_a item carries 'todo'; the team_b item also carries 'todo'.
++    n0 = work_items_on_map[0]
++    await _set_current_stage(pg_pool, tenant_a, team_a, n0, "todo")
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        count = await remap_workflow_stages(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            mappings={"todo": "queued"},
++            actor_tenant_id=tenant_a,
++        )
++    # Only the team_a item moved; the team_b item keeps 'todo'.
++    assert count == 1
++    assert await _read_current_stage(pg_pool, tenant_a, team_a, n0) == "queued"
++    # The item lives under tenant_a (its creator) but on team_b — still owned by
++    # tenant_a, so it is readable in tenant_a's context and was untouched by the
++    # team_a-scoped remap.
++    assert await _read_current_stage(pg_pool, tenant_a, team_b, node_b) == "todo"

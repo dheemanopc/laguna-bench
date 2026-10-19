@@ -1,0 +1,12 @@
+The architect reviewed your design and asked for revisions:
+
+VERDICT: REVISE
+
+1. R4 hole in rebase: E4/§2.7 let an item be rebased with its current status unmapped. The item then sits on the target version in a status that version doesn't define, so there are no transitions out and it's stuck. Rebase must require a mapping for the item's current status (reject with `rebase_conflict` otherwise), or else rebase isn't safe.
+2. Stale or duplicate sign-off requests: §2.4 completes a request by moving the item to `to_status` without checking that the item is still in `from_status`. Between request and quorum the item can be moved or rebased (§2.7 keeps pending requests). Nothing stops two pending requests on the same item, and nothing stops two concurrent approvals from both crossing quorum. Needed: revalidate status on completion, auto-close superseded requests, a partial unique index on `(work_item_id) WHERE status='pending'`, and `FOR UPDATE` on the request row.
+3. Grants contradict the flows. §1.3:140 grants only SELECT, INSERT on the new tables, but §2.4 UPDATEs `work_item_signoff_requests.status/resolved_at`, and §2.6 UPDATEs `team_workflows.current_version_id`. `team_workflow_event_log` is GRANT SELECT only (§1.3:138-139, garbled sentence), yet §2.6 inserts into it.
+4. §3 `mindmap_workflow_update` output says `orphaned_statuses` is "empty when reject_if_orphans=false". That's backwards: it is only meaningful in that case (E1). The E8 rule "terminal per the live workflow" should be "per the item's frozen workflow" (R4 consistency).
+5. Nit on naming: approvals are keyed `approver_tenant_id`, but versions and requests use `*_identity_id`. In this codebase tenant = user (`auth/rbac.py:28`), so pick one name. §7 still says "sentinel-free from_status" and "MCMC".
+
+
+Revise docs/feature/02-design.md accordingly (no code). When done, end your turn with a 3-line summary of what you changed.

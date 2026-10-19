@@ -1,0 +1,181 @@
+{
+  "T1": {
+    "2fcd5d": {
+      "conventions": 4, "layering": 5, "error_handling": 4, "test_quality": 4,
+      "spec_conformance": 3, "scope_hygiene": 5, "overall": 4,
+      "strongest": "AdminTool.__init_subclass__ enforces system.* permission, admin.* audit action and forbids overriding __call__; gate runs before run(), denied/error audits committed on a fresh system_tx.",
+      "issues": [
+        "admin/service.py AdminUserSummary: exposes `id` not `tenant_id`, and omits the required `provider` and `default_team_id` fields.",
+        "_admin_base.py __call__: audit details lack the required `via: mcp`, `tool`, `required_permission` keys (denied row only has missing_permission; success row has tenant_id).",
+        "find_users(conn, query, limit) is not keyword-only as specified; input caps query at 128 chars instead of 255 and defaults limit to None instead of 20."
+      ],
+      "test_tampering": "no: only new files (tests/unit/test_admin_service.py, test_admin_tools.py)."
+    },
+    "7aaa18": {
+      "conventions": 3, "layering": 3, "error_handling": 2, "test_quality": 3,
+      "spec_conformance": 2, "scope_hygiene": 4, "overall": 2,
+      "strongest": "Clear three-phase __call__ (gate, run with success audit, fresh-tx error audit); denial tests in tests/security check code + data + persisted denied row.",
+      "issues": [
+        "admin/service.py find_users: only rejects empty queries (1-char query accepted; tool min_length=1), raises AdminError instead of ValueError; _clamp_limit takes no None and maps <1 to 20 instead of clamping to 1.",
+        "admin/service.py: system_role (single, via LEFT JOIN tenant_system_roles) instead of system_roles list; JOINs over all identities + roles produce duplicate rows; get_user INNER JOINs primary identity so a tenant without one is 'not found'; ordering by last_seen_at, not newest signup; no status/created_at/provider/default_team_id in summary.",
+        "find_user output has no `count`; AdminTool does not forbid overriding __call__ or validate system.*/admin.* prefixes; falls back to a bare DbAuditLogger when deps is None; lint exemption covers the whole src/mem_mcp/admin/ prefix."
+      ],
+      "test_tampering": "no: only new files."
+    }
+  },
+  "T2": {
+    "02f904": {
+      "conventions": 4, "layering": 4, "error_handling": 4, "test_quality": 4,
+      "spec_conformance": 4, "scope_hygiene": 5, "overall": 4,
+      "strongest": "Minimal root-cause fix: one shared caller_can_access_memory() (owner OR UETA on the memory's team) applied at all four sites, which also closes the old team_id IS NULL skip.",
+      "issues": [
+        "teams/references.py caller_can_access_memory: rule ignores the read path's team_members/visibility='team' branch, so a raw-SQL-provisioned team member (no UETA) can still read via memory_get but not reference.",
+        "Keeps N+1 per-row queries in refs_in/refs_out/hard-delete instead of batching."
+      ],
+      "test_tampering": "no: new tests/integration/test_references_access_rule.py only."
+    },
+    "6b8e41": {
+      "conventions": 4, "layering": 4, "error_handling": 4, "test_quality": 3,
+      "spec_conformance": 5, "scope_hygiene": 3, "overall": 4,
+      "strongest": "SECURITY DEFINER user_can_read_memory() mirrors the memories_select RLS policy (owner OR team-visible + active team member) plus UETA, so the write path agrees with memory_get most faithfully.",
+      "issues": [
+        "Two overlapping regression files (test_references_access_regression.py and test_user_can_read_memory_regression_01a54.py) duplicate many of the same cases; the odd '_01a54' suffix looks like an artefact.",
+        "check_hard_delete_with_filtered_citers keeps a now-unused JOIN memories; still per-row function calls (N+1)."
+      ],
+      "test_tampering": "no: only new test files."
+    },
+    "8fa772": {
+      "conventions": 5, "layering": 5, "error_handling": 5, "test_quality": 5,
+      "spec_conformance": 4, "scope_hygiene": 5, "overall": 5,
+      "strongest": "Single source of truth memory_readable_by() SQL function plus a bulk helper (unnest) used by all four sites; thorough migration docstring with root cause; unit + integration tests including NULL-team leak and opacity.",
+      "issues": [
+        "Rule is owner OR UETA; does not include the team_members/visibility='team' read-path branch (same gap as 02f904/f6ceba)."
+      ],
+      "test_tampering": "no: only new test files."
+    },
+    "f6ceba": {
+      "conventions": 4, "layering": 4, "error_handling": 5, "test_quality": 4,
+      "spec_conformance": 4, "scope_hygiene": 5, "overall": 4,
+      "strongest": "Predicate evaluated inline in the resolving SELECT (uuid and slug paths), so miss / no-access / deleted collapse to one query and one outcome; refs graph computed in one query.",
+      "issues": [
+        "get_inbound_refs/get_outbound_refs gain an optional caller_user_id that forks each into two near-duplicate SQL branches.",
+        "Same owner-or-UETA rule; team_members read-path branch not covered.",
+        "Migration bundles CREATE FUNCTION and GRANT in one sa.text() execute."
+      ],
+      "test_tampering": "no: only new tests/integration/test_references_owner_access.py."
+    }
+  },
+  "T3": {
+    "01d9a7": {
+      "conventions": 5, "layering": 4, "error_handling": 4, "test_quality": 5,
+      "spec_conformance": 5, "scope_hygiene": 5, "overall": 4,
+      "strongest": "Transport-agnostic teams/authz.require_team_permission + TeamPermissionDeniedError, mapped once by mcp/tools/_team_authz.check_team_permission (one-line call per tool, gate before email lookup); role matrix covers exactly the 7 catalog roles.",
+      "issues": [
+        "Revocation can still be bypassed through get_team_role's legacy team_members fallback (a removed backfilled admin keeps a team_members row); not addressed.",
+        "caller_has_active_team_role lives in the MCP helper module rather than the teams domain; permission typed as str instead of Permission."
+      ],
+      "test_tampering": "no: only new test files."
+    },
+    "0353f0": {
+      "conventions": 4, "layering": 4, "error_handling": 5, "test_quality": 5,
+      "spec_conformance": 5, "scope_hygiene": 4, "overall": 4,
+      "strongest": "Spotted that rbac.get_team_role falls back to legacy team_members and made remove_member delete that row too (teams/assignments.py), so removal is a real revocation; test_removed_admin_loses_legacy_access pins it.",
+      "issues": [
+        "Each of the three tools repeats the same try/except require_team_permission block; the shared helper only builds the error.",
+        "Maps with `raise ... from None`, contrary to the `from e` convention.",
+        "Self-removal check doesn't require the caller to actually be a member (harmless but less precise)."
+      ],
+      "test_tampering": "no: only new test files."
+    }
+  },
+  "T4": {
+    "82971c": {
+      "conventions": 4, "layering": 4, "error_handling": 4, "test_quality": 4,
+      "spec_conformance": 5, "scope_hygiene": 4, "overall": 4,
+      "strongest": "Complete feature: CHECK-constrained migration with open/settled consistency, live-map + root + membership guards, FOR UPDATE re-check before settle+edge+event, cheap-read defaults and compact `resolved` list.",
+      "issues": [
+        "mindmap/service.py: unrelated UUID(str(...)) coercion added to resolve_map_root / find_live_map_seeded_from.",
+        "Validation runs across three transactions (tenant_tx, system_tx, tenant_tx) with duplicated checks; fetch_touched_since ignores link-event targets."
+      ],
+      "test_tampering": "no: only new test files."
+    },
+    "9403b0": {
+      "conventions": 4, "layering": 4, "error_handling": 4, "test_quality": 5,
+      "spec_conformance": 5, "scope_hygiene": 4, "overall": 4,
+      "strongest": "Clear spec-driven design: stored status with named CHECKs, open_loops over the whole map, since-cursor includes link targets, migration CHECK tested directly, boundary tests at 199/200/201 chars.",
+      "issues": [
+        "mindmap_resolve.py: phase-1 and phase-3 validation blocks are copy-pasted (~60 duplicated lines).",
+        "service.fetch_touched_since casts payload->>'target'/'node_id' to uuid without guarding; a non-uuid value aborts the read (and double-encoded jsonb payloads silently miss).",
+        "Requires the resolver to be a member of the same map, which is stricter than the packet."
+      ],
+      "test_tampering": "no: only new test files."
+    },
+    "a14e29": {
+      "conventions": 3, "layering": 3, "error_handling": 3, "test_quality": 2,
+      "spec_conformance": 1, "scope_hygiene": 2, "overall": 2,
+      "strongest": "Settle + edge + event are written in a single tenant_tx, and the edge uses insert_reference with the vocabulary kinds.",
+      "issues": [
+        "mindmap_get.py MindmapGetInput: defaults include='all' and depth='full' (spec requires cheap defaults open/summary); depth='summary' blanks content to '' instead of 200 chars + '…'; since=0 is treated as a full read; since lacks ge=0.",
+        "`resolved` is list[UUID] (spec requires compact entries with summary/status/party) and is always empty under include='open'; no root guard; no open/settled consistency CHECK.",
+        "Benchmark references in code ('Per ... + T4 packet' in the migration and mindmap_resolve.py docstrings); appends tests to the existing tests/integration/test_mindmap_e2e.py; fetch_members builds SQL via f-strings."
+      ],
+      "test_tampering": "no deletions, but it appends ~500 lines to the existing tests/integration/test_mindmap_e2e.py instead of adding a new file."
+    },
+    "ac1b54": {
+      "conventions": 5, "layering": 5, "error_handling": 5, "test_quality": 5,
+      "spec_conformance": 5, "scope_hygiene": 4, "overall": 5,
+      "strongest": "Single tenant_tx with FOR UPDATE on map and membership rows; since-cursor handles both jsonb payload shapes and link targets; tests include atomicity-on-edge-failure and identical errors for a cross-map node vs a random uuid.",
+      "issues": [
+        "service.py: adds `# type: ignore[no-any-return]` to two untouched functions (minor churn).",
+        "Resolver check is same-tenant only (memory_visible_in_tenant), not the resolve_reference_target path mindmap_link uses."
+      ],
+      "test_tampering": "no: only new test files."
+    },
+    "e307d9": {
+      "conventions": 5, "layering": 5, "error_handling": 5, "test_quality": 4,
+      "spec_conformance": 5, "scope_hygiene": 5, "overall": 5,
+      "strongest": "Compact, readable design: one _check_settleable() reused before and inside the write tx, conditional UPDATE ... AND status='open' with a domain NodeNotOpenError for races, constraints tested directly, design doc and skill updated.",
+      "issues": [
+        "service.touched_since only uses event.memory_id, so the target of a link event is not reported as touched.",
+        "Edges in delta mode are filtered in Python after fetching all internal edges (still sends less but queries the full set)."
+      ],
+      "test_tampering": "no: only new test files."
+    }
+  },
+  "T5": {
+    "a0fd14": {
+      "conventions": 3, "layering": 3, "error_handling": 5, "test_quality": 5,
+      "spec_conformance": 5, "scope_hygiene": 3, "overall": 4,
+      "strongest": "DB-enforced correctness: SELECT ... FOR UPDATE serialises writers, superseded check after the lock refuses forks with current_id, and the revision is hash(id, updated_at) with updated_at forced strictly monotonic; real asyncio.gather concurrency tests on a 12-connection pool.",
+      "issues": [
+        "update.py: blanket `target[...]` -> `target.get(...)` rewrites and get.py line re-wrapping that ruff format would revert. This is churn that obscures the real change.",
+        "Chain-walking recursive SQL (_find_current_in_chain) lives in the tool module, not in memory/versioning.py.",
+        "MemoryRecord revision is derived in a model_validator (falls back to compute from id/updated_at). This works, but the token depends on updated_at never being touched by other writers."
+      ],
+      "test_tampering": "no: only new test files."
+    }
+  },
+  "T6": {
+    "63ba92": {
+      "conventions": 2, "layering": 1, "error_handling": 2, "test_quality": 3,
+      "spec_conformance": 1, "scope_hygiene": 1, "overall": 1,
+      "strongest": "A large test suite that finds real bugs (cursor encoded from the overflow row, uncaught TypeError in _decode_cursor, None payload rendering).",
+      "issues": [
+        "Modifies source despite the explicit 'tests only' rule: src/mem_mcp/mcp/tools/list.py (team_id type, cursor param casting, rows[limit-1], extra excepts) and src/mem_mcp/plugins/notice_delivery.py (_render None handling, dict(payload)). The packet calls this disqualifying.",
+        "Tests are written against the patched behaviour ('Previously-documented bugs (now fixed)'), so they would not pass on unmodified source, and bugs are not recorded as xfail(strict=True).",
+        "test_plugin_notices_behaviour / list tests contain a confusing try/pytest.fail pattern labelled as xfail without a marker."
+      ],
+      "test_tampering": "no deletion of existing tests, but source under test was changed (disqualifying for this task)."
+    },
+    "95ac81": {
+      "conventions": 5, "layering": 5, "error_handling": 5, "test_quality": 5,
+      "spec_conformance": 5, "scope_hygiene": 5, "overall": 5,
+      "strongest": "Tests-only and thorough: ~165 tests covering every list filter leg, preview/keyword windows, ordering, keyset pagination, and the notice pipeline; real bugs captured as xfail(strict=True) with precise reasons (overflow-row cursor, id ASC tie-break, uncaught TypeError/KeyError in _decode_cursor).",
+      "issues": [
+        "One xfail (UPDATE ... RETURNING ordering in deliver_pending) is strict=False, so it won't flip when fixed.",
+        "Very large suite (~3000 lines). Runtime under mutation testing should be checked."
+      ],
+      "test_tampering": "no: only new test files, no source changes."
+    }
+  }
+}

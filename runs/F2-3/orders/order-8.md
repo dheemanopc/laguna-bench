@@ -1,0 +1,12 @@
+The architect reviewed your plan and asked for revisions:
+
+VERDICT: REVISE
+
+1. The blockers from design review 3 are carried into the plan unfixed. WP0 "widen … RLS" and the design's §1.3 both still use `current_user_active_team_ids()`, which reads the legacy `team_members` table. `src/` only writes to that table in `web/routes.py:271` and `jobs/reconcile_signups.py:184`; `create_team` does not write it. WP0 must base its policies on UEA/`can_access_team_resource` (0035:58-76). WP0/WP3 also need a test where a team created via `create_team` (not a legacy `team_members` row) can read, insert and move items.
+2. WP0 relaxes the CHECK to admit only `signoff_requested`/`signoff_decided` (plan:95-98). The rebase in WP1/WP3 writes `change_type='workflow_changed'` (design §2.7), so that insert would fail. Add it to the CHECK and to the WP0 test.
+3. WP0 is missing the `team_workflows` INSERT policy/grant needed by `ensure_default_workflow` (WP1/WP3 hooks). `team_workflow_versions` should be INSERT-only, not INSERT/UPDATE. No WP test runs `ensure_default_workflow` as `mem_app` under RLS.
+4. WP1's approver eligibility test (plan:133-137) does not cover the "active approver" check. The design measures activeness with the caller-only function (§2.4a), so the quorum recount can't judge another identity. Specify `get_team_role`/UEA for the approver and test that an inactive teammate's approval doesn't count.
+5. WP4's test plan assumes Jest/RTL, but `web/package.json` has no test script or runner. Either add the tooling inside WP4 or replace it with tests that can actually run. Also, the WP2 test "board shows the badge" (plan:188) can't be asserted at the MCP level, so move it to WP3/WP4.
+
+
+Revise docs/feature/03-plan.md accordingly (no code). When done, end your turn with a 3-line summary of what you changed.

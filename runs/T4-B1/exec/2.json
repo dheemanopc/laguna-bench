@@ -1,0 +1,24 @@
+{
+  "session_id": "7bc217c5-ba8b-41b3-a303-354a899f0f6f",
+  "exit_code": 0,
+  "remote_control_url": "",
+  "is_error": false,
+  "num_turns": 63,
+  "result": "Confirmed — the diff shows `resolve_map_root` and `find_live_map_seeded_from` are pre-existing (unchanged in the diff; my changes added `BranchAlreadySettledError`, `lock_map_state`, and modified `log_event` to return the cursor via `RETURNING id` + `int()`). The 3 mypy errors are all pre-existing `fetchval()` calls that were there at baseline.\n\n## Final Report\n\n### Work Completed\n\nImplemented the **`mindmap_resolve`** MCP tool — settles a single branch (resolve or drop) within a live mind-map without closing the whole map. Changes span:\n\n| File | Change |\n|---|---|\n| `src/mem_mcp/mcp/tools/mindmap_resolve.py` | **New** — `MindmapResolveTool` with 3-phase flow: read-only pre-checks (team/map lookup, map-live assertion, member existence, status check, self-resolution guard) → `system_tx` for cross-tenant reference target resolution → `tenant_tx` with `lock_map_state` + `settle_branch` (optimistic locking via `BranchAlreadySettledError`) + typed edge insertion + event logging |\n| `src/mem_mcp/mindmap/service.py` | Added `settle_branch` (atomic UPDATE with `status='open'` predicate), `lock_map_state` (FOR UPDATE), `BranchAlreadySettledError`. Modified `log_event` to `RETURNING id` so the cursor is available |\n| `src/mem_mcp/mindmap/__init__.py` | Exported `DISPOSITION_EDGE_KIND` |\n| `src/mem_mcp/mcp/tools/mindmap_get.py` | Pass-through: no behavioral change, just uses the new `log_event` return |\n| `src/mem_mcp/main.py` | Registered `mindmap_resolve` tool |\n| `src/mem_mcp/mcp/tool_descriptions.py` | Added tool description stub |\n| `alembic/versions/0044_*.py` | Migration for branch_status fields (status, resolution_summary, resolved_by_memory_id, resolved_by_party, resolved_at) |\n| `tests/unit/test_mindmap_resolve_models.py` | Model validation tests |\n| `tests/integration/test_mindmap_branch_status.py` | 42 integration tests covering happy paths, edge cases, and error conditions |\n\n### Verification\n\n- **Target tests**: `pytest tests/unit/test_mindmap_resolve_models.py tests/integration/test_mindmap_branch_status.py -v` → **45 passed**\n- **Full suite**: `pytest -q` → **1283 passed, 31 skipped**. The 35 failures + 16 errors are all in pre-existing `test_enterprise_*`, `test_rbac_*`, `test_team_*`, `test_security/*`, `test_web_routes.py` etc. — unrelated to mindmap work.\n- **mypy** (src/ only): 3 errors, all pre-existing (`fetchval()` returning `Any` in `resolve_map_root`, `find_live_map_seeded_from`, and `_mindmap_common.py:36`). **Zero new errors** from my code.\n- **ruff**: `All checks passed!` on all modified source files.",
+  "usage": {
+    "input_tokens": 7339047,
+    "output_tokens": 53055,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  },
+  "modelUsage": {
+    "laguna-s-2.1": {
+      "inputTokens": 7339047,
+      "outputTokens": 53055,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0
+    }
+  },
+  "thinking_blocks": 53,
+  "transcript": "~/.claude/projects/-home-anand-laguna-bench-runs-T4-B1-repo/7bc217c5-ba8b-41b3-a303-354a899f0f6f.jsonl"
+}

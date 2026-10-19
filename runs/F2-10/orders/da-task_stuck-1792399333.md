@@ -1,0 +1,3 @@
+```json
+{"action":"retry","guidance":"Three attempts died on the API 402 credit error, so this isn't a code problem. Only tests/unit/mindmap/test_workflow_reads.py is missing; ruff and mypy are clean.\n1) Create tests/unit/mindmap/test_workflow_reads.py. Cover compute_item_moves: allowed moves, blocked moves with their reasons, and a move that needs sign-off.\n2) Cover list_pending_signoffs_for_user: it returns items waiting on the user, excludes items the user owns, and excludes sign-offs already given.\n3) Follow the existing test fixtures and patterns in tests/unit/mindmap. Don't change lint or type config.\n4) Run `ruff check src tests`, `mypy` and `pytest tests/unit/mindmap -q` before finishing.","new_tasks":[]}
+```

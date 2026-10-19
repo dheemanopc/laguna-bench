@@ -1,0 +1,243 @@
+diff --git a/src/mem_mcp/audit/logger.py b/src/mem_mcp/audit/logger.py
+index 5186a84..a308621 100644
+--- a/src/mem_mcp/audit/logger.py
++++ b/src/mem_mcp/audit/logger.py
+@@ -144,6 +144,8 @@ AuditAction = Literal[
+     "skill.kite.intent_smoke_failed",
+     # mindmap work items
+     "mindmap.work_item_changed",
++    # team workflow management (memsys_workflow_*)
++    "team.workflow_changed",
+     "admin.find_user",
+     "admin.get_user",
+ ]
+diff --git a/src/mem_mcp/main.py b/src/mem_mcp/main.py
+index e0afa76..47d469a 100644
+--- a/src/mem_mcp/main.py
++++ b/src/mem_mcp/main.py
+@@ -67,6 +67,9 @@ from mem_mcp.mcp.tools.get import MemoryGetTool
+ from mem_mcp.mcp.tools.get_batch import MemoryGetBatchTool
+ from mem_mcp.mcp.tools.list import MemoryListTool
+ from mem_mcp.mcp.tools.list_my_teams import ListMyTeamsTool
++from mem_mcp.mcp.tools.memsys_workflow_delete import MemsysWorkflowDeleteTool
++from mem_mcp.mcp.tools.memsys_workflow_get import MemsysWorkflowGetTool
++from mem_mcp.mcp.tools.memsys_workflow_set import MemsysWorkflowSetTool
+ from mem_mcp.mcp.tools.mindmap_answer import MindmapAnswerTool
+ from mem_mcp.mcp.tools.mindmap_close import MindmapCloseTool
+ from mem_mcp.mcp.tools.mindmap_get import MindmapGetTool
+@@ -526,6 +529,9 @@ def _wire_routers(app: FastAPI) -> None:
+         MindmapWorkSetStatusTool,
+         MindmapWorkSetKindTool,
+         MindmapWorkAssignTool,
++        MemsysWorkflowSetTool,
++        MemsysWorkflowGetTool,
++        MemsysWorkflowDeleteTool,
+         # Admin tool family — gated on system.* permissions via AdminTool,
+         # NOT reachable by an ordinary caller. See mcp/tools/_admin_base.py.
+         AdminFindUserTool,
+diff --git a/src/mem_mcp/mcp/tool_descriptions.py b/src/mem_mcp/mcp/tool_descriptions.py
+index 20535da..5c9e1ce 100644
+--- a/src/mem_mcp/mcp/tool_descriptions.py
++++ b/src/mem_mcp/mcp/tool_descriptions.py
+@@ -518,6 +518,33 @@ Do not call for: assigning to someone not on the map's team; assigning a non-wor
+ Assignees must be current owners, admins, or members of the map's team. Archived maps: can still change assignee.
+ 
+ Examples: "Assign to Carol" → mindmap_work_assign(node_id="...", assignee_id="<carol-uuid>"). "Unassign this" → mindmap_work_assign(node_id="...", assignee_id=null).""",
++    "memsys_workflow_set": """Define (create-or-replace) this team's work-item workflow — the set of statuses a work item can be in and which (from → to) transitions are allowed, with an optional reason requirement per edge.
++
++Call when: the team wants a custom status pipeline instead of the built-in one (e.g. backlog / in_review / qa / shipped); an admin is configuring task-tracking for their team. When no workflow is set the built-in pipeline (todo / in_progress / blocked / done / cancelled) applies.
++
++Do not call for: teams you don't administer; status values used by an in-progress work item that aren't in your workflow (those items must be transitioned out of unknown statuses first).
++
++statuses is the ordered, unique set of valid statuses; initial_status (required to be one of them) is the status a newly-marked work item starts at. Each transition's from_status and to_status must be in statuses; from_status == to_status (self-loops) is rejected. Setting replaces any existing workflow for the team.
++
++Examples: "Use a Kanban pipeline" → memsys_workflow_set(team_id="...", name="kanban", statuses=["backlog","ready","in_progress","in_review","qa","shipped"], initial_status="backlog", transitions=[{from:"backlog",to:"ready"},{from:"ready",to:"in_progress"},{from:"in_progress",to:"in_review"},{from:"in_review",to:"qa"},{from:"qa",to:"shipped"},{from:"qa",to:"in_progress",reason_required:true}]).""",
++    "memsys_workflow_get": """Read a team's work-item workflow (statuses, initial status, and allowed transitions).
++
++Call when: you need to know which status values and transitions a team's work items accept; deciding what statuses to offer in a UI; diagnosing a status-change rejection.
++
++Do not call for: teams you are not a member of (the call returns nothing for non-members, indistinguishable from "no workflow configured").
++
++Returns null when the team has no custom workflow configured, in which case memsys_mark_work_item / memsys_work_set_status use the built-in pipeline (todo / in_progress / blocked / done / cancelled).
++
++Example: memsys_workflow_get(team_id="...").""",
++    "memsys_workflow_delete": """Remove a team's custom work-item workflow so it reverts to the built-in pipeline.
++
++Call when: an admin wants to undo a custom workflow and return the team to the default status pipeline.
++
++Do not call for: teams you don't administer.
++
++The deletion cascades to the workflow's transitions. Existing work items keep their current status but must thereafter use the built-in transitions.
++
++Example: memsys_workflow_delete(team_id="...").""",
+     "memsys_admin_find_user": """Search every user on the instance by partial email address or display name. Operator tool — requires the system.manage_tenants permission, which only a system_admin holds.
+ 
+ Call when: the user needs a tenant_id they do not have ("what's Manasi's user id?"); you are about to add someone to a team and need to confirm which account is theirs; the user asks who signed up recently, or how many accounts exist matching some name or domain.
+diff --git a/src/mem_mcp/mindmap/work_items.py b/src/mem_mcp/mindmap/work_items.py
+index 750a06b..2c3b789 100644
+--- a/src/mem_mcp/mindmap/work_items.py
++++ b/src/mem_mcp/mindmap/work_items.py
+@@ -21,6 +21,7 @@ import asyncpg  # type: ignore[import-untyped]
+ from mem_mcp.auth.permissions import ROLE_PERMISSIONS, Permission
+ from mem_mcp.auth.rbac import get_team_role
+ from mem_mcp.mindmap import service
++from mem_mcp.teams.workflows import Workflow as _TeamWorkflow, get_workflow as _get_team_workflow
+ 
+ # -------------------------------------------------------------------------
+ # Constants
+@@ -241,23 +242,35 @@ def _validate_kind(kind: str) -> None:
+         raise InvalidKindError(kind, WORK_KINDS)
+ 
+ 
+-def _validate_status(status: str) -> None:
+-    """Validate status is one of the allowed values."""
+-    if status not in WORK_STATUSES:
+-        raise InvalidStatusError(status, WORK_STATUSES)
++def _validate_status(status: str, allowed: tuple[str, ...] = WORK_STATUSES) -> None:
++    """Validate status is one of the allowed values.
++
++    ``allowed`` defaults to the built-in WORK_STATUSES; a team with a custom
++    workflow passes that workflow's statuses instead.
++    """
++    if status not in allowed:
++        raise InvalidStatusError(status, allowed)
+ 
+ 
+-def check_transition(current: str, requested: str, reason: str | None) -> None:
++def check_transition(
++    current: str,
++    requested: str,
++    reason: str | None,
++    transitions: dict[tuple[str, str], bool] = TRANSITIONS,
++) -> None:
+     """Validate a status transition is allowed.
+ 
++    ``transitions`` defaults to the built-in TRANSITIONS dict; a team with a
++    custom workflow passes that workflow's transitions instead.
++
+     Raises InvalidTransitionError if not allowed, ReasonRequiredError if
+     a reason is required but not provided.
+     """
+-    if (current, requested) not in TRANSITIONS:
++    if (current, requested) not in transitions:
+         raise InvalidTransitionError(current, requested)
+ 
+     # Reason should be pre-cleaned
+-    if TRANSITIONS[(current, requested)] and not reason:
++    if transitions[(current, requested)] and not reason:
+         raise ReasonRequiredError(current, requested)
+ 
+ 
+@@ -440,6 +453,23 @@ async def _record_change(
+     )
+ 
+ 
++async def _team_pipeline(
++    conn: asyncpg.Connection,
++    team_id: UUID,
++) -> tuple[tuple[str, ...], str, dict[tuple[str, str], bool]]:
++    """Resolve the effective status pipeline for a team.
++
++    Returns (statuses, initial_status, transitions). If the team has a
++    configured workflow (``team_workflows``), its values are used; otherwise
++    the built-in defaults apply — so every existing team behaves exactly as
++    before. The caller must have already established team membership.
++    """
++    wf: _TeamWorkflow | None = await _get_team_workflow(conn, team_id=team_id)
++    if wf is not None:
++        return wf.statuses, wf.initial_status, wf.transitions
++    return WORK_STATUSES, "todo", TRANSITIONS
++
++
+ # -------------------------------------------------------------------------
+ # Core operations
+ # -------------------------------------------------------------------------
+@@ -471,6 +501,11 @@ async def mark_work_item(
+     # Validate kind after permission checks
+     _validate_kind(kind)
+ 
++    # Resolve the team's workflow pipeline (defaults to todo/start when absent,
++    # so teams with no configured workflow behave exactly as before).
++    statuses, initial_status, _transitions = await _team_pipeline(conn, team_id)
++    _validate_status(initial_status, statuses)
++
+     # Root node not allowed
+     if node_id == root_memory_id:
+         raise RootNodeNotAllowedError()
+@@ -518,7 +553,7 @@ async def mark_work_item(
+                 INSERT INTO work_items
+                     (memory_id, root_memory_id, tenant_id, team_id, kind, assignee_id,
+                      created_by, status, status_changed_at)
+-                VALUES ($1, $2, $3, $4, $5, $6, $7, 'todo', now())
++                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+                 RETURNING memory_id, root_memory_id, tenant_id, team_id, kind, status,
+                           assignee_id, created_by, created_at, updated_at, status_changed_at
+                 """,
+@@ -529,6 +564,7 @@ async def mark_work_item(
+                 kind,
+                 assignee_id,
+                 tenant_id,  # created_by is the caller
++                initial_status,
+             )
+     except asyncpg.UniqueViolationError:
+         raise AlreadyWorkItemError() from None
+@@ -547,7 +583,7 @@ async def mark_work_item(
+         None,  # kind_before
+         kind,
+         None,  # status_before
+-        "todo",
++        initial_status,
+         None,  # assignee_before
+         assignee_id,
+         tenant_id,  # actor_id
+@@ -610,8 +646,11 @@ async def set_work_item_status(
+     # Check permission (owner, admin, or member)
+     await _check_permission(conn, tenant_id, team_id)
+ 
+-    # Validate status after permission check
+-    _validate_status(status)
++    # Resolve the team's workflow pipeline (defaults when absent).
++    statuses, _initial_status, transitions = await _team_pipeline(conn, team_id)
++
++    # Validate status against the team's allowed set
++    _validate_status(status, statuses)
+ 
+     # Load work item for update using helper
+     wi_row = await _load_work_item_for_update(conn, node_id, tenant_id, team_id, root_memory_id)
+@@ -626,8 +665,8 @@ async def set_work_item_status(
+     if current_status == status:
+         raise StatusUnchangedError(current_status)
+ 
+-    # Validate transition with cleaned reason
+-    check_transition(current_status, status, _clean_reason(reason))
++    # Validate transition against the team's allowed transitions (with cleaned reason)
++    check_transition(current_status, status, _clean_reason(reason), transitions)
+ 
+     # Get node content for title
+     node_row = await conn.fetchrow(
+@@ -1074,9 +1113,9 @@ async def list_work_items(
+     Ordered by updated_at DESC, memory_id.
+     Excludes deleted nodes.
+     """
+-    # Validate filter values
+-    if status is not None and status not in WORK_STATUSES:
+-        raise InvalidStatusError(status, WORK_STATUSES)
++    # Validate filter values that don't require a team context. The `status`
++    # filter is validated after the membership check below, because the
++    # allowed set is workflow-dependent.
+     if kind is not None and kind not in WORK_KINDS:
+         raise InvalidKindError(kind, WORK_KINDS)
+     if map_state is not None and map_state not in ("live", "archived"):
+@@ -1101,6 +1140,12 @@ async def list_work_items(
+     if caller_role is None:
+         raise WorkItemMapNotFoundError()
+ 
++    # Validate the status filter against the team's workflow (defaults to
++    # WORK_STATUSES when no workflow is configured).
++    statuses, _initial_status, _transitions = await _team_pipeline(conn, team_id)
++    if status is not None and status not in statuses:
++        raise InvalidStatusError(status, statuses)
++
+     # Build query
+     clauses = ["wi.tenant_id = $1", "wi.team_id = $2"]
+     args: list[Any] = [tenant_id, team_id]

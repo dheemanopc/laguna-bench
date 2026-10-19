@@ -1,0 +1,260 @@
+      230 +  - `test_move_requiring_signoff_blocks_until_approval` — `set_status` on a
+      231 +    guarded transition returns `code="signoff_required"` + `signoff_state{request_id,
+      232 +    have, needed, approvers}` and the item's `status` is unchanged (no rollback
+      233 +    of a partial move); `mindmap_work_signoff_approve` by an eligible teammate
+      234 +    (resolved via `get_team_role`) then moves the item and writes
+      235 +    `change_type='status'` + `signoff_request_id`. Proves R3/R13/R14 + §2.8.
+      236    - `test_waiting_on_me_only_lists_callers_pending_requests` —
+      192 -    `mindmap_work_list(waiting_on_me=true)` as tenant B returns only requests
+      193 -    B is an eligible approver for, not A's own requests. Proves R8 + opacity
+      237 +    `mindmap_work_list(waiting_on_me=true)` as tenant B returns only requests B
+      238 +    is an eligible (active) approver for, never A's own. Proves R8 + opacity
+      239      (Risk 7).
+      240    - `test_signoff_reject_does_not_move` — reject closes the request, item stays.
+      241      Proves §2.4.
+      242    - `test_workflow_edit_refuses_orphan_statuses` — editing to drop a status some
+      243      live item occupies (without `reject_if_orphans=false`) returns
+      199 -    `invalid_workflow_definition` `orphan_statuses`. Proves E1.
+      244 +    `invalid_workflow_definition`/`orphan_statuses`. Proves E1.
+      245  - Extend `tests/integration/test_mindmap_work_items_e2e.py`:
+      201 -  - `test_get_and_history_tools_enriched` — `mindmap_work_get`/`_list`/`
+      202 -    _history` return `workflow_id`, `available_transitions`, `signoff_state` and
+      203 -    the sign-off `change_type` rows. Proves R10/R14.
+      246 +  - `test_get_and_history_tools_enriched` — `mindmap_work_get`/`_list`/`_history`
+      247 +    return `workflow_id`, `available_transitions`, `signoff_state` and the
+      248 +    sign-off `change_type` rows. Proves R10/R14.
+      249  - `tests/unit/test_lint_tenant_scope.py::test_real_codebase_is_clean` (existing)
+      205 -  must remain green with the new `work_items`/`workflow_*` SQL — proves the
+      206 -  explicit-predicate rule.
+      250 +  must stay green with the new `work_items`/`workflow_*` SQL — proves the
+      251 +  explicit-predicate rule (CONVENTIONS defence-in-depth).
+      252
+      253  ## WP3: Web API — board/waiting/actions + team-creation hooks
+      254
+      255  **Scope.** Add endpoints on `make_mindmaps_router` that dispatch to the WP2 MCP
+      256  tool classes (identical ToolContext + `map_work_item_error` path — no rule
+      257  divergence). Wire `ensure_default_workflow` into the three team-creation hooks.
+      258 +The board payload carries the data the UI badge consumes
+      259 +(`signoff_state.have/needed`, `available_transitions`, `blocked_message`) — the
+      260 +badge *render* assertion lives in WP4.
+      261
+      262  **Files.**
+      215 -- MODIFY `src/mem_mcp/web/handlers/mindmaps.py` (add `GET /teams/{team_id}/
+      216 -  board`, `GET /mindmaps/{map_key}/board`, `GET /teams/{team_id}/item/{memory_id}
+      217 -  /history`, `GET /teams/{team_id}/waiting`, `POST /boards/actions` with
+      218 -  `move|approve|reject|rebase`; all via `_http_from_jsonrpc` bridge
+      263 +- MODIFY `src/mem_mcp/web/handlers/mindmaps.py` (add `GET /teams/{team_id}/board`,
+      264 +  `GET /mindmaps/{map_key}/board`, `GET /teams/{team_id}/item/{memory_id}/history`,
+      265 +  `GET /teams/{team_id}/waiting`, `POST /boards/actions`
+      266 +  `move|approve|reject|rebase`; all via the `_http_from_jsonrpc` bridge
+      267    66-77).
+      268  - MODIFY `src/mem_mcp/identity/personal_team.py` (call `ensure_default_workflow`
+      221 -  after line 82 — under the `system_tx` + `SET LOCAL app.current_tenant_id`
+      222 -  already set at line 73-76), `src/mem_mcp/web/handlers/teams.py` `create_team`
+      223 -  (after line 175), `src/mem_mcp/mcp/tools/create_team.py` `CreateTeamTool`
+      224 -  (after `assign_role` line 132).
+      269 +  after line 82, within the existing `system_tx` + `SET LOCAL` 73-76),
+      270 +  `src/mem_mcp/web/handlers/teams.py` `create_team` (after line 175),
+      271 +  `src/mem_mcp/mcp/tools/create_team.py` `CreateTeamTool` (after `assign_role`,
+      272 +  line 132).
+      273
+      226 -**Requirements delivered.** R6, R7, R8, R9 (web moves through the same path as
+      227 -MCP), R4 (rebase web action), plus the new-team default workflow seed (§5 open
+      228 -question).
+      274 +**Requirements delivered. R6, R7, R8, R9 (web moves through the same path as
+      275 +MCP), R4 (rebase web action), §5 default-workflow seed.
+      276
+      277  **Test plan.**
+      231 -- `tests/integration/test_mindmap_web_board.py` (new, HTTP via the FastAPI test
+      232 -  client, session-auth):
+      233 -  - `test_team_board_returns_items_across_member_tenants` — a board request by
+      278 +- `tests/integration/test_mindmap_web_board.py` (new, FastAPI test client,
+      279 +  session-auth):
+      280 +  - `test_team_board_returns_items_across_member_tenants` — board request by
+      281      tenant B's session returns items created by tenant A in the same team.
+      282      Proves the visibility fix end-to-end (Risk 6).
+      236 -  - `test_blocked_move_returns_422_with_reason` — POST `boards/actions
+      237 -    {action:"move", to_status:...}` on a disallowed move returns HTTP 422 with
+      238 -    `code="transition_blocked"` and a human `message` (R7 — the blocker string
+      239 -    the user sees).
+      240 -  - `test_signoff_required_move_flips_card_pending` — a guarded move returns
+      241 -    422 `code="signoff_required"` (the board flips the card to pending).
+      283 +  - `test_create_team_caller_board_read_write` (design-review-3 test) — team
+      284 +    created via `memsys_create_team` (so membership is in `team_role_assignments`
+      285 +    only, no `team_members` row); the caller's own browser session GETs
+      286 +    `/teams/{id}/board`, POSTs a move via `boards/actions`, and GETs
+      287 +    `/teams/{id}/waiting`. Proves the UEA-based policies let a `create_team`
+      288 +    member read/insert/move/waiting where the legacy reader would have missed
+      289 +    them.
+      290 +  - `test_blocked_move_returns_422_with_reason` — `POST boards/actions {action:
+      291 +    "move", to_status: …}` on a disallowed move → HTTP 422 `code="transition_blocked"`
+      292 +    + human `message`. Proves R7 (the blocker string the user sees).
+      293 +  - `test_signoff_required_move_returns_pending_state` — guarded move → 422
+      294 +    `code="signoff_required"` with `signoff_state.have/needed/approvers` in the
+      295 +    body (the data the WP4 badge consumes). Proves the badge-data contract.
+      296    - `test_waiting_endpoint_lists_caller_items_only` — `GET /teams/{id}/waiting`
+      243 -    as tenant B lists only B's pending approvals + B's reason-required items;
+      244 -    never another tenant's items (R8 + Risk 7 opacity).
+      297 +    as tenant B lists only B's pending approvals + reason-required items; never
+      298 +    another tenant's items (R8 + Risk 7 opacity).
+      299    - `test_rebase_action_requires_current_status_in_map` — `action:"rebase"`
+      300      without the current status in `status_map` → 422 `rebase_conflict`; with it
+      301      → 200 and the item is on the new version. Proves E4/R4.
+      248 -- `tests/integration/test_team_creation_seeds_workflow.py` (new):
+      302 +- `tests/integration/test_team_creation_seeds_workflow.py` (new) — each runs the
+      303 +  actual `ensure_default_workflow` function **as `mem_app` under RLS**
+      304 +  (`SET LOCAL app.current_tenant_id` + the RLS role), not system-bypassed:
+      305    - `test_mcp_create_team_seeds_default_workflow`,
+      306      `test_web_create_team_seeds_default_workflow`,
+      251 -    `test_personal_team_ensure_default_workflow` — after each of the three
+      252 -    hooks, the new team has one `team_workflows` pointer + version 1. Proves §5.
+      307 +    `test_personal_team_ensure_default_workflow` — after each of the three hooks,
+      308 +    the new team has exactly one `team_workflows` pointer + v1. Proves §5 + the
+      309 +    team_workflows INSERT policy under RLS.
+      310  - `tests/security/test_workflow_visibility.py`:
+      311    - `test_non_member_cannot_read_team_board` — tenant Z (not in team Y) GETs
+      255 -    `/teams/Y/board` → 404 (opaque, not 403). Proves Risk 6/7 (team-scoped, not
+      256 -    global).
+      257 -  - `test_non_active_member_cannot_see_pending_request` — a removed-but-histori
+      258 -    cal approver (their `team_role_assignments` row `status='inactive'`) does not
+      259 -    appear in `GET …/waiting`. Proves §2.4 active-membership gate.
+      312 +    `/teams/Y/board` → 404 (opaque, not 403). Proves Risk 6/7.
+      313 +  - `test_non_active_member_cannot_see_pending_request` — an approver whose
+      314 +    `team_role_assignments` row is `status='inactive'` does not appear in
+      315 +    `GET …/waiting`. Proves §2.4a active-membership gate (web surface).
+      316
+      261 -## WP4: Web UI — board + waiting + rebase
+      317 +## WP4: Web UI — board + waiting + rebase (+ e2e tooling)
+      318
+      319  **Scope.** New Next.js App Router pages/components consuming the WP3 endpoints;
+      264 -no API logic (just rendering + the action dispatcher). Reuse `graph-view.tsx`
+      265 -patterns (`MapNode`/`MapPayload`, pan/zoom/select).
+      320 +no API logic (rendering + the `POST /boards/actions` dispatcher). Reuse
+      321 +`graph-view.tsx` patterns (`MapNode`/`MapPayload`, pan/zoom/select). Per the
+      322 +review, this package also *adds the missing e2e tooling* (no `web/package.json`
+      323 +test script/runner exists yet) so the tests can actually run.
+      324
+      325  **Files.**
+      268 -- CREATE `web/app/teams/[id]/board/page.tsx` (Kanban board: live-workflow
+      269 -  columns, `is_read_only` archived columns, blocked chip, sign-off badge
+      326 +- CREATE `web/app/teams/[id]/board/page.tsx` (Kanban: live-workflow columns,
+      327 +  `is_read_only` archived columns, blocked chip showing `message`, sign-off badge
+      328    `have/needed`, drag→`POST boards/actions {move}`).
+      271 -- CREATE `web/app/teams/[id]/waiting/page.tsx` (the caller's pending approvals
+      272 -  + reason-required items; one-click approve/reject).
+      273 -- CREATE `web/app/mindmaps/[key]/board/page.tsx` (per-map slice).
+      274 -- MODIFY `web/lib/server-api.ts` (add `serverApiFetch` paths for the new
+      275 -  endpoints → typed return shapes).
+      276 -- MODIFY `web/app/mindmaps/page.tsx` (add a "Board" link per map / per team).
+      329 +- CREATE `web/app/teams/[id]/waiting/page.tsx`.
+      330 +- CREATE `web/app/mindmaps/[key]/board/page.tsx`.
+      331 +- CREATE `web/playwright.config.ts` + add `@playwright/test` devDep to
+      332 +  `web/package.json` (the tooling the review asked for).
+      333 +- CREATE `web/tests/board.spec.ts` (the badge-render assertion moved here from
+      334 +  WP2, plus the blocked-chip and archived-column asserts).
+      335 +- MODIFY `web/lib/server-api.ts` (new endpoints → typed shapes).
+      336 +- MODIFY `web/app/mindmaps/page.tsx` (Board link per team).
+      337
+      338  **Requirements delivered.** R6, R7 (UI blocker display), R8 (waiting surface),
+      339  R9 (web move), R4 (rebase via `action:"rebase"`).
+      340
+      341  **Test plan.**
+      282 -- `web/app/teams/[id]/board/__tests__/board.render.test.tsx` (new, Jest/React
+      283 -  Testing Library against mocked `serverApiFetch`):
+      342 +- `web/tests/board.spec.ts` (`npx playwright test`):
+      343    - `test_default_workflow_renders_five_columns` — board renders columns from
+      285 -    the default version's statuses (R6).
+      286 -  - `test_dead_status_renders_as_read_only_archived_column` — an item whose
+      287 -    frozen workflow dropped its status renders in a greyed-out archived column
+      288 -    with only a Rebase action enabled (R4/R6).
+      289 -  - `test_blocked_chip_shows_reason_message` — when the server returns 422
+      290 -    `transition_blocked`, the card's blocked chip shows the `message` (R7).
+      291 -  - `test_signoff_required_flip_shows_have_over_needed` — a guarded move
+      292 -    renders the "pending signoff" badge with `have/needed` and the approvers
+      293 -    list (R3/R7).
+      294 -  - `test_waiting_page_lists_only_callers_requests` — the waiting page lists
+      295 -    only items where the caller is an approver/assignee (R8).
+      296 -- Manual (no automated test): cross-browser board drag→move; rebase from an
+      297 -  archived column.
+      344 +    the live workflow's statuses (R6).
+      345 +  - `test_blocked_chip_shows_reason_message` — a disallowed drag surfaces the
+      346 +    `message` from the 422 `transition_blocked` body in a chip (R7).
+      347 +  - `test_signoff_required_flip_shows_have_over_needed` — a guarded move renders
+      348 +    the "pending signoff" badge with `have/needed` and the approvers list
+      349 +    (R3/R7; the data-contract half is also asserted in WP3).
+      350 +  - `test_waiting_page_lists_only_callers_requests` — waiting page lists only
+      351 +    items where the caller is an active approver (R8).
+      352 +  - `test_dead_status_renders_as_read_only_archived_column` — an item whose frozen
+      353 +    workflow dropped its status renders in a greyed-out archived column with
+      354 +    Rebase enabled and move disabled (R4/R6).
+      355 +- Manual: cross-browser board drag→move; rebase from an archived column.
+      356 +- Note (review point 5): WP4's tests run under `npx playwright test`, **not**
+      357 +  `pytest -q` — they are browser-level and outside the Python gate in WP5; the
+      358 +  *data contract* behind each badge is still asserted via the FastAPI tests in
+      359 +  WP3 so the Python gate carries the assertion this tooling gap would otherwise
+      360 +  leave un-covered.
+      361
+      362  ## WP5: Verification sweep
+      363
+      301 -**Scope.** Run the whole stack green and confirm no regressions / no
+      302 -introductions to the lint gate.
+      364 +**Scope.** Green the gates and confirm no regressions. Two tracks because WP4 is
+      365 +browser-level: `pytest -q` (Python: migration + domain + MCP + web API +
+      366 +security + lint) and `npx playwright test` (web UI).
+      367
+      304 -**Files.** None new; this is the verification entry point.
+      368 +**Files.** None new; verification entry point.
+      369
+      370  **Requirements delivered.** Confidence that R1–R14 hold together and nothing in
+      371  the existing green surface broke.
+      372
+      373  **Test plan.**
+      310 -- `pytest -q` (full suite, ~20s in this repo per CLAUDE.md) — no new failures;
+      311 -  the pre-existing red tests in `tests/unit/test_work_items_service.py` (fixture
+      312 -  collisions on hard-coded emails, per CONVENTIONS §Tests) are left alone.
+      374 +- `pytest -q` (~20s) — no new failures; pre-existing red in
+      375 +  `tests/unit/test_work_items_service.py` (hard-coded-email fixture collisions,
+      376 +  CONVENTIONS §Tests) left alone.
+      377  - `pytest tests/unit/test_lint_tenant_scope.py -q` —
+      314 -  `test_real_codebase_is_clean` green with the new SQL (CONVENTIONS defence-
+      315 -  in-depth).
+      316 -- `pytest tests/integration -q` — the new e2e tests above + the existing
+      317 -  `test_mindmap_work_items_e2e.py` still pass (unchanged external behaviour for
+      318 -  teams that never edit their workflow — Risk 2).
+      378 +  `test_real_codebase_is_clean` green with the new SQL.
+      379 +- `pytest tests/integration -q` — new WP0/WP1/WP2/WP3 tests green + existing
+      380 +  `test_mindmap_work_items_e2e.py` still passes (unchanged behaviour for teams
+      381 +  that never edit their workflow — Risk 2).
+      382  - `pytest tests/security -q` — `test_workflow_visibility.py` + existing
+      383    `test_rls_failclosed.py`/`test_team_tool_authz.py` green (no cross-team
+      321 -  leakage from the widened policies).
+      322 -- `alembic upgrade head` on `MEM_MCP_DB_MAINT_DSN` against a scratch DB
+      323 -  followed by the migration back-fill assertions in WP0 — confirms the
+      324 -  `down_revision` chain (`0047_work_item_history_rls_fix`) and the
+      325 -  `SET NOT NULL`-after-back-fill ordering.
+      384 +  leakage from the widened `can_access_team_resource` policies).
+      385 +- `alembic upgrade head` on `MEM_MCP_DB_MAINT_DSN` against a scratch DB, then the
+      386 +  WP0 back-fill/CREATE-policy assertions — confirms the `down_revision` chain
+      387 +  (`0047_work_item_history_rls_fix`) and the `SET NOT NULL`-after-back-fill
+      388 +  ordering.
+      389 +- `npx playwright test` (web UI only) — WP4 specs green.
+      390  - `mypy` + `ruff check src tests` — clean (CONVENTIONS §Style: `from __future__
+      391    import annotations`, full annotations, ~100 cols).
+
+● Stage 3 plan revised — docs/feature/03-plan.md updated.
+
+  1. RLS-basis: WP0 policies now use UEA can_access_team_resource (0035:58-76), not the legacy team_members-reading current_user_active_team_ids(); added test_create_team_member_can_read_write_move (DB) +
+     test_create_team_caller_board_read_write (web) proving a memsys_create_team membership reads/inserts/moves where legacy would miss it.
+  2. change_type CHECK now admits workflow_changed (rebase) alongside signoff_requested/signoff_decided; test asserts all three insert.
+  3. Added team_workflows INSERT policy + INSERT-only team_workflow_versions; test_team_workflows_insert_policy_under_rls + test_*_seeds_default_workflow (each runs ensure_default_workflow as mem_app under RLS) cover it.
+  4. Approver eligibility now resolved via get_team_role (UEA, active-membership); new test_signoff_rejects_inactive_approver proves an inactive teammate's approval doesn't count.
+  5. WP4 adds Playwright tooling (web/playwright.config.ts, @playwright/test, web/tests/board.spec.ts) so e2e tests actually run (gated via npx playwright test, data contract also asserted in WP3's FastAPI tests); the
+     WP2 "board shows the badge" clause was moved out (MCP now returns signoff_state; badge render is a WP4 Playwright assert).
+
+✻ Crunched for 3m 4s · done 10:23 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+

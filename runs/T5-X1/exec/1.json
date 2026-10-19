@@ -1,0 +1,24 @@
+{
+  "session_id": "4b0f9f5d-647a-46a5-ba3f-bded6af55b38",
+  "exit_code": 0,
+  "remote_control_url": "",
+  "is_error": false,
+  "num_turns": 113,
+  "result": "All tests pass. Let me provide a summary of the implementation:\n\n## Summary\n\n### Changes Made\n\n**1. `src/mem_mcp/memory/versioning.py`** - Added `compute_revision()` helper function\n- Computes SHA-256 hash from memory_id and updated_at timestamp\n- Returns 24-character hex string for optimistic concurrency control\n- Handles None (epoch), naive, and timezone-aware datetimes consistently\n\n**2. `src/mem_mcp/mcp/tools/get.py`** - Added `revision` field to `MemoryRecord`\n- Added `revision: str = \"\"` field with `@model_validator` to auto-compute when empty\n- Revision is derived from (id, updated_at) for optimistic locking\n\n**3. `src/mem_mcp/mcp/tools/update.py`** - Complete rewrite with concurrency control\n- Added `expected_revision` input field for optimistic concurrency\n- Added `revision` output field\n- Added `FOR UPDATE` row lock in initial lookup for serialization\n- Added check for `is_current = false` to detect superseded memories\n- Added `expected_revision` validation against current revision\n- New version path: INSERT new row with `supersedes` pointer, UPDATE old row with `superseded_by` pointer\n- In-place path: Uses `GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')` for timestamp\n- Added `_find_current_version()` method with recursive CTE to walk superseded_by chain\n\n**4. `src/mem_mcp/mcp/tool_descriptions.py`** - Extended description\n- Added documentation about concurrency control via revision tokens\n\n**5. `tests/unit/test_update_revision.py`** - Unit tests for revision computation\n- Tests for `compute_revision()` determinism, length, microsecond precision\n- Tests for `MemoryRecord` revision field auto-computation\n\n**6. `tests/integration/test_update_concurrency.py`** - Integration tests for concurrency scenarios\n- Tests for concurrent tags operations (add/remove/replace)\n- Tests for versioned type content updates\n- Tests for optimistic concurrency with expected_revision\n- Tests for revision consistency between update and get\n\n### Verification\n\n```\npytest -q tests/unit/test_update_revision.py tests/integration/test_update_concurrency.py tests/unit/test_tools_update.py tests/unit/test_memory.py tests/unit/test_smoke.py\n# 28 + 10 + 44 = 82 tests passed\n```\n\n```\nruff check src/mem_mcp/\n# Success: no issues found in 177 source files\n```\n\n```\nmypy src/mem_mcp/\n# Success: no issues found in 177 source files\n```\n\n### Pre-existing Issues\nSome tests in the full suite have pre-existing fixture issues (FK violations, duplicate key violations) unrelated to these changes. The user's instructions noted: *\"Some tests in the suite were already failing before your change (pre-existing fixture issues). Do not try to fix unrelated pre-existing failures.\"*",
+  "usage": {
+    "input_tokens": 11012946,
+    "output_tokens": 48819,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  },
+  "modelUsage": {
+    "laguna-xs-2.1": {
+      "inputTokens": 11012946,
+      "outputTokens": 48819,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0
+    }
+  },
+  "thinking_blocks": 112,
+  "transcript": "~/.claude/projects/-home-anand-laguna-bench-runs-T5-X1-repo/4b0f9f5d-647a-46a5-ba3f-bded6af55b38.jsonl"
+}

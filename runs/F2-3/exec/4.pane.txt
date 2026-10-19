@@ -1,0 +1,260 @@
+      392 -  requires sign-off, the server returns `signoff_required` with `needed` and the
+      393 -  item's card flips to a "pending signoff" badge showing `have/needed` and the
+      394 -  list of pending approvers (R7, R3); on quorum the card animates into the new
+      377 +- `app/teams/[id]/board/page.tsx` — team board. Columns from the live workflow's
+      378 +  `statuses[]`; column header shows the label; a small badge shows pending
+      379 +  sign-off counts. Each card shows assignee + kind + a **blocked** chip with the
+      380 +  *reason string* from the move blocker (`transition_blocked` message, R7).
+      381 +  Clicking a card opens a side panel showing the item's frozen-workflow
+      382 +  `available_transitions`; a disabled move button shows the blocker tooltip when
+      383 +  `blocked` is set. "Waiting on me" items get a per-user badge; a
+      384 +  `app/teams/[id]/waiting/page.tsx` lists them (R8).
+      385 +- `app/mindmaps/[key]/board/page.tsx` — per-map board, same card/column model.
+      386 +- Move flow: drag card to a column / pick target status →
+      387 +  `POST boards/actions {action:"move", node_id, to_status, reason?}` → if the
+      388 +  move requires sign-off, the server returns `signoff_required` with `needed`
+      389 +  and the card flips to a "pending signoff" badge showing `have/needed` + the
+      390 +  pending approvers list (R3, R7); on quorum the card animates into the new
+      391    column. Approve/reject are one-click from the card's sign-off chip or from the
+      392    waiting-on-me list (R9, R12).
+      397 -- Columns whose `status_key` is not in the live workflow are rendered as a
+      398 -  greyed-out "archived" column (read-only header) so items on a removed status
+      399 -  still appear on the board (R4, R6). Clicking one of them offers only `rebase`
+      400 -  (if the team admin mapped it) — moving it is blocked with the
+      401 -  `transition_blocked` message (R7).
+      393 +- Columns whose `status_key` is not in the live workflow render as a greyed-out
+      394 +  "archived" column (read-only header) so items on a removed status still appear
+      395 +  (R4, R6); the only action on such a card is `rebase`.
+      396
+      397  ## 5. Existing data and in-flight items
+      398
+      405 -- Migration back-fill: for every existing team, create one default
+      406 -  `team_workflow_versions` (version 1, status_key set = the 5 hard-coded
+      407 -  statuses with today's order/label/terminal flags, transitions = today's
+      408 -  `TRANSITIONS` incl. `reason_required`, `min_signoffs=0`, approver_roles=empty)
+      409 -  and one `team_workflows` pointer. Set `work_items.workflow_id` to the team's
+      410 -  default version for every existing item; set `work_item_history.*`-side
+      411 -  `workflow_id` is implicit (history rows were created under 0046 and remain
+      412 -  anchored to their `memory_id`; they are not rewritten — R5). Drop the two
+      413 -  CHECKs and add the columns; set `work_items.workflow_id NOT NULL` after the
+      414 -  back-fill.
+      415 -- In-flight items (status `todo`/`in_progress`/`blocked`): unaffected — they map
+      416 -  1:1 onto the default workflow's statuses, so their `workflow_id` = default
+      417 -  version and their next moves validate exactly as today (Risk 2,
+      418 -  byte-for-byte identity until a team edits).
+      419 -- Items whose team edits its workflow: they keep their old `workflow_id`
+      420 -  (Risk 1). The board renders the old status as a read-only column (§4). They can
+      421 -  be moved *only* under the old workflow's rules until rebased (R4); this is the
+      422 -  "never stuck" guarantee — they're movable, just under their frozen rules.
+      423 -- Pending sign-off requests at the time of a workflow edit: unaffected. They
+      424 -  carry `workflow_id` (the old version) and resolve under the old rules; a team
+      425 -  editing the workflow does not retroactively cancel or re-validate them (R4).
+      426 -  They surface on the board as `signoff_required` badges under the item's old
+      427 -  `from_status`.
+      428 -- `team_workflows` / default-version creation for **new teams** (§6 open
+      429 -  question in analysis): `ensure_default_workflow(conn, team_id)` added to
+      430 -  `mindmap/workflows.py` and called from `ensure_personal_team`
+      431 -  (`identity/personal_team.py:29`, after the team row + owner role, INSERT at
+      432 -  line 78), web `create_team` (`web/handlers/teams.py:117`, after INSERT at
+      433 -  line 175), and MCP `create_team` (`mcp/tools/create_team.py`, after INSERT at
+      434 -  line 108 + `assign_role`). Idempotent guard (skip if a version already exists
+      435 -  for the team).
+      399 +- Back-fill: for every existing team, create one default
+      400 +  `team_workflow_versions` (version 1; statuses = the 5 hard-coded statuses with
+      401 +  today's order/label/terminal flags; transitions = today's `TRANSITIONS` incl.
+      402 +  `reason_required`; `min_signoffs=0`, `approver_roles=[]`) and one
+      403 +  `team_workflows` pointer. Set `work_items.workflow_id` to the team's default
+      404 +  version for every existing item. Drop the two CHECKs and add the columns; set
+      405 +  `work_items.workflow_id NOT NULL` only after the back-fill. (`work_item_history`
+      406 +  rows are not rewritten — they keep `memory_id`/`tenant_id` and the new
+      407 +  `signoff_request_id` is nullable; R5.)
+      408 +- In-flight items (status `todo`/`in_progress`/`blocked`): map 1:1 onto the
+      409 +  default workflow's statuses, so their `workflow_id` = default version and their
+      410 +  next moves validate exactly as today (Risk 2 — byte-for-byte identity until a
+      411 +  team edits).
+      412 +- Items whose team edits its workflow: keep their old `workflow_id` (Risk 1);
+      413 +  board renders the old status as a read-only "archived" column (§4); movable
+      414 +  only under the old workflow's rules until rebased (R4).
+      415 +- Pending sign-off requests at edit time: unaffected. They carry `workflow_id`
+      416 +  (the old version) and resolve under the old rules; a team editing the workflow
+      417 +  does not retroactively cancel/re-validate them (R4). They surface on the board
+      418 +  as `signoff_required` badges under the item's old `from_status`.
+      419 +- New `change_type='workflow_changed'` rows: written against
+      420 +  `work_item_history` with `memory_id = NULL` and `team_id`/`tenant_id` of the
+      421 +  team, so team-scoped history queries still apply. The table already allows
+      422 +  `memory_id NULL`-ish shapes via its indices (`team_id`, `actor_id`,
+      423 +  `created_at` 0046:109-115 are the relevant lookup legs; an `IS NULL`
+      424 +  `memory_id` is acceptable since the FK is `NOT NULL` only conceptually — see
+      425 +  Risk 8 caveat). *(Stage 2 detail: confirm the `work_item_history.memory_id`
+      426 +  FK `NOT NULL` at 0046:84 — if so, workflow-change history may instead be a
+      427 +  dedicated team-level table `team_workflow_event_log` to avoid NULLing an FK.
+      428 +  This is an open item for Stage 2, not Stage 1.)*
+      429 +- **New teams** (post-0048): `ensure_default_workflow(conn, team_id)` in
+      430 +  `mindmap/workflows.py`, called from `ensure_personal_team` (`identity/
+      431 +  personal_team.py:29`, after team row + owner role; INSERT at line 78), web
+      432 +  `create_team` (`web/handlers/teams.py:117`, after INSERT at 175), and MCP
+      433 +  `create_team` (`mcp/tools/create_team.py`, after INSERT at 108 + `assign_role`
+      434 +  at 132). Idempotent guard.
+      435
+      436  ## 6. Edge cases (E)
+      437
+      439 -- **E1 — Workflow edit while items are mid-transition in a removed status.** The
+      440 -  edit validates that every *live* item's current `status` is either a status in
+      441 -  the new workflow OR is allowed via the optional `rebase_existing_items`
+      442 -  map passed on `mindmap_workflow_update`; if `rebase_existing_items` is omitted
+      443 -  and some live items are in a status that the new workflow dropped, the edit is
+      444 -  **rejected** with `invalid_workflow_definition` (`data.code=
+      445 -  "would_orphan_items"`, listing the statuses). This keeps R4 from being
+      446 -  violated by accident — an edit that would strand items is refused until the
+      447 -  caller also supplies a `status_map`. This is why `rebase` is a separate tool:
+      448 -  the *edit* is refused, the *rebase* is the explicit migration.
+      449 -- **E2 — Sign-off quorum when an approver leaves the team mid-request.** Removing
+      450 -  an approver's membership does not delete their `work_item_signoff_approvals`
+      451 -  row (append-only, R5), so a completed quorum still counts. A *pending* request
+      452 -  whose only remaining eligible approvers have left can never reach quorum — it
+      453 -  is surfaced on the board with a `deadlocked: true` badge and an "escalate to
+      454 -  team admin" action (R4/R7). The mover or a team admin may cancel a deadlocked
+      455 -  request (recorded as `change_type='signoff_decided'`, a reject), which closes
+      456 -  it without moving the item.
+      438 +- **E1 — Edit while items sit in a dropped status.** The edit is rejected with
+      439 +  `invalid_workflow_definition` (`data.code="orphan_statuses"`, listing the
+      440 +  statuses) unless `rebase_existing_items: {status_map}` maps every such status
+      441 +  into one the new workflow defines. This keeps R4 from being violated by
+      442 +  accident — an edit that would strand items is refused; `rebase` is the
+      443 +  explicit migration.
+      444 +- **E2 — Approver leaves the team mid-request.** Removing an approver's
+      445 +  membership does not delete their `work_item_signoff_approvals` row (append-only,
+      446 +  R5), so a completed quorum still counts. A *pending* request whose only
+      447 +  remaining eligible approvers have left can never reach quorum — surfaced on the
+      448 +  board with a `deadlocked: true` badge and an "escalate to team admin" action
+      449 +  (R4/R7). Mover/admin may cancel it (recorded `change_type='signoff_decided'`,
+      450 +  a reject), closing it without moving the item.
+      451  - **E3 — Transition cycles.** `mindmap_workflow_update` rejects workflows whose
+      458 -  `workflow_transitions` graph contains a cycle that would let an item loop
+      459 -  forever between non-terminal states without reaching terminal — i.e. a cycle
+      460 -  is allowed only if at least one node in it is terminal-reachable in one more
+      461 -  hop. This is a static-graph check on the *new version* only.
+      462 -- **E4 — Rebase to a workflow that has no mapping for the item's current
+      463 -  status.** `rebase_work_item` leaves the `status` unchanged (the key survives)
+      464 -  and the board renders that column read-only (§4); `rebase_conflict` is returned
+      465 -  only if the caller insists on a `status_map` entry that maps to a status not
+      466 -  in the new workflow (R4 — never lose the item's state).
+      467 -- **E5 — Owner = creator when assignee is NULL.** `mark_work_item` may create an
+      468 -  item with no assignee; then the owner for sign-off exclusion purposes is
+      469 -  `created_by` (§2.1). `assign_work_item` changes the owner going forward.
+      470 -- **E6 — The move that requires sign-off but the mover is the only eligible
+      471 -  approver.** If the only role that satisfies `workflow_transition_approver_roles`
+      472 -  for a transition is one the mover or the item's owner holds exclusively, the
+      473 -  request is created but can never be approved by the excluded parties; it
+      474 -  surfaces as `deadlocked` (E2). This is the direct consequence of R3 ("someone
+      475 -  other than the owner"); teams must configure at least one *other* eligible
+      476 -  role (e.g. `admin`) — the default workflow uses `min_signoffs=0` so this cannot
+      477 -  happen out of the box (Risk 2).
+      452 +  `workflow_transitions` graph contains a cycle with no terminal-reachable exit
+      453 +  — i.e. every cycle must reach a terminal status within one more hop. Static
+      454 +  check on the *new version* only.
+      455 +- **E4 — Rebase with no mapping for the item's current status.** `rebase`
+      456 +  leaves `status` unchanged (the key survives) and the board renders that column
+      457 +  read-only (§4); `rebase_conflict` (-32602) only if a map entry targets a
+      458 +  status not in the new workflow.
+      459 +- **E5 — `from_status IS NULL` (initial status).** `mark_work_item`/creation
+      460 +  validates the item's first status against the `from_status IS NULL` set.
+      461 +- **E6 — Mover/owner is the only eligible approver.** A transition whose only
+      462 +  eligible role is one the mover or item-owner holds exclusively produces a
+      463 +  request that can never be approved by an excluded party → `deadlocked` (E2).
+      464 +  Consequence of R3; teams must configure at least one other eligible role
+      465 +  (default workflow uses `min_signoffs=0`, so this cannot happen out of the box).
+      466  - **E7 — History row for a blocked move.** A rejected move (transition not
+      479 -  allowed, or reason_required missing) still writes a
+      480 -  `change_type='transition_blocked'` row so the attempt is auditable (R5, R7),
+      481 -  pointing at the requested `from_status`/`to_status` and the blocker code.
+      482 -- **E8 — Terminal-status items and "waiting on me".** A `done`/`cancelled` item
+      483 -  generates no open sign-off requests and is excluded from `waiting_on_me`
+      484 -  (terminal ⇒ no outgoing transitions ⇒ §2.5).
+      467 +  allowed, or reason_required missing) writes `change_type='transition_blocked'`
+      468 +  so the attempt is auditable (R5, R7).
+      469 +- **E8 — Terminal items × "waiting on me".** A terminal item generates no open
+      470 +  sign-off requests and is excluded from `waiting_on_me` (§2.5).
+      471
+      472  ## 7. Requirement → design map
+      473
+      488 -- R1 team-defined statuses → §1.1 `workflow_statuses`, §2.2; default workflow
+      489 -  §5.
+      490 -- R2 team-defined transitions → §1.1 `workflow_transitions` (incl. E3 cycles),
+      491 -  §2.2, R11 edit §3.
+      474 +- R1 team-defined statuses → §1.1 `workflow_statuses`, §2.2; default workflow §5.
+      475 +- R2 team-defined transitions → §1.1 `workflow_transitions` (+ E3 cycles),
+      476 +  §2.2, R11 edit §2.6.
+      477  - R3 reason + sign-off from non-owner, multi-party → §1.1
+      493 -  `workflow_transition_approver_roles` + `min_signoffs`, §2.3/§2.4, "owner"
+      494 -  = assignee/creator §2.1, E6.
+      495 -- R4 never stuck on workflow change → immutable versions §1.1/Risk 1, freeze
+      496 -  `workflow_id` §1.2, rebased columns read-only §4, rebase tool §3 & §2.7,
+      497 -  edit-refuses-orphan E1.
+      478 +  `workflow_transition_approver_roles` + `min_signoffs`, §2.3/§2.4, "owner"=
+      479 +  assignee/creator §2.1, E6.
+      480 +- R4 never stuck on workflow change → immutable versions §1.1, frozen
+      481 +  `workflow_id` §1.2, read-only archived columns §4, rebase tool §2.7/§3,
+      482 +  edit-refuses-orphan E1, pending-sign-off-keeps-old-version §5.
+      483  - R5 no lost history → append-only on all new tables §1.1; relaxed `change_type`
+      499 -  CHECK admits new events; history never rewritten §5.
+      500 -- R6 web board → `GET …/board` §4, team + per-map pages `app/teams/[id]/board` &
+      501 -  `app/mindmaps/[key]/board`.
+      484 +  CHECK admits new events §1.2; history never rewritten §5; workflow-change
+      485 +  history caveat open §5.
+      486 +- R6 web board → `GET …/board` §4 (team + per-map pages `app/teams/[id]/board`
+      487 +  & `app/mindmaps/[key]/board`).
+      488  - R7 see why blocked → `blocked`/`signoff_state` on `WorkItemOutput` §3,
+      503 -  disabled move + tooltip §4, `transition_blocked` error → 422 message.
+      504 -- R8 waiting on me → `mindmap_work_list(waiting_on_me)` / `waiting_on_me=true`
+      505 -  board param / `GET …/waiting` §3/§4, E7/E8.
+      489 +  disabled move + tooltip §4, `transition_blocked` → 422 message.
+      490 +- R8 waiting on me → `mindmap_work_list(waiting_on_me=true)` / board param /
+      491 +  `GET …/waiting` §3/§4.
+      492  - R9 web move → `POST boards/actions {action:"move"}` §4, same MCP path.
+      493  - R10 MCP read → `mindmap_work_get/list/history` §3 (wrapping existing
+      508 -  service getters `work_items.py:981/1057/1165`).
+      494 +  `get_work_item`/`list_work_items`/`get_work_item_history` at work_items.py:
+      495 +  981/1057/1165).
+      496  - R11 MCMC manage workflow → `mindmap_workflow_get/update` §3.
+      510 -- R12 MCP sign-off → `mindmap_work_signoff_*` §3.
+      497 +- R12 MCP sign-off → `mindmap_work_signoff_list/approve/reject` §3.
+      498  - R13 MCP move → `mindmap_work_set_status` modified §3.
+      499  - R14 sign-off tracking → `work_item_signoff_requests/approvals`,
+      513 -  `work_item_history.signoff_request_id`, `change_type='signoff_requested'/
+      514 -  'signoff_decided'` §1.1/§1.2, opaque errors Risk 7.
+      500 +  `work_item_history.signoff_request_id`, `change_type='signoff_requested'/'
+      501 +  signoff_decided'` §1.2, opaque errors Risk 7.
+      502 +
+      503 +## 8. Risks owned by the design (deferred to Stage 2/3 detail)
+      504 +
+      505 +- **R-A — `work_item_history.memory_id NOT NULL` (0046:84).** A workflow-change
+      506 +  history row has no single item. Options: (a) relax the FK to NULL + a check
+      507 +  that exactly one of (memory_id, team_id) is the scope, or (b) a dedicated
+      508 +  `team_workflow_event_log(team_id, …)` table. Decision deferred to Stage 2
+      509 +  schema review — both keep R5 (append-only, no UPDATE/DELETE).
+      510 +- **R-B — Performance of the widened `work_items` read policy** (tenant OR
+      511 +  team-membership subquery) on the large `work_items` table. The existing
+      512 +  `work_items_tenant_team_status_idx` (0046:62-64) does not cover the team-
+      513 +  membership OR branch. Stage 3 must add a `(team_id, status)` index and verify
+      514 +  the planner uses it under the OR (CONVENTIONS §Database).
+
+  Thought for 18s, listed 1 directory (ctrl+o to expand)
+
+● Written docs/feature/02-design.md (514 lines), mapping each R1–R14 (and the corrected facts) to concrete design.
+
+  3-line summary of what I changed:
+  1. Added a visibility/ownership model anchored to the real schema/conventions: can_access_team_resource (0035:58-76) as the writer predicate, current_user_active_team_ids() (0033:49-60; reader via 0033:86-93 /
+     0034:181-186) for RLS, "owner" = item assignee/created_by (0046:51,88; work_items.py:810,509), and widened work_items/work_item_history read+write RLS to the team-scoped two-clause shape (R6/R8/R9).
+  2. Specified the immutable-version schema (team_workflows live pointer + team_workflow_versions + workflow_* + sign-off tables), the dropped/relaxed CHECKs (work_items.status 0046:48-49, work_item_history.change_type
+     0046:88), full transition/sign-off state machine, MCP tool shapes (read wrappers around the existing getters at work_items.py:981/1057/1165), web API, and the rebase tool/endpoint (R4 migration UX).
+  3. Documented existing-data migration (default-workflow seed + back-fill), the new-team hook sites (ensure_personal_team 29→78, web create_team 117→175, MCP create_team 108→132), edge cases E1–E8, and flagged two
+     deferred schema decisions as Risks R-A/R-B.
+
+✻ Churned for 4m 23s · done 10:01 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+

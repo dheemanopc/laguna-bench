@@ -1,0 +1,260 @@
+      287 -false) — the owner initiating cannot also be the required "other person", which
+      288 -satisfies the product example directly.
+      415 +**Decision:** For a transition requiring sign-off, the eligible approvers are
+      416 +team members in the roles listed by `workflow_transition_approver_roles`
+      417 +(defaulting to e.g. `admin`), **excluding** (a) the person making the move
+      418 +request, and (b) the item's current owner (assignee, else creator). Quorum is
+      419 +`min_signoffs` distinct eligible approvals, none from the excluded set. This
+      420 +satisfies "from someone other than the owner" and "more than one person"
+      421 +(`min_signoffs >= 2`) with one mechanism. The existing assignee-validation
+      422 +pattern — `set_work_item_status` calls `get_team_role(conn, assignee_id,
+      423 +team_id)` (`work_items.py:509`) — is reused to confirm an approver is a team
+      424 +member in an eligible role.
+      425
+      290 -### Risk 5 — "From status IS NULL" (initial state) is easy to get wrong.
+      426 +### Risk 5 — `from_status IS NULL` (initial state).
+      427  Newly created items must start in an allowed status; the board's "add card" UI
+      428  needs the allowed starting statuses.
+      429
+      294 -**Decision:** A transition with `from_status IS NULL` represents "an item with
+      295 -no current status may move to `to_status`" — i.e. the set of legal initial
+      296 -statuses. `mark_work_item` and item creation validate against this set. The
+      297 -linter must not flag the `IS NULL` branch (it is a value comparison, not a
+      298 -tenant filter).
+      430 +**Decision:** A `workflow_transitions` row with `from_status IS NULL` represents
+      431 +"an item with no current status may move to `to_status`" — i.e. the legal
+      432 +initial statuses. `mark_work_item` (`work_items.py:448`) validates the item's
+      433 +first status against this set. The linter must not flag the `IS NULL` branch (it
+      434 +is a value comparison, not a tenant filter — Risk 8/lint note).
+      435
+      300 -### Risk 6 — Tenant-scope linter false positives on the new SQL.
+      301 -`tools/lint_tenant_scope.py` flags per-tenant table queries missing
+      302 -`tenant_id WHERE`. The new sign-off and workflow tables are team-scoped, so
+      303 -their queries must either (a) filter on `team_id` via the RLS GUC, or (b) use
+      304 -`system_tx`-style explicit filters.
+      436 +### Risk 6 — Visibility / RLS widening for team-wide reads (revised).
+      437 +The current `work_items` read RLS is single-clause
+      438 +`tenant_id = safe_current_tenant_id()` (0046:121-124), invisible to
+      439 +cross-tenant teammates. The board, cross-assignee sign-off, and "waiting on me"
+      440 +need two-clause reads like the memories layer (0033/0035).
+      441
+      306 -**Decision:** Use `tenant_tx` + RLS for all team-scoped reads/writes, with an
+      307 -explicit `team_id = safe_current_tenant_id()` predicate in the SQL as
+      308 -defence-in-depth (CONVENTIONS §Database), exactly mirroring migration 0046's
+      309 -`work_items`/`work_item_history` policies (lines 118-158). The tables are
+      310 -*not* per-tenant in the `tenant_id` sense — they are per-**team**, and
+      311 -`safe_current_tenant_id()` already resolves a team to its tenant (the team table
+      312 -is itself tenant-scoped, see migration 0038 `team_id`/tenant ownership). No new
+      313 -linter exemption is needed if the SQL predicates on the team's tenant via the
+      314 -existing GUC path; if any statement genuinely cannot, add a justified exemption
+      315 -in the linter's exempt list (CONVENTIONS §Database).
+      442 +**Decision:** Widen the **read** policies on `work_items`,
+      443 +`work_item_history`, `work_item_signoff_requests` to
+      444 +`tenant_id = safe_current_tenant_id() OR team_id IN (SELECT resource_team_id
+      445 +FROM user_effective_team_access WHERE user_id = safe_current_tenant_id())`
+      446 +— i.e. reuse the UEA predicate that migration 0035 codifies in
+      447 +`can_access_team_resource`. The **write** policies stay team-scoped
+      448 +(`team_id`-anchored) and unchanged for inserts; updates stay
+      449 +`tenant_id = safe_current_tenant_id()` *or* require `team_id` membership, so a
+      450 +non-teammate still cannot mutate another team's item. **Critical guardrail:**
+      451 +add `tests/security/test_workflow_visibility.py` proving tenant X cannot read
+      452 +team Y's items via the team board — the escape clause must be team-scoped, never
+      453 +global. This is a DB-policy change, not a `tools/lint_tenant_scope.py`
+      454 +exemption (the Python queries still predicate on `team_id`).
+      455
+      317 -  *Open sub-question:* confirm `safe_current_tenant_id()` resolves a *team*
+      318 -  context, not just a tenant. If team-scoped tables are accessed via a
+      319 -  `current_team_id` GUC rather than `current_tenant_id`, a symmetric
+      320 -  `safe_current_team_id()` DEFINER function may be needed. **Recommended:** verify
+      321 -  in Stage 2 against `auth/roles` / the `app.*` GUC set; do not invent the GUC
+      322 -  in this stage.
+      323 -
+      456  ### Risk 7 — Read MCP tools expose cross-team existence.
+      325 -`mindmap_work_get`/`list` could leak "this team / this item exists" through
+      326 -404-vs-403 distinctions.
+      457 +**Decision (unchanged from Stage 1 draft, restated):** CONVENTIONS §Error model —
+      458 +cross-boundary lookups are **opaque**. A work item the caller cannot reach due to
+      459 +team/RLS returns the same error and data as "no such item", so tools cannot be
+      460 +used as existence oracles. Extend `map_work_item_error`, do not weaken it.
+      461
+      328 -**Decision:** Follow CONVENTIONS §Error model — cross-boundary lookups are
+      329 -**opaque**. A work item the caller cannot reach due to team/RLS returns the same
+      330 -error and data as "no such item", so tools cannot be used as existence oracles.
+      331 -This is already the pattern `map_work_item_error` enforces for `not_found`/
+      332 -`map_not_found`; extend it, do not weaken it.
+      462 +### Risk 8 — Dropping/relaxing DB CHECKs and the linter.
+      463 +**Decision:** Drop `work_items.status CHECK` (0046:48-49) and relax
+      464 +`work_item_history.change_type CHECK` (0046:88) in the 0048 migration so
+      465 +team-defined statuses and the new history events are DB-legal (the application
+      466 +enforces allowed values via the workflow). The linter (`tools/
+      467 +lint_tenant_scope.py`) is unaffected: it checks for missing `tenant_id`/`team_id`
+      468 +predicates in Python SQL, not CHECK constraints. No code exemption needed.
+      469
+      334 -### Risk 8 — Audit rows for blocked moves vs. sign-off requests.
+      335 -A blocked move that spawns a sign-off request is a meaningful event, but it is
+      336 -not itself a status change.
+      337 -
+      338 -**Decision:** Emit `mindmap.work_signoff_requested` (new `AuditAction`) when a
+      339 -sign-off request is created, `mindmap.work_signoff_decided` on each approve/
+      340 -reject, and `mindmap.work_item_transition_blocked` when a move is rejected
+      341 -outright (no sign-off path, e.g. transition not allowed). Keep
+      342 -`mindmap.work_item_changed` for genuine status moves only. Audit rows ride the
+      343 -operation's transaction (CONVENTIONS §Audit & logging), so a rolled-back sign-off
+      344 -request audit rolls back too.
+      345 -
+      470  ### Risk 9 — Web board state coherence with MCP.
+      347 -The web board must never show a move as allowed that the MCP tool would reject
+      348 -(else the UI fights the API).
+      471 +**Decision (restated):** the board's `GET .../board` response includes the
+      472 +*same* `available_transitions` + `blocked_reason` payload that
+      473 +`mindmap_work_get` returns, and `POST .../actions` dispatches through the
+      474 +identical ToolClass + `map_work_item_error` path as the MCP tool (CONVENTIONS
+      475 +§Layering). One source of truth for rules; the frontend never re-derives
+      476 +transition rules from a status string.
+      477
+      350 -**Decision:** The board's `GET .../board` response includes the *same*
+      351 -`available_transitions` + `blocked_reason` payload that `mindmap_work_get`
+      352 -returns, and `POST .../actions` dispatches through the identical ToolClass +
+      353 -`map_work_item_error` path as the MCP tool (CONVENTIONS §Layering: web handlers
+      354 -call the same domain modules). There is therefore one source of truth for
+      355 -rules. The frontend never re-derives transition rules from a status string.
+      356 -
+      478  ### Risk 10 — Migration ordering & `down_revision`.
+      358 -The new migration must chain off `0047_2026_10_16_work_item_history_rls_fix`
+      359 -(revision `0047_work_item_history_rls_fix`), not off 0046 directly, since 0047
+      360 -is now the head and the team's databases have it applied.
+      479 +**Decision (corrected):** `0048`'s `down_revision = "0047_work_item_history_rls_fix"`.
+      480 +0047 is the **no-op** RLS-fix migration (revision `0047_work_item_history_rls_fix`,
+      481 +`down_revision = "0046_mindmap_work_items"`, it only `pass`es in `upgrade`/`
+      482 +downgrade` because the policies it intended already shipped in 0046). 0047 is
+      483 +the true head, so the new migration chains off it — NOT off 0046 directly.
+      484
+      362 -**Decision:** `down_revision = "0047_work_item_history_rls_fix"`. Add the
+      363 -`work_items.workflow_id` column with a server default pointing at the seeded
+      364 -default workflow, back-fill, then drop the default. Seed one default workflow
+      365 -per team from the existing `teams`/`team_role_assignments` rows. (Stage 2
+      366 -details the exact back-fill SQL.)
+      485 +### Risk 11 — Misstatement about 0047 corrected.
+      486 +The earlier draft wrote "Risk 11 calls 0047 the 0046 file." That was wrong. 0047
+      487 +is a distinct file (`alembic/versions/0047_2026_10_16_work_item_history_rls_fix.py`)
+      488 +that is intentionally a no-op because its RLS policies already exist in 0046.
+      489 +The only correct fact to carry forward is: **chain `down_revision` to
+      490 +`0047_work_item_history_rls_fix`** (Risk 10).
+      491
+      368 -### Risk 11 — Rename of `workflow_id`.
+      369 -The migration 0046 file names its revision
+      370 -`0047_work_item_history_rls_fix` with `down_revision =
+      371 -"0046_mindmap_work_items"`, so 0047 is genuinely the head even though it is a
+      372 -no-op. Do not be fooled into chaining off 0046.
+      492 +### Risk 12 — Board is per-map (`/mindmaps/{map_key}`) but R6/R8 are team-wide.
+      493 +**Decision:** provide **both** surfaces. A per-map board
+      494 +(`GET /api/web/mindmaps/{map_key}/board`) for a single mind-map's columns, and a
+      495 +team-wide board (`GET /api/web/teams/{team_id}/board`) that aggregates every
+      496 +work item whose `team_id` matches across all of the team's maps and member
+      497 +tenants — this is the one R6/R8 *and* the visibility fix in Risk 6 force. The
+      498 +"waiting on me" surface is team-wide by nature (`GET /api/web/teams/{team_id}/
+      499 +waiting`). Frontend: a per-map board page (`web/app/mindmaps/[key]/board/page.tsx`)
+      500 +and a team board page (`web/app/teams/[id]/board/page.tsx`).
+      501
+      374 -**See Risk 10.**
+      502 +## 5. Open questions
+      503
+      504  ### Open question — Do teams need *multiple* parallel live workflows?
+      505  The product says "a team should be able to define its own workflow" (singular).
+      506
+      379 -**Recommendation:** Support exactly **one** live workflow per team for now
+      380 -(`team_workflows` has a unique constraint on `(team_id)` — one row per team).
+      381 -The `is_default` / `schema_version` / `name` columns exist to make
+      382 -multi-workflow migration possible later without a schema change, but the service
+      383 -layer enforces one-live-workflow-per-team. This keeps R4's "freeze on item"
+      384 -simple (one snapshot table, no workflow-selector UI). Revisit only if the
+      385 -product explicitly needs parallel workflows.
+      507 +**Recommendation:** **one** live workflow per team for now — `team_workflows`
+      508 +has a unique constraint on `(team_id)` (one row per team). The `name`/`
+      509 +is_default`/`schema_version` columns exist only to avoid a future schema change
+      510 +if multi-workflow is ever needed. The service layer enforces one-live-
+      511 +-workflow-per-team. Rationale: simplifies R4's freeze (one snapshot set).
+      512
+      513  ### Open question — Who may define a team's workflow?
+      514  **Recommendation:** `TEAM_MANAGE_SETTINGS` (the existing permission for
+      389 -team-level config changes — `src/mem_mcp/auth/permissions.py:36`). Owners and
+      390 -admins have it (ROLE_PERMISSIONS `owner`/`admin`), members do not (line 86).
+      391 -This matches "the team defines its workflow" while preventing arbitrary
+      392 -members from redefining the process. `mindmap_work_signoff_*` and board *move*
+      393 -permission stays at `TEAM_WRITE_MEMORY` (current `required_scope`/`TEAM_WRITE_MEMORY`
+      394 -on `mindmap_work_set_status`), so any team member who can write memory can move
+      395 -a card — but only through the workflow's transition + sign-off rules.
+      515 +team-level config — `auth/permissions.py:36`; `owner`/`admin` roles have it per
+      516 +`ROLE_PERMISSIONS`, members do not). `mindmap_workflow_update` requires it.
+      517 +Workflow *moves* (`mindmap_work_set_status`) stay gated at `TEAM_WRITE_MEMORY`
+      518 +(owners, admins, members) but are still subject to transition + sign-off rules.
+      519
+      397 -## 5. Summary of the recommended shape (Stage 2 input)
+      520 +### Open question — Should `can_access_team_resource` be reused in the new
+      521 +read SQL, or a dedicated team-read GUC?
+      522 +The migration 0035 helper takes `(caller_tenant, resource_tenant,
+      523 +resource_team)` and returns *whether* access is granted — good for a
+      524 +`WHERE` guard but not a row filter. For a per-row read filter the team-wide
+      525 +board needs, the RLS `USING` clause must express "this row's `team_id` is
+      526 +UEA-reachable by the caller" (Risk 6). **Recommendation for Stage 2:** express
+      527 +the read policy as a subquery over `user_effective_team_access` inside `USING`,
+      528 +mirroring how 0033 mirrors the same predicate, and add the `pytestmark.security`
+      529 +test. Do not invent a new GUC in Stage 1; Stage 2 verifies the UEA shape against
+      530 +`teams/effective_access.py` (the linter exempt list cites this file).
+      531
+      399 -- One new migration `0048`, chaining off `0047_work_item_history_rls_fix`, adding
+      400 -  the workflow/sign-off tables + `work_items.workflow_id`, with a default
+      401 -  workflow seeded per team and existing items back-filled.
+      402 -- New domain module `mindmap/workflows.py`; `mindmap/work_items.py` rewritten to
+      403 -  delegate transition rules to it and to stamp/freeze `workflow_id`.
+      404 -- ~4 new MCP read tools + 2 workflow tools + 2 sign-off tools + extensions to the
+      405 -  existing 4; new `AuditAction`s; `map_work_item_error` extended.
+      406 -- New web endpoints on the mindmaps router + a new frontend board page.
+      407 -- Tests: unit (`test_workflows_service`), integration (`test_mindmap_workflows_e2e`,
+      408 -  including the R4 "change workflow, item not stuck" regression), and security
+      409 -  (RLS), all running `pytest -q` with no network.
+      532 +## 6. Summary of the recommended shape (Stage 2 input)
+      533
+      411 -The append-only, no-UPDATE/DELETE history table from migration 0046 is the
+      412 -template for every new workflow/sign-off table, and the `tenant_tx` +
+      413 -`safe_current_tenant_id()` + explicit-`WHERE` pattern is the template for every
+      414 -new query.
+      534   No newline at end of file
+      535 +- One new migration `0048`, chaining off `0047_work_item_history_rls_fix`:
+      536 +  `team_workflows`, `workflow_statuses`, `workflow_transitions`,
+      537 +  `workflow_transition_approver_roles`, `work_item_signoff_requests`,
+      538 +  `work_item_signoff_approvals`, the `work_items.workflow_id` FK, a default
+      539 +  workflow seeded per team, existing items back-filled. Drop/relaxes the two
+      540 +  CHECKs (Risk 8). Widen **read** RLS to the two-clause team-aware shape
+      541 +  (Risk 6); keep writes team-anchored. New tables mirror `work_item_history`'s
+      542 +  append-only shape.
+      543 +- New domain module `mindmap/workflows.py`; `mindmap/work_items.py` delegates
+      544 +  transition rules to it and freezes `workflow_id`; `set_work_item_status`
+      545 +  creates sign-off requests (no immediate status change) when quorum is needed.
+      546 +- ~4 MCP read wrappers around the *existing* service getters (enriched) + 2
+      547 +  workflow tools + 3 sign-off tools + extensions to the existing 4 tools; new
+      548 +  `AuditAction`s; `map_work_item_error` extended.
+      549 +- New web endpoints on the mindmaps router (per-map board) + a new team-scoped
+      550 +  board + "waiting on me" + a generic actions dispatcher; new frontend board
+      551 +  pages.
+      552 +- Tests: unit (`test_workflows_service`), integration (`test_mindmap_workflows_
+      553 +  e2e` incl. the R4 "change workflow, item not stuck" regression; `
+      554 +  test_mindmap_workflow_rebase_e2e`), and security (`test_workflow_visibility`),
+      555 +  all running `pytest -q` with no network.
+      556   No newline at end of file
+
+● Revised docs/feature/01-analysis.md for the five architect-flagged errors: (1) added a "Visibility collision" subsection with a proper §3 table showing work items are partitioned by creator tenant_id and work_items RLS
+  is the single-clause tenant_id = safe_current_tenant_id() (0046:121-125) — strictly narrower than the memories two-clause read path (0033) that migration 0035 codified in can_access_team_resource(0035:58-76) — with a
+  team-wide board endpoint + widened two-clause read policy in Risk 6; (2) listed the two DB CHECKs that must be dropped/relax ed (work_items.status 0046:48-49, work_item_history.change_type 0046:88) and spec'd the new
+  history columns/events, in Risk 8; (3) redefined "owner" as the item's assignee (created-by-when-unassigned), not the team role, with the assign_work_item/change_type 'owner' evidence; (4) made Risk 1 a real "never
+  stuck" story — freeze workflow_id on the item/sign-off request + an explicit rebase_work_item (status_map, unmapped→read-only column) so R4 is genuinely satisfiable, not parked; (5) corrected the facts: the three
+  service getters already exist at work_items.py:981/1057/1165 (only MCP+web wrappers missing), 0047 is the no-op head so down_revision chains to 0047_work_item_history_rls_fix, and the board mismatch (per-map
+  /{map_key}/board vs team-wide R6/R8) gets both surfaces in Risk 12.
+
+✻ Baked for 3m 59s · done 9:50 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+

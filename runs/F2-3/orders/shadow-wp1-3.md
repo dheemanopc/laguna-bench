@@ -1,0 +1,7 @@
+VERDICT: APPROVE
+
+1. `mark_work_item` hard-codes `initial_status = "todo"` and only checks it against `__entry__` (work_items.py:478-481). A custom workflow with a different entry status can never mark an item. Entry should come from the workflow. The error is also `InvalidTransitionError`, not the planned `invalid_workflow_status`. Fix before WP2 exposes custom workflows.
+2. `work_items.workflow_id` is still nullable (0048:227,298), against the WP0 plan ("column NOT NULL"). NULL-fallback paths (`resolve_item_workflow`, the 'null workflow' tests) now have to stay. Decide explicitly, or add the constraint in a later migration.
+3. The quorum count is `COUNT(DISTINCT approver)` with no eligibility or active recheck at completion (workflows.py:531-539). An approver deactivated, or made assignee, after approving still counts. The plan wanted inactive approvals recorded but not counted. The code rejects them up front (512-515), which is acceptable but a deviation.
+4. `list_work_items` makes a `get_signoff_state_for_item` query per row (work_items.py:1219), although the comment says "batch". This is an N+1 on the board path that WP3 will use. Batch it.
+5. Two planned tests in `test_work_items_service.py` were not added (cross-tenant list, sign-off from set_status). Equivalents exist in `test_workflows_service.py` (`test_cross_tenant_teammate_lists_items`). This is only a nit. The gate is green with 0 new failures.

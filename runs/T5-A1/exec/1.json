@@ -1,0 +1,24 @@
+{
+  "session_id": "92887d3f-e33b-41ae-ac98-17571f7394bf",
+  "exit_code": 0,
+  "remote_control_url": "",
+  "is_error": false,
+  "num_turns": 10,
+  "result": "The implementation and new tests are written, but nothing has been run: Bash was denied in this session's \"don't ask\" mode, so I couldn't execute `pytest`, `ruff`, `mypy` or the baseline `git stash` comparison.\n\n## What changed\n- **`src/mem_mcp/memory/versioning.py`**\n  - New `memory_revision(id, updated_at)`, `UpdateConflictError`, `lock_memory_for_update` (the `FOR UPDATE` lookup) and `resolve_current_id` (recursive CTE, tenant-filtered, and non-deleted `is_current` preferred).\n- **`src/mem_mcp/mcp/tools/get.py`**\n  - `MemoryRecord.revision` plus an after-validator that fills it from `(id, updated_at)`.\n  - `model_dump(mode=\"json\")` is the tool output path, so the field serializes.\n- **`src/mem_mcp/mcp/tools/update.py`**\n  - **Models:** `expected_revision` input and `revision` output.\n  - **Conflict checks:** after the not-found/deleted checks, a superseded target gives -32000 `update_conflict` with `current_id`, and a stale `expected_revision` gives -32000 with `current_revision` and `current_id`. `UpdateConflictError` is mapped with `raise ... from e`.\n  - **Writes:** the supersede UPDATE is conditional on `is_current = true`. The INSERT returns `updated_at`. Both in-place UPDATEs use `GREATEST(now(), updated_at + interval '1 microsecond')`.\n- **`src/mem_mcp/mcp/tool_descriptions.py`**\n  - Documented `expected_revision`, the output `revision`, and the conflict contract.\n- **`tests/integration/test_update_concurrency.py`** (new)\n  - Covers your tests 1–7. It uses its own pool with `max_size=14` and drains the access-bump tasks before closing.\n\n## Not done or checked\n- **Verification commands:**\n  - `pytest tests/unit/test_tools_update.py` plus the new tests\n  - `pytest tests/unit tests/integration` against a baseline\n  - `ruff check src tests` and `mypy`\n  - The \"tests 1, 2 and 5 fail on the original code\" check.\n- **Mock compatibility:**\n  - I used `.get()` for `is_current` and `updated_at`.\n  - The mock tests have `fetchval` and `INSERT` results without a datetime, so I fall back to `datetime.now(UTC)` when it isn't one.\n  - I haven't confirmed the existing unit tests pass.\n- **Unchecked callers:**\n  - I did not edit the plugin SDK `MemoryClient.update` or `web/handlers/memories.py`.\n  - From reading, the SDK wraps -32000 as `PluginValidationError(code=\"update_conflict\")`, and the web handler routes via `_jsonrpc_to_http`. I haven't checked how `_jsonrpc_to_http` maps -32000.\n- **`bump_access`:** the SQL I read only sets `last_accessed_at` and `access_count`, so a read doesn't change `updated_at`. I didn't check whether a DB trigger touches `updated_at`.\n- **Sandbox tests:** the new tests are unrun and may need small fixture fixes, such as the `MemoryWriteInput` type annotations or the cleanup table list.\n\nIf you allow Bash (or run `! pytest -q -p no:cacheprovider tests/unit/test_tools_update.py tests/integration/test_update_concurrency.py` yourself), I can finish the verification and the stash comparison.",
+  "usage": {
+    "input_tokens": 20,
+    "output_tokens": 18829,
+    "cache_read_input_tokens": 641241,
+    "cache_creation_input_tokens": 51710
+  },
+  "modelUsage": {
+    "claude-sonnet-5-5": {
+      "inputTokens": 20,
+      "outputTokens": 18829,
+      "cacheReadInputTokens": 641241,
+      "cacheCreationInputTokens": 51710
+    }
+  },
+  "thinking_blocks": 4,
+  "transcript": "~/.claude/projects/-home-anand-laguna-bench-runs-T5-A1-repo/92887d3f-e33b-41ae-ac98-17571f7394bf.jsonl"
+}

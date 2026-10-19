@@ -1,0 +1,226 @@
+NOTICE:  database "sc_t3_h_262610" does not exist, skipping
+FFFF.F.FF.F.FFFFFFF                                                      [100%]
+=================================== FAILURES ===================================
+________ TestOutsiderCannotTakeOverATeam.test_cannot_add_self_as_owner _________
+
+self = <tests.security.test_team_tool_authz.TestOutsiderCannotTakeOverATeam object at 0x70d358006ab0>
+scenario = <tests.security.test_team_tool_authz.Scenario object at 0x70d356fa3cb0>
+
+    async def test_cannot_add_self_as_owner(self, scenario: Scenario) -> None:
+        """The original exploit: self-promotion to owner of someone else's team."""
+>       with pytest.raises(JsonRpcError) as exc:
+E       Failed: DID NOT RAISE <class 'mem_mcp.mcp.errors.JsonRpcError'>
+
+tests/security/test_team_tool_authz.py:114: Failed
+______ TestOutsiderCannotTakeOverATeam.test_cannot_demote_the_real_owner _______
+
+self = <tests.security.test_team_tool_authz.TestOutsiderCannotTakeOverATeam object at 0x70d3570485c0>
+scenario = <tests.security.test_team_tool_authz.Scenario object at 0x70d356fbe450>
+
+    async def test_cannot_demote_the_real_owner(self, scenario: Scenario) -> None:
+>       with pytest.raises(JsonRpcError) as exc:
+E       Failed: DID NOT RAISE <class 'mem_mcp.mcp.errors.JsonRpcError'>
+
+tests/security/test_team_tool_authz.py:127: Failed
+_______ TestOutsiderCannotTakeOverATeam.test_cannot_evict_the_real_owner _______
+
+self = <tests.security.test_team_tool_authz.TestOutsiderCannotTakeOverATeam object at 0x70d356fa2d50>
+scenario = <tests.security.test_team_tool_authz.Scenario object at 0x70d356b20110>
+
+    async def test_cannot_evict_the_real_owner(self, scenario: Scenario) -> None:
+        with pytest.raises(JsonRpcError) as exc:
+            await RemoveTeamMemberTool()(
+                scenario.attacker_ctx,
+                RemoveTeamMemberInput(
+                    team_id=scenario.team_id,
+                    member_kind="user",
+                    member_id=scenario.victim_id,
+                ),
+            )
+>       _assert_denied(exc)
+
+tests/security/test_team_tool_authz.py:149: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+exc = <ExceptionInfo JsonRpcError('sole_owner_cannot_self_remove: sole owner cannot be removed; assign another owner first') tblen=2>
+
+    def _assert_denied(exc: pytest.ExceptionInfo[JsonRpcError]) -> None:
+>       assert exc.value.data is not None
+E       AssertionError: assert None is not None
+E        +  where None = JsonRpcError('sole_owner_cannot_self_remove: sole owner cannot be removed; assign another owner first').data
+E        +    where JsonRpcError('sole_owner_cannot_self_remove: sole owner cannot be removed; assign another owner first') = <ExceptionInfo JsonRpcError('sole_owner_cannot_self_remove: sole owner cannot be removed; assign another owner first') tblen=2>.value
+
+tests/security/test_team_tool_authz.py:107: AssertionError
+_ TestOutsiderCannotTakeOverATeam.test_team_state_is_untouched_after_all_attempts _
+
+self = <tests.security.test_team_tool_authz.TestOutsiderCannotTakeOverATeam object at 0x70d356fa30b0>
+scenario = <tests.security.test_team_tool_authz.Scenario object at 0x70d356fbe810>
+pg_pool = <asyncpg.pool.Pool object at 0x70d3581bcb80>
+
+    async def test_team_state_is_untouched_after_all_attempts(
+        self, scenario: Scenario, pg_pool: Any
+    ) -> None:
+        """Belt and braces: assert the DB, not just the raised errors."""
+>       with pytest.raises(JsonRpcError):
+E       Failed: DID NOT RAISE <class 'mem_mcp.mcp.errors.JsonRpcError'>
+
+tests/security/test_team_tool_authz.py:155: Failed
+______ TestLegitimateUseStillWorks.test_plain_member_cannot_manage_others ______
+
+self = <tests.security.test_team_tool_authz.TestLegitimateUseStillWorks object at 0x70d356fa3770>
+scenario = <tests.security.test_team_tool_authz.Scenario object at 0x70d356b219d0>
+
+    async def test_plain_member_cannot_manage_others(self, scenario: Scenario) -> None:
+        """Being in the team is not the same as administering it."""
+        await AddTeamMemberTool()(
+            scenario.victim_ctx,
+            AddTeamMemberInput(
+                team_id=scenario.team_id,
+                member_kind="user",
+                member_id=scenario.attacker_id,
+                role_key="member",
+            ),
+        )
+>       with pytest.raises(JsonRpcError) as exc:
+E       Failed: DID NOT RAISE <class 'mem_mcp.mcp.errors.JsonRpcError'>
+
+tests/security/test_team_tool_authz.py:224: Failed
+_ TestNoUserExistenceOracle.test_denied_add_by_email_does_not_reveal_whether_user_exists _
+
+self = <tests.security.test_team_tool_authz.TestNoUserExistenceOracle object at 0x70d356fa3230>
+scenario = <tests.security.test_team_tool_authz.Scenario object at 0x70d356b22f60>
+
+    async def test_denied_add_by_email_does_not_reveal_whether_user_exists(
+        self, scenario: Scenario
+    ) -> None:
+        """Unauthorized callers get the same refusal for real and unknown emails.
+    
+        If the email were resolved before the team gate, the differing error
+        would turn this tool into an account-existence oracle.
+        """
+        async with system_tx(scenario.pool) as conn:
+            real_email = await conn.fetchval(
+                "SELECT email FROM tenants WHERE id = $1", scenario.victim_id
+            )
+    
+>       with pytest.raises(JsonRpcError) as known:
+E       Failed: DID NOT RAISE <class 'mem_mcp.mcp.errors.JsonRpcError'>
+
+tests/security/test_team_tool_authz.py:272: Failed
+_____________________ test_every_catalog_role_has_an_entry _____________________
+
+    def test_every_catalog_role_has_an_entry() -> None:
+        missing = CATALOG_ROLE_KEYS - ROLE_PERMISSIONS.keys()
+>       assert not missing, (
+            f"roles_catalog role_keys with no ROLE_PERMISSIONS entry: {sorted(missing)}. "
+            "has_permission() returns False for these, silently."
+        )
+E       AssertionError: roles_catalog role_keys with no ROLE_PERMISSIONS entry: ['customer', 'owner', 'service-bot', 'vendor', 'viewer']. has_permission() returns False for these, silently.
+E       assert not {'customer', 'owner', 'service-bot', 'vendor', 'viewer'}
+
+tests/unit/test_role_permissions_cover_catalog.py:32: AssertionError
+________________________ test_owner_can_manage_members _________________________
+
+    def test_owner_can_manage_members() -> None:
+        """The regression this whole guard exists for."""
+>       assert Permission.TEAM_MANAGE_MEMBERS in ROLE_PERMISSIONS["owner"]
+                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'owner'
+
+tests/unit/test_role_permissions_cover_catalog.py:46: KeyError
+______________ test_non_admin_roles_cannot_manage_members[viewer] ______________
+
+role_key = 'viewer'
+
+    @pytest.mark.parametrize("role_key", ["member", "viewer", "vendor", "customer", "service-bot"])
+    def test_non_admin_roles_cannot_manage_members(role_key: str) -> None:
+>       assert Permission.TEAM_MANAGE_MEMBERS not in ROLE_PERMISSIONS[role_key]
+                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'viewer'
+
+tests/unit/test_role_permissions_cover_catalog.py:51: KeyError
+______________ test_non_admin_roles_cannot_manage_members[vendor] ______________
+
+role_key = 'vendor'
+
+    @pytest.mark.parametrize("role_key", ["member", "viewer", "vendor", "customer", "service-bot"])
+    def test_non_admin_roles_cannot_manage_members(role_key: str) -> None:
+>       assert Permission.TEAM_MANAGE_MEMBERS not in ROLE_PERMISSIONS[role_key]
+                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'vendor'
+
+tests/unit/test_role_permissions_cover_catalog.py:51: KeyError
+_____________ test_non_admin_roles_cannot_manage_members[customer] _____________
+
+role_key = 'customer'
+
+    @pytest.mark.parametrize("role_key", ["member", "viewer", "vendor", "customer", "service-bot"])
+    def test_non_admin_roles_cannot_manage_members(role_key: str) -> None:
+>       assert Permission.TEAM_MANAGE_MEMBERS not in ROLE_PERMISSIONS[role_key]
+                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'customer'
+
+tests/unit/test_role_permissions_cover_catalog.py:51: KeyError
+___________ test_non_admin_roles_cannot_manage_members[service-bot] ____________
+
+role_key = 'service-bot'
+
+    @pytest.mark.parametrize("role_key", ["member", "viewer", "vendor", "customer", "service-bot"])
+    def test_non_admin_roles_cannot_manage_members(role_key: str) -> None:
+>       assert Permission.TEAM_MANAGE_MEMBERS not in ROLE_PERMISSIONS[role_key]
+                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'service-bot'
+
+tests/unit/test_role_permissions_cover_catalog.py:51: KeyError
+__________________ test_external_roles_are_read_only[vendor] ___________________
+
+role_key = 'vendor'
+
+    @pytest.mark.parametrize("role_key", ["vendor", "customer"])
+    def test_external_roles_are_read_only(role_key: str) -> None:
+        """External collaborators must not write memories by default."""
+>       assert Permission.TEAM_WRITE_MEMORY not in ROLE_PERMISSIONS[role_key]
+                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'vendor'
+
+tests/unit/test_role_permissions_cover_catalog.py:58: KeyError
+_________________ test_external_roles_are_read_only[customer] __________________
+
+role_key = 'customer'
+
+    @pytest.mark.parametrize("role_key", ["vendor", "customer"])
+    def test_external_roles_are_read_only(role_key: str) -> None:
+        """External collaborators must not write memories by default."""
+>       assert Permission.TEAM_WRITE_MEMORY not in ROLE_PERMISSIONS[role_key]
+                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       KeyError: 'customer'
+
+tests/unit/test_role_permissions_cover_catalog.py:58: KeyError
+__________________ test_team_roles_hold_no_system_permissions __________________
+
+    def test_team_roles_hold_no_system_permissions() -> None:
+        for role_key in CATALOG_ROLE_KEYS:
+            assert not any(
+>               p.value.startswith("system.") for p in ROLE_PERMISSIONS[role_key]
+                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+            ), f"team role {role_key} carries a system.* permission"
+E           KeyError: 'vendor'
+
+tests/unit/test_role_permissions_cover_catalog.py:64: KeyError
+=========================== short test summary info ============================
+FAILED tests/security/test_team_tool_authz.py::TestOutsiderCannotTakeOverATeam::test_cannot_add_self_as_owner
+FAILED tests/security/test_team_tool_authz.py::TestOutsiderCannotTakeOverATeam::test_cannot_demote_the_real_owner
+FAILED tests/security/test_team_tool_authz.py::TestOutsiderCannotTakeOverATeam::test_cannot_evict_the_real_owner
+FAILED tests/security/test_team_tool_authz.py::TestOutsiderCannotTakeOverATeam::test_team_state_is_untouched_after_all_attempts
+FAILED tests/security/test_team_tool_authz.py::TestLegitimateUseStillWorks::test_plain_member_cannot_manage_others
+FAILED tests/security/test_team_tool_authz.py::TestNoUserExistenceOracle::test_denied_add_by_email_does_not_reveal_whether_user_exists
+FAILED tests/unit/test_role_permissions_cover_catalog.py::test_every_catalog_role_has_an_entry
+FAILED tests/unit/test_role_permissions_cover_catalog.py::test_owner_can_manage_members
+FAILED tests/unit/test_role_permissions_cover_catalog.py::test_non_admin_roles_cannot_manage_members[viewer]
+FAILED tests/unit/test_role_permissions_cover_catalog.py::test_non_admin_roles_cannot_manage_members[vendor]
+FAILED tests/unit/test_role_permissions_cover_catalog.py::test_non_admin_roles_cannot_manage_members[customer]
+FAILED tests/unit/test_role_permissions_cover_catalog.py::test_non_admin_roles_cannot_manage_members[service-bot]
+FAILED tests/unit/test_role_permissions_cover_catalog.py::test_external_roles_are_read_only[vendor]
+FAILED tests/unit/test_role_permissions_cover_catalog.py::test_external_roles_are_read_only[customer]
+FAILED tests/unit/test_role_permissions_cover_catalog.py::test_team_roles_hold_no_system_permissions
+15 failed, 4 passed in 0.64s

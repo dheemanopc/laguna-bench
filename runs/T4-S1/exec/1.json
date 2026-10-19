@@ -1,0 +1,24 @@
+{
+  "session_id": "831d1ce7-0952-4659-b4b7-26c56015ce58",
+  "exit_code": 0,
+  "remote_control_url": "",
+  "is_error": false,
+  "num_turns": 58,
+  "result": "The work is complete and verified. Here's the final report.\n\n---\n\n## T4 — Mind-map branch status + cheap resume reads\n\n### What changed (5 files, all in the working tree)\n\n1. **`src/mem_mcp/mcp/tools/mindmap_resolve.py`** (new) — The `mindmap_resolve` MCP tool. Settles one branch (status `resolved`/`dropped`) with edge + event log, all in one `tenant_tx` transaction. Maps disposition → edge kind via `_DISPOSITION_EDGE_KIND`.\n\n2. **`src/mem_mcp/mcp/tools/mindmap_get.py`** (modified) — Added `since`/`include`/`depth` inputs and `cursor`/`resolved`/`status`/`truncated` outputs. Fixed `open_loops` to exclude settled branches. Implements cheap incremental reads via `fetch_member_ids_touched_since`.\n\n3. **`src/mem_mcp/mindmap/service.py`** (modified) — Added `set_node_status`, `get_cursor`, `fetch_member_ids_touched_since`, `fetch_member` (with status cols), and the `include_status`/`memory_ids` filter params on `fetch_members`. Removed a pre-existing `ORDER BY` in `fetch_member_ids_touched_since` that PostgreSQL rejected under `DISTINCT`.\n\n4. **`src/mem_mcp/main.py`** (modified) — Registered `MindmapResolveTool` in `tools_list`.\n\n5. **`src/mem_mcp/mcp/tool_descriptions.py`** (modified) — Added `mindmap_resolve` description; updated `mindmap_get` description to document the new input/output levers.\n\n### Tests added\n\n- **`tests/unit/test_mindmap_resolve_schema.py`** (new) — 19 schema-validation tests (field defaults, literal constraints, min/max lengths, extra-forbid, cursor output, settled-node fields).\n- **`tests/integration/test_mindmap_e2e.py`** (modified) — 9 end-to-end tests covering resolve happy path, drop without resolver, map-not-found, non-member node, archived map, resolving-node-not-found, cheap reads (since/include/depth/resolved/cursor), open_loops excluding settled branches, and `since=0` full-read sentinel.\n\n### Verification\n\n| Command | Result |\n|---|---|\n| `pytest tests/unit/test_mindmap_resolve_schema.py tests/integration/test_mindmap_e2e.py -v` | **30 passed** |\n| `ruff check src tests` | **clean** (all files, including `main.py` import ordering) |\n| `python -m mypy src/mem_mcp` | **0 errors** (2 pre-existing errors on `service.py:65,76` are in `resolve_map_root` / `find_live_map_seeded_from` — untouched by T4) |\n| `pytest tests/unit/test_lint_tenant_scope.py -v` | **14 passed** (tenant-scope SQL lint includes the new queries) |\n| `pytest tests/unit/test_tools.py -v` | **49 passed** (`TestMemorySearchTool` + `TestMindmapGetTool` both green) |\n| `pytest tests/integration/test_enterprise_mcp_tools.py` | **1 expected failure** — `CreateTeamTool`/`ListMyTeams` (\"owner\" vs \"admin\" + teardown `UniqueViolationError`); pre-existing fixture issues, out of scope per CLAUDE.md |\n\n### Notes / open items\n\n- The `0044` migration adding `status`/`resolution_summary`/`resolved_by_*` columns to `memory_map_membership` was already applied by the prior session — schema and code agree.\n- `resolved_by_memory_id` is verified for existence within the same `tenant_tx` (simple `SELECT 1 FROM memories WHERE … AND tenant_id = $1 AND deleted_at IS NULL`) rather than a cross-tenant `system_tx` lookup — sufficient for the current access model and avoids a second transaction.\n- `since=0` is treated as a full-read sentinel (a real cursor is always ≥ 1 once any event exists), so callers passing `since=0` get the complete map rather than an empty cheap-read result.",
+  "usage": {
+    "input_tokens": 7068237,
+    "output_tokens": 101717,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  },
+  "modelUsage": {
+    "laguna-s-2.1": {
+      "inputTokens": 7068237,
+      "outputTokens": 101717,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0
+    }
+  },
+  "thinking_blocks": 51,
+  "transcript": "~/.claude/projects/-home-anand-laguna-bench-runs-T4-S1-repo/831d1ce7-0952-4659-b4b7-26c56015ce58.jsonl"
+}

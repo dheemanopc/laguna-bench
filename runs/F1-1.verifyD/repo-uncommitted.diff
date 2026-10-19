@@ -1,0 +1,698 @@
+diff --git a/KNOWN_RED_BASE.txt b/KNOWN_RED_BASE.txt
+new file mode 100644
+index 0000000..bf86313
+--- /dev/null
++++ b/KNOWN_RED_BASE.txt
+@@ -0,0 +1,32 @@
++tests/security/test_scope_enforcement.py::TestStatsToolScopes::test_stats_tool_requires_read_scope
++tests/unit/test_effective_access_recompute.py::TestRecomputeDirect::test_direct_user_member
++tests/unit/test_effective_access_recompute.py::TestSyncRefreshHook::test_assign_role_writes_uea_row
++tests/unit/test_enterprise_mcp_tools.py::TestCreateTeam::test_create_team_personal_no_domain
++tests/unit/test_enterprise_mcp_tools.py::TestCreateTeam::test_create_team_workspace_auto_domain
++tests/unit/test_enterprise_mcp_tools.py::TestListMyTeams::test_list_teams_empty
++tests/unit/test_enterprise_mcp_tools.py::TestListMyTeams::test_list_teams_with_membership
++tests/unit/test_enterprise_schema.py::test_memories_visibility_constraint
++tests/unit/test_enterprise_schema.py::test_rls_memories_team_visibility
++tests/unit/test_enterprise_schema.py::test_rls_teams_select_via_membership
++tests/unit/test_rbac_resolver.py::TestHasPermissionResolver::test_has_permission_inactive_member_denied
++tests/unit/test_refresh_team_access.py::TestReconcilerCatchUp::test_reconciler_writes_missing_uea_row
++tests/unit/test_refresh_team_access.py::TestReconcilerDryRun::test_dry_run_does_not_mutate
++tests/unit/test_roles_catalog.py::TestRolesCatalogConstraints::test_role_class_check_constraint
++tests/unit/test_roles_catalog.py::TestRolesCatalogSeed::test_seed_idempotent_on_rerun
++tests/unit/test_slugs_schema.py::TestSlugsSchema::test_pk_uniqueness_within_scope
++tests/unit/test_spec2_slug_lookup.py::TestMemsysSlugLookup::test_lookup_hit_on_existing_slug
++tests/unit/test_team_api.py::test_add_team_member_invalid_role_key_rejects
++tests/unit/test_team_api.py::test_add_team_member_team_cycle_rejects
++tests/unit/test_team_api.py::test_add_team_member_user_by_email_existing
++tests/unit/test_team_api.py::test_add_team_member_user_by_email_unknown_rejects
++tests/unit/test_team_api.py::test_assign_role_invalid_role_rejects
++tests/unit/test_team_api.py::test_assign_role_updates_existing_assignment
++tests/unit/test_team_api.py::test_create_team_creator_is_admin_in_old_table
++tests/unit/test_team_api.py::test_create_team_creator_is_owner_in_new_table
++tests/unit/test_team_api.py::test_create_team_with_invalid_parent_rejects
++tests/unit/test_team_api.py::test_create_team_with_parent_assigns_team_as_member
++tests/unit/test_team_api.py::test_create_team_with_parent_role_in_parent_honored
++tests/unit/test_team_api.py::test_remove_team_member_happy_path
++tests/unit/test_team_api.py::test_remove_team_member_sole_owner_rejects
++tests/unit/test_team_role_assignments_schema.py::TestBackfillFromTeamMembers::test_role_key_mapped_to_role_id
++tests/unit/test_user_effective_team_access_schema.py::TestUserEffectiveTeamAccessSchema::test_cascade_delete_on_user
+diff --git a/tests/verify/__init__.py b/tests/verify/__init__.py
+new file mode 100644
+index 0000000..2c09a4f
+--- /dev/null
++++ b/tests/verify/__init__.py
+@@ -0,0 +1 @@
++# Verification tests for F1 work items
+diff --git a/tests/verify/conftest.py b/tests/verify/conftest.py
+new file mode 100644
+index 0000000..a385bec
+--- /dev/null
++++ b/tests/verify/conftest.py
+@@ -0,0 +1,476 @@
++"""Shared fixtures for work item verification tests."""
++
++from __future__ import annotations
++
++from typing import Any
++from uuid import UUID, uuid4
++
++import asyncpg  # type: ignore[import-untyped]
++import pytest
++
++from mem_mcp.mcp.tools._base import ToolContext
++from mem_mcp.mcp.tools.mindmap_work_assign import (
++    MindmapWorkAssignInput,
++    MindmapWorkAssignTool,
++)
++from mem_mcp.mcp.tools.mindmap_work_mark import (
++    MindmapWorkMarkInput,
++    MindmapWorkMarkTool,
++)
++from mem_mcp.mcp.tools.mindmap_work_set_kind import (
++    MindmapWorkSetKindInput,
++    MindmapWorkSetKindTool,
++)
++from mem_mcp.mcp.tools.mindmap_work_set_status import (
++    MindmapWorkSetStatusInput,
++    MindmapWorkSetStatusTool,
++)
++from mem_mcp.teams.assignments import assign_role
++
++
+<email>
++async def work_item_fixture_setup(pg_pool: asyncpg.Pool) -> dict[str, UUID]:
++    """Set up test data for work item verification tests.
++
++    Creates:
++    - Tenant T1 with users: owner_u, admin_u, member_u, bot_u, viewer_u, vendor_u, removed_u
++    - Tenant T2 with user: other_tenant_u
++    - Team in T1 with all T1 users as members (various roles)
++    - Team in T2 with other_tenant_u
++    - Map M_live in T1 with root R and nodes A, B, C, D, E
++    - Map M_arch in T1 (closed) with root and node X
++    - Map M2 in T1 with node Z
++
++    Returns dict with all UUIDs and map keys.
++    """
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            # Create tenants
++            tenant_1 = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"verify-t1-{uuid4()}@example.test",
++            )
++            tenant_2 = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"verify-t2-{uuid4()}@example.test",
++            )
++
++            # Create teams
++            team_1 = await conn.fetchval(
++                "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++                f"verify-team-1-{uuid4().hex[:8]}",
++                tenant_1,
++            )
++            team_2 = await conn.fetchval(
++                "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++                f"verify-team-2-{uuid4().hex[:8]}",
++                tenant_2,
++            )
++
++            # Create identities (all in T1 except other_tenant_u)
++            identities: dict[str, UUID] = {}
++            for role, _ in [
++                ("owner", "owner"),
++                ("admin", "admin"),
++                ("member", "member"),
++                ("bot", "bot"),
++                ("viewer", "viewer"),
++                ("vendor", "vendor"),
++                ("removed", "removed"),
++            ]:
++                identity_id = await conn.fetchval(
++                    """
++                    INSERT INTO tenant_identities
++                        (tenant_id, cognito_sub, provider, email, is_primary, default_team_id)
++                    VALUES ($1, $2, 'cognito', $3, true, $4)
++                    RETURNING tenant_id
++                    """,
++                    tenant_1,
++                    f"sub-{role}-{uuid4()}",
++                    f"verify-{role}@{uuid4().hex[:8]}.test",
++                    team_1,
++                )
++                identities[role] = identity_id
++
++            # Create identity for T2
++            other_tenant_u = await conn.fetchval(
++                """
++                INSERT INTO tenant_identities
++                    (tenant_id, cognito_sub, provider, email, is_primary, default_team_id)
++                VALUES ($1, $2, 'cognito', $3, true, $4)
++                RETURNING tenant_id
++                """,
++                tenant_2,
++                f"sub-other-{uuid4()}",
++                f"verify-other@{uuid4().hex[:8]}.test",
++                team_2,
++            )
++            identities["other_tenant"] = other_tenant_u
++
++            # Assign roles in T1 team
++            for user_role, identity_id in identities.items():
++                if user_role == "other_tenant":
++                    continue
++                role_key = {
++                    "owner": "owner",
++                    "admin": "admin",
++                    "member": "member",
++                    "bot": "member",  # bot is a member
++                    "viewer": "viewer",
++                    "vendor": "vendor",
++                    "removed": "member",  # will be removed later
++                }[user_role]
++                await assign_role(
++                    conn,
++                    parent_team_id=team_1,
++                    member_kind="user",
++                    member_id=identity_id,
++                    role_key=role_key,
++                    assigned_by_user_id=identities["owner"],
++                )
++
++            # Assign role in T2 team
++            await assign_role(
++                conn,
++                parent_team_id=team_2,
++                member_kind="user",
++                member_id=other_tenant_u,
++                role_key="member",
++                assigned_by_user_id=other_tenant_u,
++            )
++
++            # Create oauth client
++            await conn.execute(
++                """
++                INSERT INTO oauth_clients
++                    (id, redirect_uris, scope, registration_payload, review_status)
++                VALUES ($1, ARRAY[]::text[], 'memory.read memory.write',
++                        '{}'::jsonb, 'auto_allowed')
++                ON CONFLICT (id) DO NOTHING
++                """,
++                "plugin:verify-test",
++            )
++
++            # Create map M_live with root and nodes A-E
++            map_live_root = await conn.fetchval(
++                """
++                INSERT INTO memories
++                    (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, $3, $4, array_fill(0::real, ARRAY[1024])::vector, 'api', 'question', 'team')
++                RETURNING id
++                """,
++                tenant_1,
++                team_1,
++                "Root of live map",
++                f"hash-live-root-{uuid4().hex}",
++            )
++
++            # Create map entry for M_live
++            await conn.fetchval(
++                """
++                INSERT INTO memory_maps (root_memory_id, tenant_id, team_id, state)
++                VALUES ($1, $2, $3, 'live')
++                RETURNING id
++                """,
++                map_live_root,
++                tenant_1,
++                team_1,
++            )
++
++            # Create slug for M_live
++            await conn.execute(
++                """
++                INSERT INTO slugs (memory_id, team_id, resource_type, slug)
++                VALUES ($1, $2, 'map', $3)
++                """,
++                map_live_root,
++                team_1,
++                "live-map",
++            )
++
++            # Create nodes A-E in M_live
++            nodes: dict[str, UUID] = {}
++            for node_name in ["A", "B", "C", "D", "E"]:
++                node_id = await conn.fetchval(
++                    """
++                    INSERT INTO memories
++                        (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                    VALUES ($1, $2, $3, $4, array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++                    RETURNING id
++                    """,
++                    tenant_1,
++                    team_1,
++                    f"Node {node_name}",
++                    f"hash-{node_name}-{uuid4().hex}",
++                )
++                nodes[node_name] = node_id
++
++                # Add to map membership
++                await conn.execute(
++                    """
++                    INSERT INTO memory_map_membership (memory_id, root_memory_id, tenant_id, turn, branch_status)
++                    VALUES ($1, $2, $3, 1, 'trunk')
++                    """,
++                    node_id,
++                    map_live_root,
++                    tenant_1,
++                )
++
++            # Create map M_arch (closed) with root and node X
++            map_arch_root = await conn.fetchval(
++                """
++                INSERT INTO memories
++                    (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, $3, $4, array_fill(0::real, ARRAY[1024])::vector, 'api', 'question', 'team')
++                RETURNING id
++                """,
++                tenant_1,
++                team_1,
++                "Root of archived map",
++                f"hash-arch-root-{uuid4().hex}",
++            )
++
++            # Create map entry for M_arch (closed)
++            await conn.fetchval(
++                """
++                INSERT INTO memory_maps (root_memory_id, tenant_id, team_id, state)
++                VALUES ($1, $2, $3, 'closed')
++                RETURNING id
++                """,
++                map_arch_root,
++                tenant_1,
++                team_1,
++            )
++
++            # Create slug for M_arch
++            await conn.execute(
++                """
++                INSERT INTO slugs (memory_id, team_id, resource_type, slug)
++                VALUES ($1, $2, 'map', $3)
++                """,
++                map_arch_root,
++                team_1,
++                "arch-map",
++            )
++
++            # Create node X in M_arch
++            node_x = await conn.fetchval(
++                """
++                INSERT INTO memories
++                    (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, $3, $4, array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++                RETURNING id
++                """,
++                tenant_1,
++                team_1,
++                "Node X",
++                f"hash-x-{uuid4().hex}",
++            )
++
++            # Add X to map membership
++            await conn.execute(
++                """
++                INSERT INTO memory_map_membership (memory_id, root_memory_id, tenant_id, turn, branch_status)
++                VALUES ($1, $2, $3, 1, 'trunk')
++                """,
++                node_x,
++                map_arch_root,
++                tenant_1,
++            )
++
++            # Create map M2 with node Z
++            map2_root = await conn.fetchval(
++                """
++                INSERT INTO memories
++                    (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, $3, $4, array_fill(0::real, ARRAY[1024])::vector, 'api', 'question', 'team')
++                RETURNING id
++                """,
++                tenant_1,
++                team_1,
++                "Root of map 2",
++                f"hash-map2-root-{uuid4().hex}",
++            )
++
++            # Create map entry for M2
++            await conn.fetchval(
++                """
++                INSERT INTO memory_maps (root_memory_id, tenant_id, team_id, state)
++                VALUES ($1, $2, $3, 'live')
++                RETURNING id
++                """,
++                map2_root,
++                tenant_1,
++                team_1,
++            )
++
++            # Create slug for M2
++            await conn.execute(
++                """
++                INSERT INTO slugs (memory_id, team_id, resource_type, slug)
++                VALUES ($1, $2, 'map', $3)
++                """,
++                map2_root,
++                team_1,
++                "map2",
++            )
++
++            # Create node Z in M2
++            node_z = await conn.fetchval(
++                """
++                INSERT INTO memories
++                    (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, $3, $4, array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++                RETURNING id
++                """,
++                tenant_1,
++                team_1,
++                "Node Z",
++                f"hash-z-{uuid4().hex}",
++            )
++
++            # Add Z to map membership
++            await conn.execute(
++                """
++                INSERT INTO memory_map_membership (memory_id, root_memory_id, tenant_id, turn, branch_status)
++                VALUES ($1, $2, $3, 1, 'trunk')
++                """,
++                node_z,
++                map2_root,
++                tenant_1,
++            )
++
++            return {
++                "tenant_1": tenant_1,
++                "tenant_2": tenant_2,
++                "team_1": team_1,
++                "team_2": team_2,
++                "owner_u": identities["owner"],
++                "admin_u": identities["admin"],
++                "member_u": identities["member"],
++                "bot_u": identities["bot"],
++                "viewer_u": identities["viewer"],
++                "vendor_u": identities["vendor"],
++                "removed_u": identities["removed"],
++                "other_tenant_u": other_tenant_u,
++                "map_live_root": map_live_root,
++                "map_live_key": "live-map",
++                "map_arch_root": map_arch_root,
++                "map_arch_key": "arch-map",
++                "map2_root": map2_root,
++                "map2_key": "map2",
++                "node_A": nodes["A"],
++                "node_B": nodes["B"],
++                "node_C": nodes["C"],
++                "node_D": nodes["D"],
++                "node_E": nodes["E"],
++                "node_X": node_x,
++                "node_Z": node_z,
++            }
++
++
++async def _call_tool(
++    pool: asyncpg.Pool,
++    tenant_id: UUID,
++    identity_id: UUID,
++    tool: type[MindmapWorkMarkTool]
++    | type[MindmapWorkSetStatusTool]
++    | type[MindmapWorkSetKindTool]
++    | type[MindmapWorkAssignTool],
++    input_model: MindmapWorkMarkInput
++    | MindmapWorkSetStatusInput
++    | MindmapWorkSetKindInput
++    | MindmapWorkAssignInput,
++) -> dict[str, Any]:
++    """Helper to call a work item tool as a specific user."""
++    ctx = ToolContext(
++        db_pool=pool,
++        tenant_id=tenant_id,
++        identity_id=identity_id,
++        client_id="plugin:verify-test",
++        request_id="verify-request",
++        deps=None,
++        scopes=frozenset(),
++    )
++    tool_instance = tool()
++    result = await tool_instance(ctx, input_model)
++    return result.model_dump()
++
++
++async def _get_work_items(
++    conn: asyncpg.Connection, tenant_id: UUID, node_ids: list[UUID] | None = None
++) -> list[dict[str, Any]]:
++    """Get work items from DB."""
++    query = """
++    SELECT * FROM work_items
++    WHERE tenant_id = $1 """
++    params: list[Any] = [tenant_id]
++    if node_ids:
++        query += "AND memory_id = ANY($2::uuid[])"
++        params.append(node_ids)
++    rows = await conn.fetch(query, *params)
++    return [dict(row) for row in rows]
++
++
++async def _get_work_item_history(
++    conn: asyncpg.Connection, tenant_id: UUID, node_id: UUID
++) -> list[dict[str, Any]]:
++    """Get work item history from DB."""
++    rows = await conn.fetch(
++        """
++        SELECT * FROM work_item_history
++        WHERE tenant_id = $1 AND memory_id = $2
++        ORDER BY id ASC
++        """,
++        tenant_id,
++        node_id,
++    )
++    return [dict(row) for row in rows]
++
++
++async def _get_memory_map_events(
++    conn: asyncpg.Connection, tenant_id: UUID, node_id: UUID
++) -> list[dict[str, Any]]:
++    """Get memory map events from DB."""
++    rows = await conn.fetch(
++        """
++        SELECT * FROM memory_map_events
++        WHERE tenant_id = $1 AND memory_id = $2
++        ORDER BY created_at ASC
++        """,
++        tenant_id,
++        node_id,
++    )
++    return [dict(row) for row in rows]
++
++
++async def _get_memories(
++    conn: asyncpg.Connection, tenant_id: UUID, node_ids: list[UUID]
++) -> list[dict[str, Any]]:
++    """Get memories from DB."""
++    rows = await conn.fetch(
++        """
++        SELECT * FROM memories
++        WHERE tenant_id = $1 AND id = ANY($2::uuid[])
++        ORDER BY id ASC
++        """,
++        tenant_id,
++        node_ids,
++    )
++    return [dict(row) for row in rows]
++
++
++async def _get_memberships(
++    conn: asyncpg.Connection, tenant_id: UUID, node_ids: list[UUID]
++) -> list[dict[str, Any]]:
++    """Get memory map memberships from DB."""
++    rows = await conn.fetch(
++        """
++        SELECT * FROM memory_map_membership
++        WHERE tenant_id = $1 AND memory_id = ANY($2::uuid[])
++        ORDER BY memory_id ASC
++        """,
++        tenant_id,
++        node_ids,
++    )
++    return [dict(row) for row in rows]
+diff --git a/tests/verify/conftest_fixed.py b/tests/verify/conftest_fixed.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/verify/test_gates.py b/tests/verify/test_gates.py
+new file mode 100644
+index 0000000..ca3de8e
+--- /dev/null
++++ b/tests/verify/test_gates.py
+@@ -0,0 +1,162 @@
++"""Verification tests for project gates (V1-V5)."""
++
++from pathlib import Path
++
++
++class TestV1AlembicMigration:
++    """V1 [BLOCKER] Alembic single head, migration applies and reverses."""
++
++    def test_v1_alembic_single_head(self) -> None:
++        """Check there is exactly one alembic head."""
++        import subprocess
++
++        result = subprocess.run(
++            ["alembic", "heads"],
++            cwd="/home/anand/laguna-bench/runs/F1-1.verifyD/repo",
++            capture_output=True,
++            text=True,
++        )
++        heads = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
++        assert len(heads) == 1, f"Expected 1 head, got {len(heads)}: {heads}"
++        assert heads[0].startswith(
++            "0047_work_item_history_rls_fix"
++        ), f"Head is not 0047: {heads[0]}"
++
++    def test_v1_alembic_migration_file_exists(self) -> None:
++        """Check migration 0046 file exists with proper structure."""
++        migration_path = Path(
++            "/home/anand/laguna-bench/runs/F1-1.verifyD/repo/alembic/versions/0046_2026_10_16_mindmap_work_items.py"
++        )
++        assert migration_path.exists(), "Migration 0046 file not found"
++
++        content = migration_path.read_text()
++        assert 'down_revision = "0045_fix_turn_backfill"' in content
++        assert "def downgrade()" in content
++        assert "work_items" in content
++        assert "work_item_history" in content
++
++    def test_v1_alembic_upgrade_succeeds(self) -> None:
++        """Check alembic upgrade head succeeds."""
++        import subprocess
++
++        result = subprocess.run(
++            ["alembic", "upgrade", "head"],
++            cwd="/home/anand/laguna-bench/runs/F1-1.verifyD/repo",
++            capture_output=True,
++            text=True,
++        )
++        assert result.returncode == 0, f"alembic upgrade failed: {result.stderr}"
++
++
++class TestV2LintAndTypes:
++    """V2 [BLOCKER] Lint & types."""
++
++    def test_v2_ruff_check_passes(self) -> None:
++        """Check ruff check passes."""
++        import subprocess
++
++        result = subprocess.run(
++            ["ruff", "check", "src", "tests"],
++            cwd="/home/anand/laguna-bench/runs/F1-1.verifyD/repo",
++            capture_output=True,
++            text=True,
++        )
++        assert result.returncode == 0, f"ruff check failed: {result.stdout}"
++
++    def test_v2_mypy_passes(self) -> None:
++        """Check mypy passes."""
++        import subprocess
++
++        result = subprocess.run(
++            ["mypy"],
++            cwd="/home/anand/laguna-bench/runs/F1-1.verifyD/repo",
++            capture_output=True,
++            text=True,
++        )
++        assert result.returncode == 0, f"mypy failed: {result.stdout}"
++
++
++class TestV3FullSuite:
++    """V3 [BLOCKER] Full suite vs. pre-existing failures."""
++
++    def test_v3_mindmap_tests_pass(self) -> None:
++        """Check all mindmap tests pass."""
++        import subprocess
++
++        result = subprocess.run(
++            ["pytest", "tests", "-k", "mindmap", "-q"],
++            cwd="/home/anand/laguna-bench/runs/F1-1.verifyD/repo",
++            capture_output=True,
++            text=True,
++        )
++        assert result.returncode == 0, f"Mindmap tests failed: {result.stdout}"
++
++    def test_v3_lint_tenant_scope_passes(self) -> None:
++        """Check tenant scope lint passes."""
++        import subprocess
++
++        result = subprocess.run(
++            [
++                "pytest",
++                "tests/unit/test_lint_tenant_scope.py::TestLintTenantScope::test_real_codebase_is_clean",
++                "-q",
++            ],
++            cwd="/home/anand/laguna-bench/runs/F1-1.verifyD/repo",
++            capture_output=True,
++            text=True,
++        )
++        assert result.returncode == 0, f"Tenant scope lint failed: {result.stdout}"
++
++
++class TestV4TenantScopeLint:
++    """V4 [BLOCKER] Tenant-scope lint on the new code."""
++
++    def test_v4_tenant_scope_lint_passes(self) -> None:
++        """Check tenant scope lint passes for work_items module."""
++        import subprocess
++
++        result = subprocess.run(
++            [
++                "pytest",
++                "tests/unit/test_lint_tenant_scope.py::TestLintTenantScope::test_real_codebase_is_clean",
++                "-q",
++            ],
++            cwd="/home/anand/laguna-bench/runs/F1-1.verifyD/repo",
++            capture_output=True,
++            text=True,
++        )
++        assert result.returncode == 0, f"Tenant scope lint failed: {result.stdout}"
++
++    def test_v4_work_items_sql_has_tenant_filters(self) -> None:
++        """Check work_items.py SQL statements have explicit tenant_id predicates."""
++        work_items_path = Path(
++            "/home/anand/laguna-bench/runs/F1-1.verifyD/repo/src/mem_mcp/mindmap/work_items.py"
++        )
++        content = work_items_path.read_text()
++
++        # Check for SQL statements on work_items and work_item_history
++        lines = content.split("\n")
++        for i, line in enumerate(lines):
++            if "FROM work_items" in line or "FROM work_item_history" in line:
++                # Check that tenant_id filter is present in this or nearby lines
++                context = "\n".join(lines[max(0, i - 5) : i + 10])
++                assert (
++                    "tenant_id = " in context or "tenant_id =$" in context
++                ), f"SQL statement without tenant_id filter at line {i+1}: {line}"
++
++
++class TestV5DeliveredTests:
++    """V5 Delivered new tests are meaningful."""
++
++    def test_v5_work_item_e2e_tests_exist_and_pass(self) -> None:
++        """Check work item e2e tests exist and pass."""
++        import subprocess
++
++        result = subprocess.run(
++            ["pytest", "tests/integration/test_mindmap_work_items_e2e.py", "-q"],
++            cwd="/home/anand/laguna-bench/runs/F1-1.verifyD/repo",
++            capture_output=True,
++            text=True,
++        )
++        # Tests may be skipped if MEM_MCP_TEST_DSN not set, but should not fail
++        assert "FAILED" not in result.stdout, f"Work item e2e tests failed: {result.stdout}"

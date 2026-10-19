@@ -1,0 +1,260 @@
+      465 +  frozen-workflow `available_transitions`; pending-signoff cards show
+      466    `have/needed` + pending approvers (R3). "Waiting on me" items get a per-user
+      467    badge; `app/teams/[id]/waiting/page.tsx` lists them (R8).
+      468  - `app/mindmaps/[key]/board/page.tsx` — per-map board (subset), same model.
+      434 -- Move flow: drag to a column / pick target →
+      435 -  `POST boards/actions {action:"move", node_id, to_status, reason?}` → on
+      436 -  `signoff_required` the card flips to a "pending signoff" badge with `needed`
+      437 -  + approvers (R3, R7); on quorum it animates into the new column. Approve/
+      438 -  reject one-click from the card chip or the waiting list (R9, R12).
+      439 -- Columns whose `status_key` is not in the live workflow render as a greyed-out
+      469 +- Move flow: drag to a column / pick target → `POST boards/actions
+      470 +  {action:"move", node_id, to_status, reason?}` → on `signoff_required` the
+      471 +  card flips to a "pending signoff" badge with `needed` + approvers (R3, R7);
+      472 +  on quorum it animates into the new column. Approve/reject one-click from the
+      473 +  card chip or the waiting list (R9, R12).
+      474 +- Columns whose `status_key` is not in the live version render as a greyed-out
+      475    "archived" column (read-only) (R4, R6); the only card action there is `rebase`.
+      476
+      477  ## 5. Existing data and in-flight items
+      478
+      479  - Back-fill: for every existing team, create one default `team_workflow_versions`
+      445 -  (version 1; statuses = the 5 hard-coded statuses with today's
+      446 -  order/label/terminal=false; transitions = today's `TRANSITIONS`
+      447 -  (`work_items.py:36-47`) literally — including `done→in_progress`/`
+      448 -  cancelled→todo` reopens — `reason_required` as given, `min_signoffs=0`,
+      449 -  `approver_roles=[]`) and one `team_workflows` pointer. Set
+      450 -  `work_items.workflow_id` to the team's default version for every existing
+      451 -  item. Drop the two CHECKs (§1.2) and add columns; set
+      452 -  `work_items.workflow_id NOT NULL` after the back-fill.
+      480 +  (version 1; statuses = the 5 hard-coded statuses with today's order/label;
+      481 +  `is_terminal=false` for open ones, `true` for done/cancelled as a *hint*;
+      482 +  transitions = today's `TRANSITIONS` (`work_items.py:36-47`) literally —
+      483 +  including `done→in_progress`/`cancelled→todo` reopens — `reason_required` as
+      484 +  given, `min_signoffs=0`, `approver_roles=[]`) + one `team_workflows` pointer.
+      485 +  Set `work_items.workflow_id` to the team's default version for every existing
+      486 +  item. Drop the two CHECKs (§1.2) and add columns; set NOT NULL after back-fill.
+      487  - In-flight items (status `todo`/`in_progress`/`blocked`): map 1:1 onto the
+      454 -  default workflow → byte-for-byte identity until a team edits (Risk 2).
+      488 +  default version → byte-for-byte identity until a team edits (Risk 2).
+      489  - Items whose team edits its workflow: keep their old `workflow_id` (Risk 1);
+      456 -  board renders the old status as a read-only column (§4); movable only under
+      457 -  the old workflow until rebased (R4). Edit refuses if live items are in a
+      458 -  dropped status (E1) → caller rebases via `rebase_work_item`.
+      459 -- Pending sign-off requests at edit time: unaffected; they carry `workflow_id`
+      460 -  (the old version) and resolve under the old rules (R4); surface on the board
+      461 -  as `signoff_required` badges.
+      490 +  board renders the old status as a read-only column (§4); movable only under the
+      491 +  old version until rebased (R4); edit refused-if-orphan unless rebased (E1).
+      492 +- Pending sign-off requests at edit time: unaffected; carry the old
+      493 +  `workflow_id` and resolve under the old rules (R4).
+      494  - **New teams** (post-0048): `ensure_default_workflow(conn, team_id)` in
+      495    `mindmap/workflows.py`, called from `ensure_personal_team`
+      464 -  (`identity/personal_team.py:29`; INSERT `teams` at line 78), web `create_team`
+      465 -  (`web/handlers/teams.py:117`; INSERT at line 175), and MCP `create_team`
+      466 -  (`mcp/tools/create_team.py`; INSERT at line 108 + `assign_role` at 132).
+      467 -  Idempotent guard (skip if a version already exists for the team).
+      468 -- Workflow-change lifecycle events → `team_workflow_event_log` (§1.1), not
+      469 -  `work_item_history` (its `memory_id` is NOT NULL). Item-level rebases →
+      470 -  `change_type='workflow_changed'` *item* history row (the item's workflow_id
+      471 -  changed).
+      496 +  (`identity/personal_team.py:29`, after team row at line 78), web `create_team`
+      497 +  (`web/handlers/teams.py:117`, after INSERT at line 175), and MCP `create_team`
+      498 +  (`mcp/tools/create_team.py`, after INSERT at line 108 + `assign_role` at 132).
+      499 +  Idempotent guard.
+      500 +- Workflow-change lifecycle events → `team_workflow_event_log` (§1.1). Item-
+      501 +  level rebases → `change_type='workflow_changed'` item history row +
+      502 +  `mindmap.workflow_rebased` audit.
+      503
+      504  ## 6. Edge cases (E)
+      505
+      506  - **E1 — Edit while items sit in a dropped status.** Edit refused with
+      507    `invalid_workflow_definition` (`data.code="orphan_statuses"`, listing the
+      477 -  statuses) unless `reject_if_orphans=false`, in which case the new version is
+      478 -  created and the board marks the orphaned columns read-only (the items stay on
+      479 -  their frozen version; the new version just stops listing those keys). Either
+      480 -  way no item is stranded (R4). Caller rebases items explicitly (§2.7).
+      481 -- **E2 — Approver leaves mid-request.** Approvals are append-only (R5), so a
+      482 -  completed quorum still counts. A *pending* request whose only remaining
+      483 -  eligible approvers left → `deadlocked: true` badge + "escalate to team admin"
+      484 -  (R4/R7); admin cancels it (a `'reject'` by the admin, recorded) — no item move.
+      508 +  statuses) when `reject_if_orphans=true` (default); with
+      509 +  `reject_if_orphans=false` the edit succeeds and returns the `orphaned_statuses`
+      510 +  (those items stay on their frozen version, board shows them as read-only
+      511 +  archived columns). Either way no item is stranded — rebase is the explicit
+      512 +  migration (§2.7).
+      513 +- **E2 — Approver leaves mid-request.** Approvals append-only (R5); a completed
+      514 +  quorum still counts. A *pending* request whose only remaining eligible
+      515 +  approvers left → `deadlocked:true` badge + "escalate to admin" (R4/R7); admin
+      516 +  cancels it (a `'reject'` by the admin) — no item move.
+      517  - **E3 — Reopens are allowed.** Cycles/reopens (`done→in_progress`,
+      518    `cancelled→todo`, `in_progress↔blocked`) are legal in the default workflow
+      487 -  (TRANSITIONS `work_items.py:36-47`); `is_terminal` is a UI hint, not a gate.
+      488 -  No cycle-rejection at definition time. (If a team wants a *strictly* acyclic
+      489 -  workflow, they simply don't define those transitions.)
+      490 -- **E4 — Rebase with no mapping for the item's current status.** `rebase` leaves
+      491 -  `status` unchanged; board renders that column read-only (§4);
+      492 -  `rebase_conflict` only if a map entry targets a status not in the new
+      493 -  workflow.
+      519 +  (TRANSITIONS `work_items.py:36-47`); `is_terminal` is a hint, not a gate. No
+      520 +  cycle-rejection at definition time.
+      521 +- **E4 — Rebase with no mapping for the item's current status.** `rebase`
+      522 +  requires `status_map` to cover the item's current status; missing/illegal
+      523 +  mapping → `rebase_conflict` (-32602) (closes the R4 hole from review #1).
+      524  - **E5 — `from_status='__entry__'`.** Initial-status rows use the sentinel;
+      495 -  `mark_work_item`/creation validates against this set.
+      525 +  `mark_work_item`/creation validates against this set; PK-safe.
+      526  - **E6 — Mover/owner is the only eligible approver.** Produces a `deadlocked`
+      497 -  request (E2). Consequence of R3; default workflow uses `min_signoffs=0` so it
+      498 -  can't happen out of the box.
+      499 -- **E7 — Blocked moves.** Not persisted as a history row (rollback would drop it;
+      500 -  §2.8); recorded via the audit logger on a fresh tx + returned in the error
+      501 -  `data` for the UI (R7).
+      502 -- **E8 — Terminal items × "waiting on me".** Terminal items (per the live
+      503 -  workflow's `is_terminal` hint) generate no open sign-off requests and are
+      504 -  excluded from `waiting_on_me`; reopening is still allowed for items whose
+      505 -  frozen workflow has a terminal→non-terminal transition (default workflow does).
+      527 +  request (E2). Consequence of R3; default workflow uses `min_signoffs=0`.
+      528 +- **E7 — Blocked moves.** Not persisted as a history row (rollback-safe, §2.8);
+      529 +  recorded via fresh-tx audit + returned in error `data` (R7).
+      530 +- **E8 — Terminal × "waiting on me".** "Terminal" is read from the item's
+      531 +  **frozen** workflow (R4 consistency), not the live one; a frozen-workflow
+      532 +  terminal status generates no open sign-off request. Reopening is still allowed
+      533 +  if the frozen workflow has a terminal→non-terminal transition.
+      534
+      535  ## 7. Requirement → design map
+      536
+      509 -- R1 team-defined statuses → §1.1 `workflow_statuses` (denorm `team_id`,
+      510 -  sentinel-free `from_status`), §2.2; default workflow §5.
+      537 +- R1 team-defined statuses → §1.1 `workflow_statuses`, §2.2; default workflow §5.
+      538  - R2 team-defined transitions → §1.1 `workflow_transitions` (+ E3 reopens),
+      539    §2.2, R11 edit §2.6.
+      540  - R3 reason + sign-off from non-owner, multi-party → §1.1 approver-roles +
+      541    `min_signoffs`, §2.3/§2.4, "owner"=assignee/creator §2.1, E6; terminal as
+      542    hint §2.5.
+      543  - R4 never stuck → immutable versions §1.1/Risk 1, frozen `workflow_id` §1.2,
+      517 -  read-only archived columns §4, per-item rebase §2.7, edit-refuses-orphan E1,
+      518 -  pending-signoff-keeps-old-version §5.
+      519 -- R5 no lost history → append-only on all new tables §1.1; relaxed
+      520 -  `change_type` CHECK admits sign-off events §1.2; `team_workflow_event_log`
+      521 -  for workflow changes (resolves §8 R-A); history never rewritten §5.
+      544 +  read-only archived columns §4, per-item rebase §2.7 (requires current-status
+      545 +  mapping, E4), edit-refuses-orphan E1, pending-sign-off-keeps-old-version §5,
+      546 +  supersede-on-move §2.4.
+      547 +- R5 no lost history → append-only on all new tables §1.1; relaxed `change_type`
+      548 +  CHECK admits sign-off events §1.2; `team_workflow_event_log` for workflow
+      549 +  changes (§1.1); history never rewritten §5.
+      550  - R6 web board → `GET …/board` §4 (team + per-map pages).
+      551  - R7 see why blocked → `blocked`/`signoff_state` on `WorkItemOutput` §3,
+      524 -  disabled move + tooltip §4, `transition_blocked` → 422 message + fresh-tx audit
+      525 -  §2.8.
+      552 +  disabled move + tooltip §4, fresh-tx audit §2.8.
+      553  - R8 waiting on me → `mindmap_work_list(waiting_on_me=true)` / board param /
+      527 -  `GET …/waiting` §4; `team_id` denorm + cross-tenant tenant visibility §1.3.
+      554 +  `GET …/waiting` §4; cross-tenant tenant visibility §1.3.
+      555  - R9 web move → `POST boards/actions {action:"move"}` §4, same MCP path.
+      556  - R10 MCP read → `mindmap_work_get/list/history` §3 (wrapping existing
+      557    `get_work_item`/`list_work_items`/`get_work_item_history` at `work_items.py:
+      558    981/1057/1165`).
+      532 -- R11 MCMC manage workflow → `mindmap_workflow_get/update` §3.
+      559 +- R11 MCP manage workflow → `mindmap_workflow_get/update` §3.
+      560  - R12 MCP sign-off → `mindmap_work_signoff_list/approve/reject` §3.
+      561  - R13 MCP move → `mindmap_work_set_status` modified §3.
+      535 -- R14 sign-off tracking → `work_item_signoff_requests/approvals`,
+      536 -  `work_item_history.signoff_request_id`, `change_type='signoff_requested'/'
+      537 -  signoff_decided'`, opaque errors §4 Risk 7.
+      562 +- R14 sign-off tracking → `work_item_signoff_requests/approvals` (PK
+      563 +  `(request_id, approver_identity_id)`), `work_item_history.signoff_request_id`,
+      564 +  `change_type='signoff_requested'/'signoff_decided'`, partial-unique one-pending
+      565 +  per item §1.4, opaque errors §4 Risk 7.
+      566
+      539 -## 8. Risks owned by the design (Stage 3 detail)
+      567 +## 8. Stage 3 follow-ups (owned by the design)
+      568
+      541 -- **R-A — Performance of the widened `work_items` read policy** (tenant OR
+      542 -  team-membership subquery) on the large table. The existing
+      543 -  `work_items_tenant_team_status_idx` (0046:62-64) doesn't cover the team branch.
+      544 -  Stage 3 adds a `(team_id, status)` index and verifies the planner uses it under
+      545 -  the OR (CONVENTIONS §Database).
+      546 -- **R-B — `team_workflow_event_log` vs row-level audit.** Workflow edits now audit
+      547 -  both to `team_workflow_event_log` and via `ctx.deps.audit.audit` (fresh tx for
+      548 -  the blocked path, same tx for success). Stage 3 confirms the event-log row and
+      549 -  the audit row carry the same `request_id` correlation id for traceability.
+      569 +- **R-A — Performance** of the widened `work_items` read policy. Add a
+      570 +  `(team_id, status)` index; verify the planner uses it under the OR (CONVENTIONS
+      571 +  §Database).
+      572 +- **R-B — Tracing.** Align `team_workflow_event_log.detail` with the
+      573 +  `ctx.deps.audit.audit` call so the workflow-change audit + the event-log row
+      574 +  share a `request_id` correlation.
+      575 +- **R-C — `add_approval` concurrency.** The `SELECT … FOR UPDATE` on the request
+      576 +  row (§2.4) must run in the same `tenant_tx` as the approval insert + completion
+      577 +  move so the revalidation and the move are atomic. Stage 3 pins the exact tx in
+      578 +  `work_item_signoff_approvals`/`set_work_item_status`.
+      579   No newline at end of file
+
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  laguna-s-2.1-q5km · API Usage Billing
+ ▝▝   ▝▝   ~/laguna-bench/runs/F2-3/repo
+
+
+✻ Conversation compacted (ctrl+o for history)
+
+
+  Thought for 1s (ctrl+o to expand)
+
+● Write(docs/feature/03-plan.md)
+  ⎿  Wrote 327 lines to docs/feature/03-plan.md
+       1 # F2 — Team workflows for work items: Integration plan
+       2
+       3 Stage 3 (plan). No code. This is the build-order checklist that takes
+       4 `docs/feature/02-design.md` to shippable, as reviewable work packages. Each
+       5 package is independently lint/clean-testable and ordered by dependency. The
+       6 branch for this feature is `master` (working) / `main` (PR) per the repo
+       7 snapshot; commit messages end
+       8 `Co-Authored-By: Claude Code <noreply@anthropic.com>` (CLAUDE.md).
+       9
+      10 Conventions assumed throughout (CONVENTIONS.md): domain modules take an
+     … +317 lines (ctrl+o to expand)
+  ⎿  Referenced file docs/feature/03-plan.md
+  ⎿  Referenced file docs/feature/02-design.md
+  ⎿  Read src/mem_mcp/mcp/tools/create_team.py (161 lines)
+  ⎿  Read src/mem_mcp/auth/rbac.py (183 lines)
+  ⎿  Referenced file src/mem_mcp/mindmap/work_items.py
+
+  Thought for 46s (ctrl+o to expand)
+
+● Stage 3 is complete. docs/feature/03-plan.md is written.
+
+  Report
+
+  What changed (files):
+  - CREATED docs/feature/03-plan.md — the Stage 3 integration plan. No source/test code was written (Stages 4–5 remain).
+
+  Build order (6 packages): WP0 Migration → WP1 Domain (mindmap/workflows.py + work_items.py edits) → WP2 MCP surface (9 new tools + 4 modified + registration/descriptions/audit/error mapping) → WP3 Web API (mindmaps.py
+  endpoints + ensure_default_workflow wired into the three team-creation hooks: identity/personal_team.py, web/handlers/teams.py, mcp/tools/create_team.py) → WP4 Web UI (Next.js board/waiting pages + server-api.ts) → WP5
+  Verification sweep.
+
+  Each WP carries: scope, exact file CREATE/MODIFY list, the requirement numbers it delivers (R1–R14), and a concrete test plan — each test named with what it proves (e.g. test_non_member_cannot_read_team_board → 404 not
+  403, team-scoped not global; test_completion_revalidates_status → race guard; test_rebase_requires_current_status_mapping → R4/rebase-conflict). The plan re-derives every cited line number from the reads done this
+  turn (create_team.py:136, auth/rbac.py:28, main.py:567/525-528, web/handlers/mindmaps.py:100, create_team.py:108 INSERT + assign_role at 132, personal_team.py:78 INSERT + GUC at 73-76).
+
+  How verified: This stage is docs-only ("Still no code" per the Stage 3 brief), so the per-package check is structural consistency — each touch-point line number in the plan was cross-checked against the fresh reads
+  this turn. pytest/ruff/mypy/alembic upgrade head are the WP5 entry point, deferred to Stages 4–5; running them now would only exercise the unmodified baseline (the migration doesn't exist yet). I did not run pytest -q
+  because no code has been written to test.
+
+  Left open / notes:
+  - The three team-creation hooks wire ensure_default_workflow in a system_tx context. In create_team.py the INSERTs already run under tenant_tx (line 61) with the GUC set — I cited the post-assign_role line (132) as the
+    hook site so the back-fill + seed can be one transaction. In ensure_personal_team, it runs under an already-SET LOCAL app.current_tenant_id system_tx (73-76) — hook site ~82. No semantic change to either, just the
+    seed call appended. Flagged in the plan for the architect to confirm transaction boundaries.
+  - Default-workflow seeding for existing pre-feature teams is done as a back-fill pass inside the 0048 migration (WP0 tests assert it), not as a lazy on-read side effect — chosen to keep the frozen-version invariant
+    true for every item at day 0.
+  - No new Permission enum value is required (the plan reuses TEAM_WRITE_MEMORY/TEAM_MANAGE_SETTINGS); if the architect prefers a dedicated team.manage_workflow perm, that is a one-line addition to auth/permissions.py +
+    ROLE_PERMISSIONS and doesn't move any WP.
+
+✻ Worked for 7m 17s · done 10:19 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+

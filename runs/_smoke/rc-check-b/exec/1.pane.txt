@@ -1,0 +1,195 @@
+"laguna-s-2.1" isn't described by this version's model catalog; update Claude Code, or map it with behavesAs on a modelPicker row (or modelOverrides, if it is a provider id of a model this version knows). Until then auto
+-compact keeps this session within 200k tokens (the context window it assumes); if the model accepts more, append [1m] to the model name for 1M, or set CLAUDE_CODE_MAX_CONTEXT_TOKENS to its real window; CLAUDE_CODE_DISAB
+LE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 restores the previous wait-for-the-API behavior.
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  laguna-s-2.1 · API Usage Billing
+ ▝▝   ▝▝   ~/laguna-bench/runs/rc-check-b/repo
+
+
+❯ Work order 1: slugify_title text helper
+
+  Goal
+
+  Create a new module src/mem_mcp/util_text.py exposing:
+
+  def slugify_title(title: str) -> str: ...
+
+  Behaviour, applied in this order:
+  1. Trim surrounding whitespace and lowercase.
+  2. Replace every run of one or more characters that are not ASCII [a-z0-9] with a single hyphen -.
+     (Non-ASCII letters such as é, ß, 日 are treated as non-alphanumeric and so dropped / turned
+     into separators. That is intended; do not transliterate, and do not add dependencies.)
+  3. Strip leading and trailing hyphens.
+
+  Examples: "Hello World" -> "hello-world"; "  Foo -- Bar!!! baz  " -> "foo-bar-baz";
+  "" -> ""; "!!!" -> ""; "Café Crème" -> "caf-cr-me"; "日本語" -> ""; "Version 2.0" -> "version-2-0".
+
+  Use a precompiled module-level regex, e.g. re.compile(r"[^a-z0-9]+") (with lowercasing done first;
+  note str.lower() can produce non-ASCII output, which the regex then handles).
+
+  Conventions (see CONVENTIONS.md "Style")
+
+  - from __future__ import annotations, full type hints, ruff-formatted (~100 cols).
+  - Module docstring explaining purpose and the why of the ASCII-only choice; short function docstring.
+  - No other files changed besides the two below.
+
+  Tests
+
+  Create tests/unit/test_util_text.py (follow the style of existing tests in tests/unit/) covering at least:
+  - normal text ("Hello World"),
+  - punctuation/whitespace runs collapsing to one hyphen, plus leading/trailing hyphen stripping,
+  - empty string and whitespace-only / punctuation-only input -> "",
+  - unicode letters (non-ASCII dropped, e.g. "Café Crème" -> "caf-cr-me", "日本語" -> ""),
+  - digits preserved and an already-slugified input is unchanged (idempotent).
+    pytest.mark.parametrize is fine.
+
+  Acceptance / verification — report exact output of:
+
+  - pytest tests/unit/test_util_text.py -q
+  - ruff check src tests and ruff format --check src/mem_mcp/util_text.py tests/unit/test_util_text.py
+  - mypy (note whether any errors are in the new files)
+  - pytest -q (full suite; report pass/fail counts and confirm any failures are pre-existing/unrelated)
+
+  Thought for 5s (ctrl+o to expand)
+
+● I'll start by exploring the codebase to understand the conventions and existing patterns.
+
+  Thought for 3s, searched for 2 patterns, read 2 files (ctrl+o to expand)
+
+● Let me look at existing modules and tests to match the style precisely.
+
+  Thought for 2s, read 4 files (ctrl+o to expand)
+
+● Let me look at the existing slug helper to match conventions and check the line-length/ruff config.
+
+  Thought for 2s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Let me read the existing slug normalization function to match the established approach.
+
+  Thought for 15s, searched for 1 pattern (ctrl+o to expand)
+
+● Let me check how compiled regexes are type-annotated elsewhere in the codebase to match conventions.
+
+  Thought for 16s, searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● I now have a clear picture of the conventions. Let me write the two files.
+
+● Write(src/mem_mcp/util_text.py)
+  ⎿  Wrote 33 lines to src/mem_mcp/util_text.py
+       1 """Small, dependency-free text helpers shared across the service.
+       2
+       3 slugify_title turns a human-readable title into a URL-safe, ASCII-only slug.
+       4
+       5 Design note on the ASCII-only choice: non-ASCII characters (é, ß, 日, …) are
+       6 *not* transliterated — they are dropped and collapse to hyphens, mirroring the
+       7 existing ``slugs`` table constraint (``^[a-z0-9-]+$``) which also rejects them.
+       8 This keeps output deterministic for downstream consumers (URLs, shells, DB
+       9 columns) and avoids pulling in an unidecode-style dependency that the project
+      10 deliberately does not carry. ``str.lower()`` may itself produce non-ASCII output
+     … +23 lines (ctrl+o to expand)
+
+● Write(tests/unit/test_util_text.py)
+  ⎿  Wrote 42 lines to tests/unit/test_util_text.py
+       1 """Tests for mem_mcp.util_text — slugify_title."""
+       2
+       3 from __future__ import annotations
+       4
+       5 import pytest
+       6
+       7 from mem_mcp.util_text import slugify_title
+       8
+       9
+      10 class TestSlugifyTitle:
+     … +32 lines (ctrl+o to expand)
+
+  Thought for 2s (ctrl+o to expand)
+
+● Both files are written. Now let me run the verification commands.
+
+● Bash(pytest tests/unit/test_util_text.py -q 2>&1)
+  ⎿  ...................                                                      [100%]
+     19 passed in 0.09s
+
+● Bash(ruff check src tests 2>&1)
+  ⎿  All checks passed!
+
+● Bash(ruff format --check src/mem_mcp/util_text.py tests/unit/test_util_text.py 2>&1)
+  ⎿  2 files already formatted
+
+● Bash(mypy 2>&1)
+  ⎿  Success: no issues found in 333 source files
+
+  Thought for 2s (ctrl+o to expand)
+
+● All targeted checks pass. Now the full suite to confirm no regressions.
+
+● Bash(pytest -q 2>&1 | tail -40)
+  ⎿  SKIPPED [6] tests/security/test_sqli_probes.py:122: requires --live-aws flag to run (uses live AWS resources)
+     SKIPPED [1] tests/security/test_token_reuse.py:16: requires --live-aws flag to run (uses live AWS resources)
+     SKIPPED [1] tests/security/test_token_reuse.py:31: requires --live-aws flag to run (uses live AWS resources)
+     … +37 lines (ctrl+o to expand)
+  ⎿  (timeout 15m)
+
+  Thought for 6s (ctrl+o to expand)
+
+● The full suite shows failures, but they're all in DB-fixture-dependent tests (team/roles/permissions/schema) unrelated to my change. Let me confirm my change is isolated and that these failures are pre-existing by
+  checking git status and whether any failure references the new code.
+
+● Bash(git status --short 2>&1)
+  ⎿  ?? src/mem_mcp/util_text.py
+     ?? tests/unit/test_util_text.py
+
+● Bash(git stash && pytest tests/unit/test_slugs_schema.py tests/unit/test_team_api.py::test_create_team_creator_is_owner_in_new_table -q 2>&1 | tail -15; git stash po…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 6s (ctrl+o to expand)
+
+● The git stash was denied as it mutates the working tree, but it's not needed: git status shows my change is purely additive — only two untracked files (src/mem_mcp/util_text.py, tests/unit/test_util_text.py). I didn't
+  modify any existing source, fixture, or conftest, so it cannot have caused DB-fixture failures. Let me confirm none of the failing tests reference the new module.
+
+  Thought for 5s, searched for 2 patterns (ctrl+o to expand)
+
+● Confirmed: only my new test file references the new module. The full suite's failures are all in DB/RBAC/permission-schema tests that depend on the shared pg_pool test-DB fixture — none related to
+  util_text/slugify_title. Per the repo guidance, these are pre-existing and left untouched.
+
+  Report
+
+  What changed (2 new files, no existing files modified)
+
+  src/mem_mcp/util_text.py — new module exposing slugify_title(title: str) -> str:
+  1. Trims surrounding whitespace + lowercases (str.lower() first, so uppercased ASCII is preserved while it may emit non-ASCII like É→é).
+  2. Replaces every run of non-[a-z0-9] characters with a single - via a module-level precompiled regex _NON_ALNUM_RUN = re.compile(r"[^a-z0-9]+").
+  3. Strips leading/trailing hyphens.
+
+  Non-ASCII letters are intentionally dropped/turned into separators (no transliteration, no new dependency), mirroring the existing slugs table constraint. Module docstring explains the ASCII-only why; function has a
+  short docstring. from __future__ import annotations, full type hints, ~100-col formatted.
+
+  tests/unit/test_util_text.py — pure unit tests (no DB), pytest.mark.parametrize, covering: normal text ("Hello World"→"hello-world"); punctuation/whitespace run collapse + edge stripping ("  Foo -- Bar!!! baz
+  "→"foo-bar-baz", "a---b"→"a-b", "---abc---"→"abc"); empty/whitespace/punctuation-only → ""; non-ASCII ("Café Crème"→"caf-cr-me", "日本語"→""); digits preserved; idempotency on already-slugified input and across
+  repeated calls.
+
+  Verification
+
+  - pytest tests/unit/test_util_text.py -q → 19 passed in 0.09s (all new tests green)
+  - ruff check src tests → All checks passed!
+  - ruff format --check src/mem_mcp/util_text.py tests/unit/test_util_text.py → 2 files already formatted
+  - mypy → Success: no issues found in 333 source files (no errors in the new files)
+  - pytest -q (full suite) → 18 failed, 1366 passed, 31 skipped, 94 warnings, 16 errors
+    - All 19 new tests passed.
+    - Git status confirms the change is purely additive (only two untracked files; no existing source/fixture/conftest touched), and grep confirms none of the failing/erroring tests reference util_text/slugify_title.
+    - The failures/errors are confined to DB- and RBAC/permission-schema tests that depend on the shared pg_pool test-container fixture (e.g. test_effective_access_recompute, test_refresh_team_access, test_rbac_resolver,
+      test_roles_catalog, test_enterprise_schema, test_slugs_schema::test_pk_uniqueness_within_scope, test_team_api, test_enterprise_mcp_tools, test_security/test_scope_enforcement, test_team_role_assignments_schema,
+      test_user_effective_team_access_schema, test_spec2_slug_lookup). These are the pre-existing fixture failures called out in the environment notes; I left them untouched per the rules.
+
+  Nothing is left open for this work order.
+
+✻ Cooked for 2m 4s · done 9:35 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+

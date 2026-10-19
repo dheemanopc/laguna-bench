@@ -1,0 +1,24 @@
+{
+  "session_id": "76535497-acca-4998-94a2-b287343bf874",
+  "exit_code": 0,
+  "remote_control_url": "https://claude.ai/code/session_0133gadpqiGHRdTHKFEMGYeN",
+  "is_error": false,
+  "num_turns": 12,
+  "result": "The task is done in three executor round-trips. Concurrent `memory_update` calls on the same memory now behave as if they ran one after another, and callers can pass a revision token. I didn't run anything myself; all test results below come from the executor's reports.\n\n**How it works**\n- **New migration (`alembic/versions/0046_2026_10_16_memory_revision.py`):** adds a `revision` UUID column to `memories`, filled automatically for existing and new rows. Downgrade then upgrade ran cleanly.\n- **`update.py`:**\n  - The first lookup now locks the row (`SELECT … FOR UPDATE`), so concurrent updates queue on that row in the database. Tag add/remove merges against the latest committed row, so none are lost, and in-place content updates are last-writer-wins.\n  - If the target has already been superseded, the update is refused (code -32000, `data.code=\"update_conflict\"`) with `data.current_id`, the current version found by walking the chain forward.\n  - A stale `expected_revision` is refused the same way, with `data.current_revision`.\n  - When a new version is created, the old row is only marked superseded if it is still current; if that changes nothing, the update is refused too. This is a second safeguard against two current versions.\n  - Every successful update writes a new revision and returns it as `revision` on the output, which defaults to `\"\"` so existing callers keep working.\n  - Not-found and deleted targets keep their -32602 errors.\n- **`get.py` / `get_batch.py`:** `MemoryRecord` has a `revision` field and every query that builds one selects it, including history records. A record built without one gets a non-empty fallback string derived from its other fields.\n- **`write.py`:** the duplicate-merge path also gives the memory a new revision, so a token can't stay valid across that tag change. Reads (the access-count bump) leave it unchanged.\n- **`tool_descriptions.py`:** documents `expected_revision` and the conflict contract.\n\n**Tests**\n- `tests/unit/test_tools_update_conflicts.py`: 7 unit tests, all passing.\n- `tests/integration/test_memory_update_concurrency.py`: 11 tests against real Postgres, all passing. They use their own 12-connection pool and run 8 concurrent callers. They check exactly one winner for versioned updates and for a shared `expected_revision`, that no concurrent tag add or remove is lost, and that the chain ends with exactly one current row.\n- With the row lock and the still-current check removed, 3 of these tests failed every time and one failed intermittently. With the fix restored, all 11 pass.\n- No existing tests were changed. In round 1 the executor had edited `tests/unit/test_web_memories_handler.py`; I had that reverted and gave the output's `revision` a default instead.\n- `ruff` and `mypy` are clean.\n- Full suite: 45 failures and errors before the change and the same 45 after; the before and after lists were identical. A second run after the change gave the same set. The failures are in teams, RBAC, roles and enterprise schema tests.\n\n**Remaining concerns**\n- The row lock is held while the new content is embedded. Updates to the same memory therefore wait for each other's embedding call, though updates to different memories are unaffected.\n- The test cleanup clears a module-level set of background access-count tasks. That's harmless for the test run but has a side effect outside the test.\n- The executor couldn't run some commands directly and ran them through Python wrapper scripts. Its results are consistent, but I couldn't check them myself.\n\nConfidence that the acceptance criteria are met: high, about 90%.",
+  "usage": {
+    "input_tokens": 24,
+    "output_tokens": 13402,
+    "cache_read_input_tokens": 793760,
+    "cache_creation_input_tokens": 57025
+  },
+  "modelUsage": {
+    "claude-opus-5-5": {
+      "inputTokens": 24,
+      "outputTokens": 13402,
+      "cacheReadInputTokens": 793760,
+      "cacheCreationInputTokens": 57025
+    }
+  },
+  "thinking_blocks": 11,
+  "transcript": "~/.claude/projects/-home-anand-laguna-bench-runs-T5-B1n-repo/76535497-acca-4998-94a2-b287343bf874.jsonl"
+}

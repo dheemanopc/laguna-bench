@@ -1,0 +1,1916 @@
+diff --git a/src/mem_mcp/mcp/tool_descriptions.py b/src/mem_mcp/mcp/tool_descriptions.py
+index 7c495ce..04c33d8 100644
+--- a/src/mem_mcp/mcp/tool_descriptions.py
++++ b/src/mem_mcp/mcp/tool_descriptions.py
+@@ -109,6 +109,10 @@ Call when: user says "update that memory", "fix that note", "change it to say",
+ 
+ Do not call for decision or fact types when the update represents a changed conclusion — use memory_supersede instead (it preserves history). Do not call without a known memory ID — search first. Do not call when the user wants to delete and rewrite from scratch — delete then write.
+ 
++Concurrency control: pass expected_revision obtained from memory_get() → memory.revision or a previous memory_update result. If the memory was modified since that revision, the call fails with -32000 error (data.code="update_conflict") and returns current_revision / current_id so you can re-read and merge. This prevents lost updates from concurrent edits.
++
++Conflict contract (-32000, data.code="update_conflict"): stale expected_revision returns {"current_revision": "...", "current_id": "..."}; updating a superseded memory returns {"current_id": "<current-version-id>"}. Both error responses include current_revision for the current version when found.
++
+ Examples: "Fix that note to say the deadline is April 15, not March 15." → update content. "Add tag 'urgent' to that memory." → update tags. "That snippet has a bug — here's the corrected version." → update content.""",
+     "memory_delete": """Soft-delete a memory — call this when the user explicitly wants to remove a memory from their active store. Deleted memories are not returned in search or list by default but can be restored.
+ 
+diff --git a/src/mem_mcp/mcp/tools/get.py b/src/mem_mcp/mcp/tools/get.py
+index b2eb530..6148821 100644
+--- a/src/mem_mcp/mcp/tools/get.py
++++ b/src/mem_mcp/mcp/tools/get.py
+@@ -14,6 +14,7 @@ from mem_mcp.mcp.errors import JsonRpcError
+ from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+ from mem_mcp.mcp.tools._base import BaseTool, ToolContext
+ from mem_mcp.memory.access_tracking import bump_access
++from mem_mcp.memory.versioning import compute_revision
+ from mem_mcp.teams.slugs import lookup_slug
+ 
+ 
+@@ -59,6 +60,7 @@ class MemoryRecord(BaseModel):
+     expires_at: datetime | None
+     indexable: bool
+     embedding_status: str
++    revision: str = ""
+ 
+     @field_validator("metadata", mode="before")
+     @classmethod
+@@ -73,6 +75,17 @@ class MemoryRecord(BaseModel):
+             return json.loads(v) if v else {}
+         return v
+ 
++    @model_validator(mode="after")
++    def _compute_revision(self) -> MemoryRecord:
++        """Compute revision token if not provided.
++
++        The revision is derived from (id, updated_at) and provides optimistic
++        concurrency control for memory_update.
++        """
++        if not self.revision:
++            self.revision = compute_revision(self.id, self.updated_at)
++        return self
++
+ 
+ class MemoryGetOutput(BaseModel):
+     memory: MemoryRecord
+diff --git a/src/mem_mcp/mcp/tools/update.py b/src/mem_mcp/mcp/tools/update.py
+index c38fc1c..48cfaf7 100644
+--- a/src/mem_mcp/mcp/tools/update.py
++++ b/src/mem_mcp/mcp/tools/update.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import json
+ import re
++from datetime import datetime
+ from typing import Any, ClassVar, Literal
+ from uuid import UUID
+ 
+@@ -14,7 +15,7 @@ from mem_mcp.mcp.errors import JsonRpcError
+ from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+ from mem_mcp.mcp.tools._base import BaseTool, ToolContext
+ from mem_mcp.memory.normalize import hash_content
+-from mem_mcp.memory.versioning import VERSIONED_TYPES
++from mem_mcp.memory.versioning import VERSIONED_TYPES, compute_revision
+ 
+ _TAG_RE = re.compile(r"^[a-zA-Z0-9_:.-]+$")
+ MemoryType = Literal["note", "decision", "fact", "snippet", "question", "position", "challenge"]
+@@ -31,6 +32,7 @@ class MemoryUpdateInput(BaseModel):
+     tags: list[str] | None = None
+     metadata: dict[str, Any] | None = None
+     tags_op: Literal["replace", "add", "remove"] = "replace"
++    expected_revision: str | None = None
+ 
+     @field_validator("content", mode="after")
+     @classmethod
+@@ -69,6 +71,7 @@ class MemoryUpdateOutput(BaseModel):
+     id: UUID
+     version: int
+     is_new_version: bool
++    revision: str = ""
+     tags: list[str] | None
+     request_id: str
+ 
+@@ -88,22 +91,27 @@ class MemoryUpdateTool(BaseTool):
+             raise JsonRpcError(-32603, "tool deps not wired")
+ 
+         async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
+-            # Initial lookup
++            # Initial lookup with FOR UPDATE to serialize concurrent updates
+             target = await conn.fetchrow(
+                 """
+-                SELECT id, type, content, version, tags, metadata, deleted_at
++                SELECT id, type, content, version, tags, metadata, deleted_at,
++                       is_current, updated_at
+                 FROM memories
+-                WHERE id = $1 AND tenant_id = $2
++                WHERE id = $1 AND tenant_id = $2 FOR UPDATE
+                 """,
+                 inp.id,
+                 ctx.tenant_id,
+             )
++
++            # 1. not found → -32602
+             if target is None:
+                 raise JsonRpcError(
+                     -32602,
+                     "memory not found",
+                     data={"errors": [{"path": "id", "message": "not found in tenant scope"}]},
+                 )
++
++            # 2. deleted → -32602
+             if target["deleted_at"] is not None:
+                 raise JsonRpcError(
+                     -32602,
+@@ -111,6 +119,35 @@ class MemoryUpdateTool(BaseTool):
+                     data={"errors": [{"path": "id", "message": "memory is deleted"}]},
+                 )
+ 
++            # 3. is_current is false → conflict (superseded)
++            if not target.get("is_current", True):
++                # Find the current version in the chain
++                current_id, current_revision = await self._find_current_version(
++                    conn, target["id"], ctx.tenant_id
++                )
++                raise JsonRpcError(
++                    -32000,
++                    "memory is superseded",
++                    data={
++                        "code": "update_conflict",
++                        "current_id": str(current_id) if current_id else None,
++                        "current_revision": current_revision,
++                    },
++                )
++
++            # 4. Check expected_revision if provided
++            current_revision = compute_revision(target["id"], target.get("updated_at"))
++            if inp.expected_revision is not None and inp.expected_revision != current_revision:
++                raise JsonRpcError(
++                    -32000,
++                    "memory has been modified by another operation",
++                    data={
++                        "code": "update_conflict",
++                        "current_revision": current_revision,
++                        "current_id": str(target["id"]),
++                    },
++                )
++
+             # Decide path
+             content_changed = inp.content is not None and inp.content != target["content"]
+             type_changed = inp.type is not None and inp.type != target["type"]
+@@ -163,7 +200,7 @@ class MemoryUpdateTool(BaseTool):
+                         type, tags, metadata,
+                         version, supersedes, is_current
+                     ) VALUES ($1, $2, $3, $4::vector, $5, 'api', $6, $7, $8::jsonb, $9, $10, true)
+-                    RETURNING id, version
++                    RETURNING id, version, updated_at
+                     """,
+                     ctx.tenant_id,
+                     new_content,
+@@ -177,18 +214,21 @@ class MemoryUpdateTool(BaseTool):
+                     target["id"],
+                 )
+ 
+-                # UPDATE old row: mark as superseded
++                # UPDATE old row: mark as superseded (defense in depth with is_current = true)
+                 await conn.execute(
+                     """
+                     UPDATE memories
+                     SET is_current = false, superseded_by = $1
+-                    WHERE id = $2 AND tenant_id = $3
++                    WHERE id = $2 AND tenant_id = $3 AND is_current = true
+                     """,
+                     new_row["id"],
+                     target["id"],
+                     ctx.tenant_id,
+                 )
+ 
++                # Compute revision from the new row's id and updated_at
++                new_revision = compute_revision(new_row["id"], new_row.get("updated_at"))
++
+                 # Audit
+                 await ctx.deps.audit.audit(
+                     conn,
+@@ -214,6 +254,7 @@ class MemoryUpdateTool(BaseTool):
+                     id=new_row["id"],
+                     version=int(new_row["version"]),
+                     is_new_version=True,
++                    revision=new_revision,
+                     tags=final_tags,
+                     request_id=ctx.request_id,
+                 )
+@@ -235,10 +276,14 @@ class MemoryUpdateTool(BaseTool):
+                 # Only re-embed if content changed
+                 embed_tokens = 0
+                 inplace_embedding_vec: list[float] | None = None
++                updated_at: datetime
+                 if content_changed and inp.content is not None:
+                     # Quota check
+                     await ctx.deps.quotas.check_write(ctx.tenant_id, len(inp.content))
+ 
++                    # Compute hash upfront
++                    content_hash = hash_content(inp.content)
++
+                     # Re-embed UNLESS oversize.
+                     from mem_mcp.mcp.tools.write import EMBED_MAX_INPUT_CHARS
+ 
+@@ -250,15 +295,13 @@ class MemoryUpdateTool(BaseTool):
+                         inplace_embedding_vec = embed.vector
+                         embed_tokens = embed.input_tokens
+ 
+-                    # Compute hash
+-                    content_hash = hash_content(inp.content)
+-
+-                    # UPDATE with content change
+-                    await conn.fetchval(
++                    # UPDATE with content change (use GREATEST to ensure updated_at increases)
++                    updated_at = await conn.fetchval(
+                         """
+                         UPDATE memories
+                         SET content = $1, content_hash = $2, embedding = $3::vector,
+-                            type = $4, tags = $5, metadata = $6::jsonb, updated_at = now()
++                            type = $4, tags = $5, metadata = $6::jsonb,
++                            updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+                         WHERE id = $7 AND tenant_id = $8
+                         RETURNING updated_at
+                         """,
+@@ -273,10 +316,12 @@ class MemoryUpdateTool(BaseTool):
+                     )
+                 else:
+                     # UPDATE without content change (no embedding)
+-                    await conn.fetchval(
++                    # Use GREATEST to ensure updated_at increases
++                    updated_at = await conn.fetchval(
+                         """
+                         UPDATE memories
+-                        SET type = $1, tags = $2, metadata = $3::jsonb, updated_at = now()
++                        SET type = $1, tags = $2, metadata = $3::jsonb,
++                            updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+                         WHERE id = $4 AND tenant_id = $5
+                         RETURNING updated_at
+                         """,
+@@ -287,6 +332,9 @@ class MemoryUpdateTool(BaseTool):
+                         ctx.tenant_id,
+                     )
+ 
++                # Compute revision from the updated row
++                new_revision = compute_revision(target["id"], updated_at)
++
+                 # Audit
+                 await ctx.deps.audit.audit(
+                     conn,
+@@ -313,10 +361,50 @@ class MemoryUpdateTool(BaseTool):
+                     id=target["id"],
+                     version=int(target.get("version") or 1),
+                     is_new_version=False,
++                    revision=new_revision,
+                     tags=final_tags,
+                     request_id=ctx.request_id,
+                 )
+ 
++    async def _find_current_version(
++        self, conn: Any, start_id: UUID, tenant_id: UUID
++    ) -> tuple[UUID | None, str | None]:
++        """Find the current version in a chain, walking via superseded_by.
++
++        When a memory is superseded, the old row's superseded_by points to the new version.
++        Walk this chain to find the current (is_current=true) version.
++        """
++        row = await conn.fetchrow(
++            """
++            WITH RECURSIVE chain AS (
++                -- Start with the given row
++                SELECT id, superseded_by, is_current
++                FROM memories WHERE id = $1 AND tenant_id = $2
++                UNION ALL
++                -- Follow superseded_by chain to newer versions
++                SELECT m.id, m.superseded_by, m.is_current
++                FROM memories m
++                JOIN chain c ON m.id = c.superseded_by
++                WHERE m.tenant_id = $2 AND c.superseded_by IS NOT NULL
++            )
++            -- Find the current version in the chain, pick highest version
++            SELECT id, updated_at FROM memories
++            WHERE id = ANY(SELECT id FROM chain)
++              AND tenant_id = $2
++              AND is_current = true
++              AND deleted_at IS NULL
++            ORDER BY version DESC NULLS LAST
++            LIMIT 1
++            """,
++            start_id,
++            tenant_id,
++        )
++
++        if row is None:
++            return None, None
++
++        return row["id"], compute_revision(row["id"], row.get("updated_at"))
++
+     def _compute_tags(
+         self,
+         existing_tags: list[str],
+diff --git a/src/mem_mcp/memory/versioning.py b/src/mem_mcp/memory/versioning.py
+index 0695098..8aafd03 100644
+--- a/src/mem_mcp/memory/versioning.py
++++ b/src/mem_mcp/memory/versioning.py
+@@ -6,7 +6,49 @@ exists so other modules can import the constants/types they'll need.
+ 
+ from __future__ import annotations
+ 
++from datetime import datetime, timedelta
++from hashlib import sha256
+ from typing import Final
++from uuid import UUID
+ 
+ VERSIONED_TYPES: Final[frozenset[str]] = frozenset({"decision", "fact"})
+ NON_VERSIONED_TYPES: Final[frozenset[str]] = frozenset({"note", "snippet", "question"})
++
++# Unix epoch for microsecond calculations
++_EPOCH = datetime(1970, 1, 1, tzinfo=None)
++
++
++def compute_revision(memory_id: UUID | str, updated_at: datetime | None) -> str:
++    """Compute an opaque revision token for a memory row.
++
++    The revision is derived from the memory_id and updated_at timestamp,
++    providing optimistic concurrency control. Callers can use it to detect
++    when a memory has changed since they last read it.
++
++    Args:
++        memory_id: The UUID of the memory (or string representation).
++        updated_at: The updated_at timestamp, or None (treated as epoch).
++
++    Returns:
++        A 24-character hex string (first 24 chars of SHA-256 hash).
++    """
++    # Convert to string if UUID
++    id_str = str(memory_id) if isinstance(memory_id, UUID) else memory_id
++
++    # Compute microseconds since epoch (treat None as 0)
++    if updated_at is None:
++        micros = 0
++    elif updated_at.tzinfo is not None:
++        # Convert to UTC naive for consistent arithmetic
++        offset = updated_at.tzinfo.utcoffset(updated_at)
++        assert offset is not None
++        utc_naive = updated_at.replace(tzinfo=None) - offset
++        micros = int((utc_naive - _EPOCH) // timedelta(microseconds=1))
++    else:
++        # Naive datetime, treat as UTC
++        micros = int((updated_at - _EPOCH) // timedelta(microseconds=1))
++
++    # Compute hash and return first 24 hex chars
++    hash_input = f"{id_str}:{micros}"
++    hash_bytes = sha256(hash_input.encode("utf-8")).hexdigest()
++    return hash_bytes[:24]
+diff --git a/tests/integration/test_update_concurrency.py b/tests/integration/test_update_concurrency.py
+new file mode 100644
+index 0000000..221a53d
+--- /dev/null
++++ b/tests/integration/test_update_concurrency.py
+@@ -0,0 +1,1038 @@
++"""Integration tests for memory_update concurrency control (T-7.2).
++
++Tests for revision tokens, row locks, and conflict detection with real Postgres.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import os
++from typing import Any
++from uuid import UUID, uuid4
++
++import asyncpg  # type: ignore[import-untyped]
++import pytest
++
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tools._base import ToolContext
++from mem_mcp.mcp.tools._deps import NoopAuditLogger, NoopQuotas, ToolDeps
++from mem_mcp.mcp.tools.get import MemoryGetInput, MemoryGetTool, MemoryRecord
++from mem_mcp.mcp.tools.update import MemoryUpdateInput, MemoryUpdateOutput, MemoryUpdateTool
++from mem_mcp.mcp.tools.write import MemoryWriteInput, MemoryWriteOutput, MemoryWriteTool
++
++pytestmark = pytest.mark.asyncio
++
++
++def _build_deps() -> Any:
++    """Build stub dependencies for tool invocation."""
++    class _StubEmbed:
++        async def embed(self, content: str) -> Any:
++            from mem_mcp.embeddings.bedrock import EmbedResult
++
++            return EmbedResult(vector=[0.0] * 1024, input_tokens=max(1, len(content) // 4))
++
++    return ToolDeps(embeddings=_StubEmbed(), audit=NoopAuditLogger(), quotas=NoopQuotas())
++
++
+<email>
++async def db_pool() -> asyncpg.Pool:
++    """Dedicated larger pool (12 connections) for concurrent database operations."""
++    dsn = os.environ.get("MEM_MCP_TEST_DSN")
++    if not dsn:
++        pytest.skip("MEM_MCP_TEST_DSN env not set; skipping live-DB test")
++    from mem_mcp.db.pool import _init_connection
++
++    pool = await asyncpg.create_pool(
++        dsn=dsn,
++        min_size=12,
++        max_size=12,
++        init=_init_connection,
++    )
++    yield pool
++    # Wait for background tasks to drain
++    await asyncio.sleep(0.2)
++    await pool.close()
++
++
++async def _setup_tenant_and_memory(pool: asyncpg.Pool) -> dict[str, Any]:
++    """Create a tenant, team, and memory for testing.
++
++    Returns dict with tenant_id, team_id, client_id, default_team_id.
++    """
++    tenant_id = uuid4()
++
++    async with pool.acquire() as conn:
++        async with conn.transaction():
++            # Insert tenant
++            await conn.execute(
++                "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++                tenant_id,
++                f"test-{tenant_id}@example.test",
++            )
++
++            # Insert team and get the generated id
++            team_id = await conn.fetchval(
++                "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++                f"test-team-{tenant_id.hex[:8]}",
++                tenant_id,
++            )
++
++            # Insert primary identity with default_team_id
++            await conn.execute(
++                """
++                INSERT INTO tenant_identities
++                (tenant_id, cognito_sub, provider, email, is_primary, default_team_id)
++                VALUES ($1, $2, 'cognito', $3, true, $4)
++                """,
++                tenant_id,
++                f"sub-{tenant_id}",
++                f"test-{tenant_id}@example.test",
++                team_id,
++            )
++
++            # Insert oauth_clients row for plugin client
++            await conn.execute(
++                """
++                INSERT INTO oauth_clients
++                (id, redirect_uris, scope, registration_payload, review_status)
++                VALUES ($1, ARRAY[]::text[], 'memory.read memory.write', '{}'::jsonb, 'auto_allowed')
++                ON CONFLICT (id) DO NOTHING
++                """,
++                "test-concurrent",
++            )
++
++    return {
++        "tenant_id": tenant_id,
++        "team_id": team_id,
++        "client_id": "test-concurrent",
++    }
++
++
++async def _create_decision(pool: asyncpg.Pool, tenant_id: UUID, content: str) -> UUID:
++    """Create a decision memory using MemoryWriteTool."""
++    ctx = ToolContext(
++        request_id=f"req-{uuid4().hex[:8]}",
++        tenant_id=tenant_id,
++        identity_id=tenant_id,
++        client_id="test-concurrent",
++        scopes=frozenset(["memory.read", "memory.write"]),
++        db_pool=pool,
++        deps=_build_deps(),
++    )
++    tool = MemoryWriteTool()
++    out = await tool(
++        ctx,
++        MemoryWriteInput(content=content, type="decision", slug_clue="test-decision"),
++    )
++    assert isinstance(out, MemoryWriteOutput)
++    return out.id
++
++
++async def _create_note(pool: asyncpg.Pool, tenant_id: UUID, content: str) -> UUID:
++    """Create a note memory using MemoryWriteTool."""
++    ctx = ToolContext(
++        request_id=f"req-{uuid4().hex[:8]}",
++        tenant_id=tenant_id,
++        identity_id=tenant_id,
++        client_id="test-concurrent",
++        scopes=frozenset(["memory.read", "memory.write"]),
++        db_pool=pool,
++        deps=_build_deps(),
++    )
++    tool = MemoryWriteTool()
++    out = await tool(
++        ctx,
++        MemoryWriteInput(content=content, type="note"),
++    )
++    assert isinstance(out, MemoryWriteOutput)
++    return out.id
++
++
++async def _cleanup(pool: asyncpg.Pool, tenant_id: UUID, team_id: UUID) -> None:
++    """Clean up test data."""
++    async with pool.acquire() as conn:
++        async with conn.transaction():
++            await conn.execute(
++                "DELETE FROM memory_references WHERE source_memory_id IN "
++                "(SELECT id FROM memories WHERE tenant_id = $1) "
++                "OR target_memory_id IN (SELECT id FROM memories WHERE tenant_id = $1)",
++                tenant_id,
++            )
++            # Slugs reference memories, delete first
++            await conn.execute("DELETE FROM slugs WHERE team_id = $1", team_id)
++            await conn.execute("DELETE FROM memories WHERE tenant_id = $1", tenant_id)
++            await conn.execute(
++                "DELETE FROM tenant_identities WHERE tenant_id = $1", tenant_id
++            )
++            await conn.execute("DELETE FROM teams WHERE id = $1", team_id)
++            await conn.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
++
++
++async def _get_memory_revision(pool: asyncpg.Pool, tenant_id: UUID, memory_id: UUID) -> str:
++    """Get the current revision of a memory via memory_get."""
++    ctx = ToolContext(
++        request_id=f"req-{uuid4().hex[:8]}",
++        tenant_id=tenant_id,
++        identity_id=tenant_id,
++        client_id="test-concurrent",
++        scopes=frozenset(["memory.read"]),
++        db_pool=pool,
++        deps=_build_deps(),
++    )
++    tool = MemoryGetTool()
++    out = await tool(ctx, MemoryGetInput(id=memory_id))
++    assert isinstance(out.memory, MemoryRecord)
++    return out.memory.revision
++
++
++class TestConcurrentTagsOperations:
++    """Tests for concurrent tags_op="add"/"remove" operations."""
++
++    async def test_concurrent_add_tags_all_preserved(self, db_pool: asyncpg.Pool) -> None:
++        """10 concurrent tags_op='add' each adding distinct tags → all preserved."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a decision with no tags
++        memory_id = await _create_decision(db_pool, tenant_id, "Test decision content")
++
++        try:
++            # 10 concurrent add operations, each adding a distinct tag
++            num_concurrent = 10
++            distinct_tags = [f"tag-{i}" for i in range(num_concurrent)]
++
++            async def add_tag(tag: str) -> MemoryUpdateOutput:
++                ctx = ToolContext(
++                    request_id=f"req-{uuid4().hex[:8]}",
++                    tenant_id=tenant_id,
++                    identity_id=tenant_id,
++                    client_id="test-concurrent",
++                    scopes=frozenset(["memory.write"]),
++                    db_pool=db_pool,
++                    deps=_build_deps(),
++                )
++                inp = MemoryUpdateInput(id=memory_id, tags=[tag], tags_op="add")
++                tool = MemoryUpdateTool()
++                return await tool(ctx, inp)
++
++            results = await asyncio.gather(
++                *[add_tag(tag) for tag in distinct_tags],
++                return_exceptions=True,
++            )
++
++            # All should succeed (no exceptions)
++            errors = [r for r in results if isinstance(r, Exception)]
++            assert len(errors) == 0, f"Some operations failed: {errors}"
++
++            # Verify all tags are present
++            ctx = ToolContext(
++                request_id=f"req-{uuid4().hex[:8]}",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.read"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            out = await MemoryGetTool()(ctx, MemoryGetInput(id=memory_id))
++
++            final_tags = set(out.memory.tags)
++            expected_tags = set(distinct_tags)
++
++            assert final_tags == expected_tags, f"Tags mismatch: {final_tags} vs {expected_tags}"
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++    async def test_concurrent_remove_tags_all_removed(self, db_pool: asyncpg.Pool) -> None:
++        """9 concurrent tags_op='remove' each removing distinct tags → all removed correctly."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a note with many tags
++        initial_tags = [f"tag-{i}" for i in range(9)]
++
++        ctx = ToolContext(
++            request_id=f"req-{uuid4().hex[:8]}",
++            tenant_id=tenant_id,
++            identity_id=tenant_id,
++            client_id="test-concurrent",
++            scopes=frozenset(["memory.read", "memory.write"]),
++            db_pool=db_pool,
++            deps=_build_deps(),
++        )
++        write_tool = MemoryWriteTool()
++        out = await write_tool(
++            ctx,
++            MemoryWriteInput(content="Test content for remove", type="note", tags=initial_tags),
++        )
++        assert isinstance(out, MemoryWriteOutput)
++        memory_id = out.id
++
++        try:
++            # Remove all tags concurrently
++            async def remove_tag(tag: str) -> MemoryUpdateOutput:
++                ctx_upd = ToolContext(
++                    request_id=f"req-{uuid4().hex[:8]}",
++                    tenant_id=tenant_id,
++                    identity_id=tenant_id,
++                    client_id="test-concurrent",
++                    scopes=frozenset(["memory.write"]),
++                    db_pool=db_pool,
++                    deps=_build_deps(),
++                )
++                inp = MemoryUpdateInput(id=memory_id, tags=[tag], tags_op="remove")
++                tool = MemoryUpdateTool()
++                return await tool(ctx_upd, inp)
++
++            results = await asyncio.gather(
++                *[remove_tag(tag) for tag in initial_tags],
++                return_exceptions=True,
++            )
++
++            # All should succeed
++            errors = [r for r in results if isinstance(r, Exception)]
++            assert len(errors) == 0, f"Some operations failed: {errors}"
++
++            # Verify all tags are removed
++            get_ctx = ToolContext(
++                request_id=f"req-{uuid4().hex[:8]}",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.read"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            get_tool = MemoryGetTool()
++            out = await get_tool(get_ctx, MemoryGetInput(id=memory_id))
++
++            final_tags = set(out.memory.tags)
++            assert final_tags == set(), f"Tags should be empty, got: {final_tags}"
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++
++class TestVersionedTypeConcurrency:
++    """Tests for concurrent content updates to versioned types (decision/fact)."""
++
++    async def test_concurrent_content_updates_only_one_succeeds(self, db_pool: asyncpg.Pool) -> None:
++        """10 concurrent content updates to same current decision → exactly one succeeds."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]  # type: ignore[index]
++        team_id = tenant_info["team_id"]  # type: ignore[index]
++
++        # Create a decision
++        memory_id = await _create_decision(db_pool, tenant_id, "Original decision content")
++
++        try:
++            num_concurrent = 10
++
++            async def update_decision() -> MemoryUpdateOutput | Exception:
++                ctx = ToolContext(
++                    request_id=f"req-{uuid4().hex[:8]}",
++                    tenant_id=tenant_id,
++                    identity_id=tenant_id,
++                    client_id="test-concurrent",
++                    scopes=frozenset(["memory.write"]),
++                    db_pool=db_pool,
++                    deps=_build_deps(),
++                )
++                inp = MemoryUpdateInput(id=memory_id, content="Updated decision")
++                tool = MemoryUpdateTool()
++                try:
++                    return await tool(ctx, inp)
++                except JsonRpcError as e:
++                    return e
++
++            results = await asyncio.gather(
++                *[update_decision() for _ in range(num_concurrent)],
++                return_exceptions=False,
++            )
++
++            # Count successes vs conflicts
++            successes = [r for r in results if isinstance(r, MemoryUpdateOutput)]
++            conflicts = [r for r in results if isinstance(r, JsonRpcError)]
++
++            # Exactly one should succeed (is_new_version=True)
++            success_outputs = [r for r in successes if r.is_new_version]
++            assert len(success_outputs) == 1, (
++                f"Expected exactly 1 new version, got {len(success_outputs)}"
++            )
++
++            # The rest should be conflicts
++            assert len(conflicts) == num_concurrent - 1, (
++                f"Expected {num_concurrent - 1} conflicts, got {len(conflicts)}"
++            )
++            winner = success_outputs[0]
++            for conflict in conflicts:
++                assert conflict.code == -32000
++                assert conflict.data["code"] == "update_conflict"
++                # current_id should point to the winner
++                assert conflict.data["current_id"] is not None
++                assert conflict.data["current_id"] == str(winner.id)
++                # winner's version should be 2 (second version in chain)
++                assert winner.version == 2
++
++            # Verify DB has exactly one is_current row in the chain
++            async with db_pool.acquire() as conn:
++                async with conn.transaction():
++                    count = await conn.fetchval(
++                        """
++                        SELECT COUNT(*) FROM memories
++                        WHERE id IN (
++                            WITH RECURSIVE chain AS (
++                                SELECT id FROM memories WHERE supersedes = $1
++                                UNION ALL
++                                SELECT m.id FROM memories m
++                                JOIN chain c ON m.supersedes = c.id
++                            )
++                            SELECT $1 UNION ALL SELECT * FROM chain
++                        ) AND is_current = true AND deleted_at IS NULL
++                        """,
++                        memory_id,
++                    )
++                    assert count == 1, f"Expected 1 current row, got {count}"
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++    async def test_sequential_update_superseded_then_old_id_refused(
++        self, db_pool: asyncpg.Pool
++    ) -> None:
++        """Update a decision (creates v2), then update the old v1 id → refused."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a decision
++        v1_id = await _create_decision(db_pool, tenant_id, "Version 1 decision")
++
++        try:
++            # Update v1 to create v2
++            ctx = ToolContext(
++                request_id=f"req-{uuid4().hex[:8]}",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.write"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            inp = MemoryUpdateInput(id=v1_id, content="Updated to V2")
++            tool = MemoryUpdateTool()
++            v2_output = await tool(ctx, inp)
++            assert isinstance(v2_output, MemoryUpdateOutput)
++            assert v2_output.is_new_version is True
++
++            # Now try to update v1 (which is now superseded)
++            inp_old = MemoryUpdateInput(id=v1_id, tags=["new-tag"])
++            with pytest.raises(JsonRpcError) as exc:
++                await tool(ctx, inp_old)
++
++            assert exc.value.code == -32000
++            assert exc.value.data["code"] == "update_conflict"
++            assert exc.value.data["current_id"] is not None
++            assert exc.value.data["current_id"] == str(v2_output.id)
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++    async def test_sequential_note_to_decision_promotion_old_refused(
++        self, db_pool: asyncpg.Pool
++    ) -> None:
++        """Note→decision promotion then update old note id → refused."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a note
++        note_id = await _create_note(db_pool, tenant_id, "Original note content")
++
++        try:
++            # Update note to decision (this creates a new version)
++            ctx = ToolContext(
++                request_id=f"req-{uuid4().hex[:8]}",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.write"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            inp = MemoryUpdateInput(id=note_id, type="decision", content="Promoted to decision")
++            tool = MemoryUpdateTool()
++            output = await tool(ctx, inp)
++            assert isinstance(output, MemoryUpdateOutput)
++            assert output.is_new_version is True
++
++            # Try to update the old note id
++            inp_old = MemoryUpdateInput(id=note_id, tags=["new-tag"])
++            with pytest.raises(JsonRpcError) as exc:
++                await tool(ctx, inp_old)
++
++            assert exc.value.code == -32000
++            assert exc.value.data["code"] == "update_conflict"
++            assert exc.value.data["current_id"] == str(output.id)
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++
++class TestOptimisticConcurrency:
++    """Tests for expected_revision optimistic concurrency control."""
++
++    async def test_same_valid_revision_only_one_succeeds(self, db_pool: asyncpg.Pool) -> None:
++        """10 concurrent updates with same valid expected_revision → exactly one success."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a note
++        memory_id = await _create_note(db_pool, tenant_id, "Original content")
++
++        try:
++            num_concurrent = 10
++
++            # Get the initial revision
++            initial_revision = await _get_memory_revision(db_pool, tenant_id, memory_id)
++
++            async def update_with_revision() -> MemoryUpdateOutput | Exception:
++                ctx = ToolContext(
++                    request_id=f"req-{uuid4().hex[:8]}",
++                    tenant_id=tenant_id,
++                    identity_id=tenant_id,
++                    client_id="test-concurrent",
++                    scopes=frozenset(["memory.write"]),
++                    db_pool=db_pool,
++                    deps=_build_deps(),
++                )
++                inp = MemoryUpdateInput(
++                    id=memory_id, content="Updated content", expected_revision=initial_revision
++                )
++                tool = MemoryUpdateTool()
++                try:
++                    return await tool(ctx, inp)
++                except JsonRpcError as e:
++                    return e
++
++            results = await asyncio.gather(
++                *[update_with_revision() for _ in range(num_concurrent)],
++                return_exceptions=False,
++            )
++
++            successes = [r for r in results if isinstance(r, MemoryUpdateOutput)]
++            conflicts = [r for r in results if isinstance(r, JsonRpcError)]
++
++            # Exactly one should succeed
++            assert len(successes) == 1, f"Expected 1 success, got {len(successes)}"
++
++            # Rest should be conflicts
++            assert len(conflicts) == num_concurrent - 1
++            for conflict in conflicts:
++                assert conflict.code == -32000
++                assert conflict.data["code"] == "update_conflict"
++
++            # Fetch current revision from memory_get
++            ctx = ToolContext(
++                request_id=f"req-{uuid4().hex[:8]}",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.write"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            winner_output = successes[0]
++            winner_revision = winner_output.revision
++
++            # Verify memory shows the successful update
++            get_out = await MemoryGetTool()(ctx, MemoryGetInput(id=memory_id))
++
++            # Content should be from the winner's update
++            assert get_out.memory.content == "Updated content"
++            # Winner's revision matches what memory_get sees
++            assert get_out.memory.revision == winner_revision
++
++            # Every conflict's current_revision should equal the winner's revision
++            for conflict in conflicts:
++                assert conflict.data["current_revision"] == winner_revision
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++    async def test_stale_revision_refused_memory_unchanged(self, db_pool: asyncpg.Pool) -> None:
++        """Stale expected_revision sequential → refused, memory unchanged."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a note
++        memory_id = await _create_note(db_pool, tenant_id, "Original content")
++
++        try:
++            # Get revision
++            original_revision = await _get_memory_revision(db_pool, tenant_id, memory_id)
++
++            # Make a concurrent update (simulated by another client call)
++            ctx1 = ToolContext(
++                request_id="req-1",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.write"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            tool = MemoryUpdateTool()
++            await tool(ctx1, MemoryUpdateInput(id=memory_id, tags=["tag1"]))
++
++            # Get the new revision
++            new_revision = await _get_memory_revision(db_pool, tenant_id, memory_id)
++
++            # Try to update with OLD revision
++            ctx2 = ToolContext(
++                request_id="req-2",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.write"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            inp = MemoryUpdateInput(
++                id=memory_id, tags=["tag2"], expected_revision=original_revision
++            )
++
++            with pytest.raises(JsonRpcError) as exc:
++                await tool(ctx2, inp)
++
++            assert exc.value.code == -32000
++            assert exc.value.data["code"] == "update_conflict"
++            assert exc.value.data["current_revision"] == new_revision
++
++            # Verify memory has the first update's changes only
++            ctx_get = ToolContext(
++                request_id="req-get",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.read"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            get_tool = MemoryGetTool()
++            out = await get_tool(ctx_get, MemoryGetInput(id=memory_id))
++
++            assert set(out.memory.tags) == {"tag1"}
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++
++class TestRevisionConsistency:
++    """Tests for revision consistency between memory_update output and memory_get."""
++
++    async def test_update_revision_matches_memory_get_after_in_place(
++        self, db_pool: asyncpg.Pool
++    ) -> None:
++        """memory_update output revision == memory_get(...).memory.revision (in-place path)."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a note
++        memory_id = await _create_note(db_pool, tenant_id, "Original content")
++
++        try:
++            ctx = ToolContext(
++                request_id=f"req-{uuid4().hex[:8]}",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.write"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            tool = MemoryUpdateTool()
++
++            # Update in-place
++            inp = MemoryUpdateInput(id=memory_id, tags=["new-tag"])
++            output = await tool(ctx, inp)
++            assert isinstance(output, MemoryUpdateOutput)
++
++            # Get the memory's current revision
++            get_tool = MemoryGetTool()
++            get_out = await get_tool(ctx, MemoryGetInput(id=memory_id))
++
++            assert output.revision == get_out.memory.revision
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++    async def test_update_revision_matches_memory_get_after_versioned(
++        self, db_pool: asyncpg.Pool
++    ) -> None:
++        """memory_update output revision == memory_get(...).memory.revision (versioned path)."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a decision
++        memory_id = await _create_decision(db_pool, tenant_id, "Original decision")
++
++        try:
++            ctx = ToolContext(
++                request_id=f"req-{uuid4().hex[:8]}",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.write"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            tool = MemoryUpdateTool()
++
++            # Update (creates new version)
++            inp = MemoryUpdateInput(id=memory_id, content="Updated decision")
++            output = await tool(ctx, inp)
++            assert isinstance(output, MemoryUpdateOutput)
++            assert output.is_new_version is True
++
++            # Get the new version's revision
++            get_tool = MemoryGetTool()
++            get_out = await get_tool(ctx, MemoryGetInput(id=output.id))
++
++            assert output.revision == get_out.memory.revision
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++    async def test_two_successive_updates_yield_different_revisions(
++        self, db_pool: asyncpg.Pool
++    ) -> None:
++        """Two successive updates yield different revisions."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a note
++        memory_id = await _create_note(db_pool, tenant_id, "Original content")
++
++        try:
++            ctx = ToolContext(
++                request_id=f"req-{uuid4().hex[:8]}",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.write"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            tool = MemoryUpdateTool()
++
++            # First update
++            inp1 = MemoryUpdateInput(id=memory_id, tags=["tag1"])
++            output1 = await tool(ctx, inp1)
++            assert isinstance(output1, MemoryUpdateOutput)
++
++            # Second update
++            inp2 = MemoryUpdateInput(id=memory_id, tags=["tag2"])
++            output2 = await tool(ctx, inp2)
++            assert isinstance(output2, MemoryUpdateOutput)
++
++            # Revisions should be different
++            assert output1.revision != output2.revision
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++    async def test_noop_update_changes_revision(self, db_pool: asyncpg.Pool) -> None:
++        """A no-op update (no content/type/tags/metadata change) still changes the revision."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a note
++        memory_id = await _create_note(db_pool, tenant_id, "Original content")
++
++        try:
++            ctx = ToolContext(
++                request_id=f"req-{uuid4().hex[:8]}",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.write"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            tool = MemoryUpdateTool()
++
++            # Get revision BEFORE the no-op update
++            get_tool = MemoryGetTool()
++            get_out_before = await get_tool(ctx, MemoryGetInput(id=memory_id))
++            before_revision = get_out_before.memory.revision
++
++            # No-op update (just id, no changes)
++            inp = MemoryUpdateInput(id=memory_id)
++            output = await tool(ctx, inp)
++            assert isinstance(output, MemoryUpdateOutput)
++            assert output.is_new_version is False
++
++            # Revision should be different after the update
++            assert output.revision != before_revision, "Revision should change even on no-op update"
++
++            # Even though nothing changed, the revision should be different
++            # because updated_at was bumped
++            get_out = await get_tool(ctx, MemoryGetInput(id=memory_id))
++            assert output.revision == get_out.memory.revision
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++    async def test_return_exceptions_count_verification(self, db_pool: asyncpg.Pool) -> None:
++        """Use return_exceptions=True in gather and assert counts."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a note
++        memory_id = await _create_note(db_pool, tenant_id, "Original content")
++
++        try:
++            ops = []
++
++            # Two updates with stale revision (should fail)
++            ops.append(
++                MemoryUpdateInput(id=memory_id, tags=["tag1"], expected_revision="stale1")
++            )
++            ops.append(
++                MemoryUpdateInput(id=memory_id, tags=["tag2"], expected_revision="stale2")
++            )
++            # One valid update
++            revision = await _get_memory_revision(db_pool, tenant_id, memory_id)
++            ops.append(MemoryUpdateInput(id=memory_id, tags=["tag3"], expected_revision=revision))
++
++            async def do_update(inp: MemoryUpdateInput) -> MemoryUpdateOutput | JsonRpcError:
++                ctx = ToolContext(
++                    request_id=f"req-{uuid4().hex[:8]}",
++                    tenant_id=tenant_id,
++                    identity_id=tenant_id,
++                    client_id="test-concurrent",
++                    scopes=frozenset(["memory.write"]),
++                    db_pool=db_pool,
++                    deps=_build_deps(),
++                )
++                tool = MemoryUpdateTool()
++                try:
++                    return await tool(ctx, inp)
++                except JsonRpcError as e:
++                    return e
++
++            results = await asyncio.gather(
++                *[do_update(op) for op in ops],
++                return_exceptions=True,
++            )
++
++            successes = [r for r in results if isinstance(r, MemoryUpdateOutput)]
++            failures = [r for r in results if isinstance(r, JsonRpcError | Exception)]
++
++            # One success, two failures
++            assert len(successes) == 1, f"Expected 1 success, got {len(successes)}"
++            assert len(failures) == 2, f"Expected 2 failures, got {len(failures)}"
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++
++class TestConcurrentMixedOperations:
++    """Tests for concurrent mixed operations on versioned types."""
++
++    async def test_concurrent_mixed_on_decision(
++        self, db_pool: asyncpg.Pool
++    ) -> None:
++        """1 content update + 5 tags_op='add' calls gathered → one current row, all tags applied."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a decision
++        memory_id = await _create_decision(db_pool, tenant_id, "Original decision content")
++
++        try:
++            # Prepare distinct tags for the add operations
++            distinct_tags = [f"tag-{i}" for i in range(5)]
++
++            # Content update operation
++            async def do_content_update() -> tuple[str, MemoryUpdateOutput | Exception]:
++                ctx = ToolContext(
++                    request_id=f"req-content-{uuid4().hex[:8]}",
++                    tenant_id=tenant_id,
++                    identity_id=tenant_id,
++                    client_id="test-concurrent",
++                    scopes=frozenset(["memory.write"]),
++                    db_pool=db_pool,
++                    deps=_build_deps(),
++                )
++                inp = MemoryUpdateInput(id=memory_id, content="Updated decision content")
++                tool = MemoryUpdateTool()
++                try:
++                    return ("content", await tool(ctx, inp))
++                except JsonRpcError as e:
++                    return ("content", e)
++
++            # Tags add operations
++            async def do_tags_add(tag: str) -> tuple[str, MemoryUpdateOutput | Exception]:
++                ctx = ToolContext(
++                    request_id=f"req-tag-{uuid4().hex[:8]}",
++                    tenant_id=tenant_id,
++                    identity_id=tenant_id,
++                    client_id="test-concurrent",
++                    scopes=frozenset(["memory.write"]),
++                    db_pool=db_pool,
++                    deps=_build_deps(),
++                )
++                inp = MemoryUpdateInput(id=memory_id, tags=[tag], tags_op="add")
++                tool = MemoryUpdateTool()
++                try:
++                    return ("tag", await tool(ctx, inp))
++                except JsonRpcError as e:
++                    return ("tag", e)
++
++            # Gather all 6 operations: 1 content update + 5 tags adds
++            all_ops = [do_content_update()] + [do_tags_add(tag) for tag in distinct_tags]
++            gathered = await asyncio.gather(*all_ops, return_exceptions=False)
++
++            # Separate successes and conflicts
++            successes = []
++            conflicts = []
++            for op_type, result in gathered:
++                if isinstance(result, MemoryUpdateOutput):
++                    successes.append((op_type, result))
++                elif isinstance(result, JsonRpcError):
++                    conflicts.append((op_type, result))
++
++            # The content update is the only content update on a current decision, so it
++            # can never be refused — tag adds may be refused only if they ran after the
++            # version bump (i.e., after the content update won the race).
++            content_outputs = [(t, r) for t, r in successes if t == "content"]
++            assert len(content_outputs) == 1, f"Expected exactly 1 content update success, got {len(content_outputs)}"
++            content_tag, content_output = content_outputs[0]
++            assert content_output.is_new_version is True
++
++            # All conflicts should be tag-add operations with current_id pointing to content_output
++            tag_conflicts = [(t, c) for t, c in conflicts if t == "tag"]
++            for op_type, conflict in tag_conflicts:
++                assert conflict.code == -32000, f"Expected -32000 for {op_type} conflict"
++                assert conflict.data["code"] == "update_conflict"  # type: ignore[index]
++                assert conflict.data["current_id"] == str(content_output.id)  # type: ignore[index]
++
++            # Verify exactly one current row in the chain
++            async with db_pool.acquire() as conn:
++                async with conn.transaction():
++                    count = await conn.fetchval(
++                        """
++                        SELECT COUNT(*) FROM memories
++                        WHERE tenant_id = $1 AND is_current = true AND deleted_at IS NULL
++                        """,
++                        tenant_id,
++                    )
++                    assert count == 1, f"Expected 1 current row, got {count}"
++
++            # Get the final state from the current row of the chain
++            # If content update succeeded, use its output id; otherwise use memory_id
++            ctx = ToolContext(
++                request_id="req-final",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.read"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            get_out = await MemoryGetTool()(ctx, MemoryGetInput(id=content_output.id))
++
++            # Verify tags from successful tag-add calls are present on the current row
++            for op_type, result in successes:
++                if op_type == "tag":
++                    assert result.tags is not None
++                    for tag in result.tags:
++                        assert tag in get_out.memory.tags, f"Tag {tag} from successful operation not in final state"
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
++
++
++class TestConcurrentInplaceContentUpdates:
++    """Tests for concurrent in-place content updates to non-versioned types."""
++
++    async def test_concurrent_noop_inplace_updates_on_note(
++        self, db_pool: asyncpg.Pool
++    ) -> None:
++        """10 concurrent distinct content updates to a note → all succeed, last-writer-wins."""
++        tenant_info = await _setup_tenant_and_memory(db_pool)
++        tenant_id = tenant_info["tenant_id"]
++        team_id = tenant_info["team_id"]
++
++        # Create a note
++        memory_id = await _create_note(db_pool, tenant_id, "Original content")
++
++        try:
++            distinct_contents = [f"Content-{i}" for i in range(10)]
++
++            async def update_content(content: str) -> MemoryUpdateOutput:
++                ctx = ToolContext(
++                    request_id=f"req-{uuid4().hex[:8]}",
++                    tenant_id=tenant_id,
++                    identity_id=tenant_id,
++                    client_id="test-concurrent",
++                    scopes=frozenset(["memory.write"]),
++                    db_pool=db_pool,
++                    deps=_build_deps(),
++                )
++                inp = MemoryUpdateInput(id=memory_id, content=content)
++                tool = MemoryUpdateTool()
++                return await tool(ctx, inp)
++
++            results = await asyncio.gather(
++                *[update_content(content) for content in distinct_contents],
++                return_exceptions=False,
++            )
++
++            # All 10 updates should succeed (in-place on note)
++            assert len(results) == 10
++            for result in results:
++                assert isinstance(result, MemoryUpdateOutput)
++                assert result.is_new_version is False
++
++            # All revisions should be different (each update bumps updated_at)
++            revisions = {r.revision for r in results}
++            assert len(revisions) == 10, f"Expected 10 unique revisions, got {len(revisions)}"
++
++            # Final content should be one of the submitted contents
++            ctx = ToolContext(
++                request_id="req-final",
++                tenant_id=tenant_id,
++                identity_id=tenant_id,
++                client_id="test-concurrent",
++                scopes=frozenset(["memory.read"]),
++                db_pool=db_pool,
++                deps=_build_deps(),
++            )
++            get_out = await MemoryGetTool()(ctx, MemoryGetInput(id=memory_id))
++
++            assert get_out.memory.content in distinct_contents, (
++                f"Final content {get_out.memory.content} not in submitted contents"
++            )
++
++            # Final revision should equal one of the successful outputs
++            final_revisions = {r.revision for r in results}
++            assert get_out.memory.revision in final_revisions, (
++                f"Final revision {get_out.memory.revision} not in any output revision"
++            )
++
++        finally:
++            await _cleanup(db_pool, tenant_id, team_id)
+diff --git a/tests/unit/test_update_revision.py b/tests/unit/test_update_revision.py
+new file mode 100644
+index 0000000..f84d600
+--- /dev/null
++++ b/tests/unit/test_update_revision.py
+@@ -0,0 +1,503 @@
++"""Unit tests for revision token computation and MemoryRecord.revision.
++
++Tests for compute_revision and MemoryRecord validation by T-7.2.
++"""
++
++from __future__ import annotations
++
++from datetime import UTC, datetime, timedelta
++from uuid import uuid4
++
++import pytest
++
++from mem_mcp.memory.versioning import compute_revision
++
++
++class TestComputeRevision:
++    """Tests for compute_revision helper."""
++
++    def test_deterministic_same_args(self) -> None:
++        """Same (id, updated_at) from Python/asyncpg always yields same string."""
++        memory_id = uuid4()
++        updated_at = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
++
++        r1 = compute_revision(memory_id, updated_at)
++        r2 = compute_revision(memory_id, updated_at)
++
++        assert r1 == r2
++        assert r1 == compute_revision(str(memory_id), updated_at)
++
++    def test_non_empty_string(self) -> None:
++        """Revision is always a non-empty string."""
++        memory_id = uuid4()
++
++        # With valid datetime
++        r1 = compute_revision(memory_id, datetime(2024, 1, 1, 0, 0, 0))
++        assert r1 and isinstance(r1, str) and len(r1) > 0
++
++        # With None
++        r2 = compute_revision(memory_id, None)
++        assert r2 and isinstance(r2, str) and len(r2) > 0
++
++        # With naive datetime
++        r3 = compute_revision(memory_id, datetime(2024, 1, 1, 0, 0, 0))
++        assert r3 and isinstance(r3, str) and len(r3) > 0
++
++    def test_length(self) -> None:
++        """Revision is exactly 24 hex characters."""
++        memory_id = uuid4()
++        r1 = compute_revision(memory_id, datetime.now(UTC))
++        r2 = compute_revision(memory_id, None)
++
++        assert len(r1) == 24
++        assert len(r2) == 24
++        # Verify it's valid hex
++        int(r1, 16)
++        int(r2, 16)
++
++    def test_changes_when_updated_at_increments_by_1us(self) -> None:
++        """A 1 microsecond change in updated_at changes the revision."""
++        memory_id = uuid4()
++        base_dt = datetime(2024, 1, 15, 10, 30, 0, 0)
++        later_dt = base_dt + timedelta(microseconds=1)
++
++        r1 = compute_revision(memory_id, base_dt)
++        r2 = compute_revision(memory_id, later_dt)
++
++        assert r1 != r2
++
++    def test_differs_by_id(self) -> None:
++        """Different memory IDs produce different revisions."""
++        dt = datetime(2024, 1, 15, 10, 30, 0)
++        id1 = uuid4()
++        id2 = uuid4()
++
++        r1 = compute_revision(id1, dt)
++        r2 = compute_revision(id2, dt)
++
++        assert r1 != r2
++
++    def test_naive_datetime_treated_as_utc(self) -> None:
++        """Naive datetime is treated as UTC for consistent hashing."""
++        memory_id = uuid4()
++
++        # Same wall-clock time, one UTC-aware, one naive
++        utc_aware = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
++        naive = datetime(2024, 1, 15, 10, 30, 0)
++
++        r1 = compute_revision(memory_id, utc_aware)
++        r2 = compute_revision(memory_id, naive)
++
++        # They should be the same since naive is treated as UTC
++        assert r1 == r2
++
++    def test_none_treated_as_epoch(self) -> None:
++        """None updated_at is treated as epoch (0 microseconds)."""
++        memory_id = uuid4()
++
++        r_none = compute_revision(memory_id, None)
++        r_epoch = compute_revision(memory_id, datetime(1970, 1, 1, 0, 0, 0))
++
++        # None should give the same result as epoch
++        assert r_none == r_epoch
++
++    def test_microsecond_precision(self) -> None:
++        """Revision reflects microsecond precision in timestamp."""
++        memory_id = uuid4()
++        dt1 = datetime(2024, 1, 15, 10, 30, 0, 0)
++        dt2 = datetime(2024, 1, 15, 10, 30, 0, 1)  # +1 microsecond
++        dt3 = datetime(2024, 1, 15, 10, 30, 0, 1000)  # +1000 microseconds
++
++        r1 = compute_revision(memory_id, dt1)
++        r2 = compute_revision(memory_id, dt2)
++        r3 = compute_revision(memory_id, dt3)
++
++        assert r1 != r2
++        assert r1 != r3
++        assert r2 != r3
++
++
++class TestMemoryRecordRevision:
++    """Tests for MemoryRecord revision field and validator."""
++
++    @pytest.mark.asyncio
++    async def test_record_has_revision_field(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        """MemoryRecord has revision field."""
++        from mem_mcp.mcp.tools.get import MemoryRecord
++
++        record = MemoryRecord(
++            id=uuid4(),
++            content="test",
++            type="note",
++            tags=[],
++            metadata={},
++            version=1,
++            is_current=True,
++            supersedes=None,
++            superseded_by=None,
++            created_at=datetime.now(UTC),
++            updated_at=datetime.now(UTC),
++            deleted_at=None,
++            expires_at=None,
++            indexable=True,
++            embedding_status="complete",
++        )
++
++        assert hasattr(record, "revision")
++        assert record.revision  # non-empty
++
++    @pytest.mark.asyncio
++    async def test_revision_computed_when_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        """When revision is empty, it's computed from id and updated_at."""
++        from mem_mcp.mcp.tools.get import MemoryRecord
++
++        memory_id = uuid4()
++        updated_at = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
++
++        record = MemoryRecord(
++            id=memory_id,
++            content="test",
++            type="note",
++            tags=[],
++            metadata={},
++            version=1,
++            is_current=True,
++            supersedes=None,
++            superseded_by=None,
++            created_at=updated_at,
++            updated_at=updated_at,
++            deleted_at=None,
++            expires_at=None,
++            indexable=True,
++            embedding_status="complete",
++            revision="",  # Will be auto-computed
++        )
++
++        # revision should be auto-computed
++        expected = compute_revision(memory_id, updated_at)
++        assert record.revision == expected
++
++    @pytest.mark.asyncio
++    async def test_revision_in_model_dump(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        """revision is present in model_dump() output."""
++        from mem_mcp.mcp.tools.get import MemoryRecord
++
++        record = MemoryRecord(
++            id=uuid4(),
++            content="test",
++            type="note",
++            tags=[],
++            metadata={},
++            version=1,
++            is_current=True,
++            supersedes=None,
++            superseded_by=None,
++            created_at=datetime.now(UTC),
++            updated_at=datetime.now(UTC),
++            deleted_at=None,
++            expires_at=None,
++            indexable=True,
++            embedding_status="complete",
++        )
++
++        dumped = record.model_dump()
++        assert "revision" in dumped
++        assert dumped["revision"]  # non-empty
++
++    @pytest.mark.asyncio
++    async def test_build_from_old_fields_has_revision(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        """MemoryRecord(**existing_fields) works and includes non-empty revision."""
++        from mem_mcp.mcp.tools.get import MemoryRecord
++
++        memory_id = uuid4()
++        updated_at = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
++
++        # Simulate what would happen when unpacking a DB row (which doesn't have revision)
++        existing_fields = {
++            "id": memory_id,
++            "content": "test content",
++            "type": "note",
++            "tags": ["a", "b"],
++            "metadata": {},
++            "version": 1,
++            "is_current": True,
++            "supersedes": None,
++            "superseded_by": None,
++            "created_at": updated_at,
++            "updated_at": updated_at,
++            "deleted_at": None,
++            "expires_at": None,
++            "indexable": True,
++            "embedding_status": "complete",
++        }
++
++        record = MemoryRecord(**existing_fields)
++        assert record.revision  # Auto-computed from id + updated_at
++        expected = compute_revision(memory_id, updated_at)
++        assert record.revision == expected
++
++        dumped = record.model_dump()
++        assert dumped["revision"]
++
++    @pytest.mark.asyncio
++    async def test_existing_revision_preserved(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        """Explicitly provided revision is preserved."""
++        from mem_mcp.mcp.tools.get import MemoryRecord
++
++        memory_id = uuid4()
++        updated_at = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
++
++        record = MemoryRecord(
++            id=memory_id,
++            content="test",
++            type="note",
++            tags=[],
++            metadata={},
++            version=1,
++            is_current=True,
++            supersedes=None,
++            superseded_by=None,
++            created_at=updated_at,
++            updated_at=updated_at,
++            deleted_at=None,
++            expires_at=None,
++            indexable=True,
++            embedding_status="complete",
++            revision="custom-revision-string",
++        )
++
++        # Explicit revision is preserved
++        assert record.revision == "custom-revision-string"
++
++
++class TestMemoryUpdateRevisionIntegration:
++    """Integration tests for revision in memory_update tool (mock-based)."""
++
++    @pytest.mark.asyncio
++    async def test_stale_expected_revision_returns_conflict(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Stale expected_revision → -32000 / update_conflict / current_revision."""
++        from mem_mcp.mcp.tools._base import ToolContext
++        from mem_mcp.mcp.tools._deps import NoopAuditLogger, NoopQuotas, ToolDeps
++        from mem_mcp.mcp.tools.update import MemoryUpdateInput, MemoryUpdateTool
++
++        # Build a stub embeddings client
++        class _StubEmbeddings:
++            async def embed(self, text: str):
++                from mem_mcp.embeddings.bedrock import EmbedResult
++
++                return EmbedResult(vector=[0.1] * 1024, input_tokens=len(text.split()))
++
++        tool = MemoryUpdateTool()
++        ctx = ToolContext(
++            request_id="test-request",
++            tenant_id=uuid4(),
++            identity_id=uuid4(),
++            client_id="client-1",
++            scopes=frozenset(["memory.write"]),
++            db_pool=None,  # Will be patched
++            deps=ToolDeps(embeddings=_StubEmbeddings(), audit=NoopAuditLogger(), quotas=NoopQuotas()),
++        )
++
++        target_id = uuid4()
++        current_revision = compute_revision(target_id, datetime(2024, 1, 15, 10, 30, 0))
++        stale_revision = current_revision[:-4] + "0000"  # Deliberately stale
++
++        inp = MemoryUpdateInput(id=target_id, tags=["new-tag"], expected_revision=stale_revision)
++
++        conn = type("MockConn", (), {})()
++
++        async def fake_fetchrow(query: str, *args) -> dict:
++            # Return a current row with the current revision
++            return {
++                "id": target_id,
++                "type": "note",
++                "content": "old content",
++                "tags": [],
++                "metadata": {},
++                "deleted_at": None,
++                "is_current": True,
++                "updated_at": datetime(2024, 1, 15, 10, 30, 0),
++            }
++
++        conn.fetchrow = fake_fetchrow
++        conn.fetchval = None
++
++        # Patch tenant_tx
++        from contextlib import asynccontextmanager
++
++        @asynccontextmanager
++        async def fake_tx(pool, tenant_id):
++            yield conn
++
++        monkeypatch.setattr("mem_mcp.mcp.tools.update.tenant_tx", fake_tx)
++
++        # Should raise -32000 with update_conflict
++        from mem_mcp.mcp.errors import JsonRpcError
++
++        with pytest.raises(JsonRpcError) as exc:
++            await tool(ctx, inp)
++
++        assert exc.value.code == -32000
++        assert exc.value.data["code"] == "update_conflict"
++        assert exc.value.data["current_revision"] == current_revision
++        assert exc.value.data["current_id"] == str(target_id)
++
++    @pytest.mark.asyncio
++    async def test_matching_expected_revision_succeeds(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Matching expected_revision → success with revision in output."""
++        from mem_mcp.mcp.tools._base import ToolContext
++        from mem_mcp.mcp.tools._deps import NoopAuditLogger, NoopQuotas, ToolDeps
++        from mem_mcp.mcp.tools.update import MemoryUpdateInput, MemoryUpdateOutput, MemoryUpdateTool
++
++        # Build a stub embeddings client
++        class _StubEmbeddings:
++            async def embed(self, text: str):
++                from mem_mcp.embeddings.bedrock import EmbedResult
++
++                return EmbedResult(vector=[0.1] * 1024, input_tokens=len(text.split()))
++
++        tool = MemoryUpdateTool()
++        ctx = ToolContext(
++            request_id="test-request",
++            tenant_id=uuid4(),
++            identity_id=uuid4(),
++            client_id="client-1",
++            scopes=frozenset(["memory.write"]),
++            db_pool=None,
++            deps=ToolDeps(embeddings=_StubEmbeddings(), audit=NoopAuditLogger(), quotas=NoopQuotas()),
++        )
++
++        target_id = uuid4()
++        updated_at = datetime(2024, 1, 15, 10, 30, 0)
++        expected_revision = compute_revision(target_id, updated_at)
++
++        inp = MemoryUpdateInput(id=target_id, tags=["new-tag"], expected_revision=expected_revision)
++
++        conn = type("MockConn", (), {})()
++
++        async def fake_fetchrow(query: str, *args):
++            return {
++                "id": target_id,
++                "type": "note",
++                "content": "old content",
++                "tags": [],
++                "metadata": {},
++                "deleted_at": None,
++                "is_current": True,
++                "updated_at": updated_at,
++            }
++
++        conn.fetchrow = fake_fetchrow
++
++        async def fake_fetchval(*args):
++            return datetime(2024, 1, 15, 10, 30, 1)
++
++        conn.fetchval = fake_fetchval
++
++        # Patch tenant_tx
++        from contextlib import asynccontextmanager
++
++        @asynccontextmanager
++        async def fake_tx(pool, tenant_id):
++            yield conn
++
++        monkeypatch.setattr("mem_mcp.mcp.tools.update.tenant_tx", fake_tx)
++
++        output = await tool(ctx, inp)
++        assert isinstance(output, MemoryUpdateOutput)
++        assert output.id == target_id
++        assert output.revision  # non-empty
++        assert output.revision == compute_revision(target_id, datetime(2024, 1, 15, 10, 30, 1))
++
++    @pytest.mark.asyncio
++    async def test_is_current_false_returns_conflict(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """is_current=False target → -32000 / update_conflict with current_id."""
++        from mem_mcp.mcp.tools._base import ToolContext
++        from mem_mcp.mcp.tools._deps import NoopAuditLogger, NoopQuotas, ToolDeps
++        from mem_mcp.mcp.tools.update import MemoryUpdateInput, MemoryUpdateTool
++
++        # Build a stub embeddings client
++        class _StubEmbeddings:
++            async def embed(self, text: str):
++                from mem_mcp.embeddings.bedrock import EmbedResult
++
++                return EmbedResult(vector=[0.1] * 1024, input_tokens=len(text.split()))
++
++        tool = MemoryUpdateTool()
++        ctx = ToolContext(
++            request_id="test-request",
++            tenant_id=uuid4(),
++            identity_id=uuid4(),
++            client_id="client-1",
++            scopes=frozenset(["memory.write"]),
++            db_pool=None,
++            deps=ToolDeps(embeddings=_StubEmbeddings(), audit=NoopAuditLogger(), quotas=NoopQuotas()),
++        )
++
++        old_id = uuid4()
++        current_id = uuid4()
++        current_updated_at = datetime(2024, 1, 15, 10, 30, 0)
++
++        inp = MemoryUpdateInput(id=old_id, tags=["new-tag"])
++
++        conn = type("MockConn", (), {})()
++
++        fetch_count = 0
++
++        async def fake_fetchrow(query: str, *args):
++            nonlocal fetch_count
++            # First call: initial lookup returns superseded row
++            if fetch_count == 0:
++                fetch_count += 1
++                return {
++                    "id": old_id,
++                    "type": "note",
++                    "content": "old content",
++                    "tags": [],
++                    "metadata": {},
++                    "deleted_at": None,
++                    "is_current": False,
++                    "updated_at": datetime(2024, 1, 15, 10, 0, 0),
++                }
++            # Subsequent calls (for finding current) should return the current row
++            fetch_count += 1
++            if "supersedes" in query or "superseded" in query or "is_current" in query:
++                # The _find_current_version query
++                if "chain" in query:
++                    # Return the current row from the chain search
++                    return {"id": current_id}
++            # Fallback
++            return {
++                "id": current_id,
++                "updated_at": current_updated_at,
++            }
++
++        conn.fetchrow = fake_fetchrow
++        conn.fetchval = None
++        conn.execute = None
++
++        # Patch tenant_tx
++        from contextlib import asynccontextmanager
++
++        @asynccontextmanager
++        async def fake_tx(pool, tenant_id):
++            yield conn
++
++        monkeypatch.setattr("mem_mcp.mcp.tools.update.tenant_tx", fake_tx)
++
++        # Should raise -32000 with update_conflict
++        from mem_mcp.mcp.errors import JsonRpcError
++
++        with pytest.raises(JsonRpcError) as exc:
++            await tool(ctx, inp)
++
++        assert exc.value.code == -32000
++        assert exc.value.data["code"] == "update_conflict"
++        # The current_id should be the current version in the chain
++        assert exc.value.data["current_id"] is not None

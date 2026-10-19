@@ -1,0 +1,11 @@
+{
+  "key": "wp1-t2-peer",
+  "status": "ok",
+  "compactions": 0,
+  "rc": 0,
+  "session_id": "f5276935-9d9e-4596-9985-3dc2f2dc8e42",
+  "wall_s": 30,
+  "ctx_max": 36502,
+  "result": "VERDICT: ISSUES\n1. `src/mem_mcp/mindmap/workflow_crud.py:366-380`: `remap_workflow_stages` only matches rows with `current_stage = m.old_stage`. Legacy work items have `current_stage` NULL, because migration 0048 does no backfill and a NULL stage resolves to the legacy workflow. Their position lives in `status`. A remap like `{\"todo\": \"open\"}` therefore skips every un-migrated item, and the returned count understates the work. The test at `test_workflow_crud.py:336` asserts that a NULL-stage item is left untouched, which locks this in without covering the legacy `status` case.\n2. `src/mem_mcp/mindmap/workflow_crud.py:370`: the remap also sets `workflow_id = $3` on each moved item and writes no `work_item_history` row. The plan and acceptance only call for updating `current_stage`. This unrequested side effect changes which workflow those items belong to. The plan doesn't say it is wanted.\n3. `src/mem_mcp/mindmap/workflow_crud.py:259-276`: two concurrent activations of different workflows for one team can raise a raw `asyncpg.UniqueViolationError` from `team_workflows_active_per_team`. That breaks the promise that these functions raise only `WorkflowError` subclasses. The `FOR UPDATE` locks only the target row, not the team. No test covers concurrent activation.\n4. Test gaps in `tests/unit/mindmap/test_workflow_crud.py`: I found no test of `allowed_kinds` validation, `StageNotFoundError` from `create_team_workflow` for unknown transition stages, or `WorkflowAlreadyActiveError`/not-found on activate. I could not run pytest, ruff, mypy or `lint_tenant_scope.py` here because the shell needed approval. I reviewed the code statically only.",
+  "stderr_tail": ""
+}

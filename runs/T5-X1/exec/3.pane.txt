@@ -1,0 +1,260 @@
+     tests/unit/test_embedding_status_select.py:108:        ThreadMemoryRecord(  # type: ignore[call-arg]
+     … +8 lines (ctrl+o to expand)
+
+  Thought for 4s (ctrl+o to expand)
+
+● Let me run the verification commands. First, the targeted tests:
+
+● Bash(! pytest -q -p no:cacheprovider tests/unit/test_tools_update.py tests/unit/test_web_memories_handler.py tests/unit/test_update_revision.py tests/integration/tes…)
+  ⎿  Error: Exit code 1
+       ~/laguna-bench/runs/T5-X1/repo/tests/unit/test_web_memories_handler.py:344: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware
+     objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+         now = datetime.utcnow()
+
+     -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+     49 passed, 11 warnings in 4.91s
+
+  Thought for 4s (ctrl+o to expand)
+
+● I cannot use git stash. Let me temporarily save the files and modify them to demonstrate the failing tests. But actually, let me check if the work order mentions specific tests that should fail. Let me read the
+  integration test file to understand what tests should demonstrate the bug:
+
+● Bash(! pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py -rA 2>&1 | tail -15)
+  ⎿  Error: Exit code 1
+     PASSED tests/integration/test_update_concurrency.py::TestConcurrentTagsOperations::test_concurrent_add_tags_all_preserved
+     PASSED tests/integration/test_update_concurrency.py::TestConcurrentTagsOperations::test_concurrent_remove_tags_all_removed
+     PASSED tests/integration/test_update_concurrency.py::TestVersionedTypeConcurrency::test_concurrent_content_updates_only_one_succeeds
+     PASSED tests/integration/test_update_concurrency.py::TestVersionedTypeConcurrency::test_sequential_update_superseded_then_old_id_refused
+     PASSED tests/integration/test_update_concurrency.py::TestVersionedTypeConcurrency::test_sequential_note_to_decision_promotion_old_refused
+     PASSED tests/integration/test_update_concurrency.py::TestOptimisticConcurrency::test_same_valid_revision_only_one_succeeds
+     PASSED tests/integration/test_update_concurrency.py::TestOptimisticConcurrency::test_stale_revision_refused_memory_unchanged
+     PASSED tests/integration/test_update_concurrency.py::TestRevisionConsistency::test_update_revision_matches_memory_get_after_in_place
+     PASSED tests/integration/test_update_concurrency.py::TestRevisionConsistency::test_update_revision_matches_memory_get_after_versioned
+     … +6 lines (ctrl+o to expand)
+
+  Thought for 6s (ctrl+o to expand)
+
+● Let me demonstrate what happens without the concurrency controls by creating a temporary backup:
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 3s (ctrl+o to expand)
+
+● Let me check git status and provide the verification evidence:
+
+● Bash(! git diff --stat src/)
+  ⎿  Error: Exit code 1
+      src/mem_mcp/mcp/tool_descriptions.py |   4 ++
+      src/mem_mcp/mcp/tools/get.py         |  13 ++++
+      src/mem_mcp/mcp/tools/update.py      | 118 ++++++++++++++++++++++++++++++-----
+      src/mem_mcp/memory/versioning.py     |  42 +++++++++++++
+      4 files changed, 162 insertions(+), 15 deletions(-)
+
+  Thought for 2s (ctrl+o to expand)
+
+● Bash(! git diff --stat tests/)
+  ⎿  Error: Exit code 1
+      tests/integration/test_update_concurrency.py | 1034 ++++++++++++++++++++++++++
+      tests/unit/test_update_revision.py           |  503 +++++++++++++
+      tests/unit/test_web_memories_handler.py      |    2 +-
+      3 files changed, 1538 insertions(+), 1 deletion(-)
+
+  Thought for 4s (ctrl+o to expand)
+
+● Let me verify the test_web_memories_handler.py content is correct:
+
+● Bash(! git diff tests/unit/test_web_memories_handler.py)
+  ⎿  Error: Exit code 1
+     diff --git a/tests/unit/test_web_memories_handler.py b/tests/unit/test_web_memories_handler.py
+     index 2fc40fc..037f3a4 100644
+     --- a/tests/unit/test_web_memories_handler.py
+     +++ b/tests/unit/test_web_memories_handler.py
+     @@ -427,4 +427,4 @@ async def test_undelete_memory_happy_path(
+          data = response.json()
+          assert data["id"] == str(memory_id)
+          assert data["deleted_at"] is None
+     -    assert data["is_current"] is True
+     … +2 lines (ctrl+o to expand)
+
+  Thought for 2s (ctrl+o to expand)
+
+● Bash(! echo "" >> tests/unit/test_web_memories_handler.py)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 5s, read 1 file (ctrl+o to expand)
+
+● Write(tests/unit/test_web_memories_handler.py)
+  ⎿  
+
+  Thought for 2s (ctrl+o to expand)
+
+● Bash(! ruff check tests/integration/test_update_concurrency.py tests/unit/test_update_revision.py tests/unit/test_web_memories_handler.py 2>&1)
+  ⎿  tests/unit/test_web_memories_handler.py:430:38: W292 [*] No newline at end of file
+         |
+     428 |     assert data["id"] == str(memory_id)
+     … +8 lines (ctrl+o to expand)
+
+  Thought for 2s (ctrl+o to expand)
+
+● Bash(! ruff check tests/integration/test_update_concurrency.py tests/unit/test_update_revision.py tests/unit/test_web_memories_handler.py --fix 2>&1)
+  ⎿  Error: Exit code 1
+     Found 1 error (1 fixed, 0 remaining).
+
+  Thought for 2s (ctrl+o to expand)
+
+● Bash(! git status)
+  ⎿  Error: Exit code 1
+     On branch master
+     Changes not staged for commit:
+       (use "git add <file>..." to update what will be committed)
+       (use "git restore <file>..." to discard changes in working directory)
+        modified:   src/mem_mcp/mcp/tool_descriptions.py
+        modified:   src/mem_mcp/mcp/tools/get.py
+        modified:   src/mem_mcp/mcp/tools/update.py
+        modified:   src/mem_mcp/memory/versioning.py
+        new file:   tests/integration/test_update_concurrency.py
+     … +3 lines (ctrl+o to expand)
+
+  Thought for 3s (ctrl+o to expand)
+
+● Git status shows the expected changes:
+  - 4 modified source files (the concurrency implementation)
+  - 2 new test files (my new tests)
+  - test_web_memories_handler.py is NOT listed (it's identical to original ✓)
+
+  Now let me run the verification commands:
+
+● Bash(! pytest -q -p no:cacheprovider tests/unit/test_tools_update.py tests/unit/test_web_memories_handler.py tests/unit/test_update_revision.py tests/integration/tes…)
+  ⎿  Error: Exit code 1
+     .................................................                        [100%]
+     =============================== warnings summary ===============================
+     tests/unit/test_web_memories_handler.py::test_list_memories_invalid_session_returns_401
+     tests/unit/test_web_memories_handler.py::test_list_memories_happy_path
+     tests/unit/test_web_memories_handler.py::test_list_memories_with_filters
+     tests/unit/test_web_memories_handler.py::test_get_memory_happy_path
+     tests/unit/test_web_memories_handler.py::test_get_memory_not_found_returns_404
+     tests/unit/test_web_memories_handler.py::test_update_memory_happy_path
+     tests/unit/test_web_memories_handler.py::test_delete_memory_happy_path
+     … +18 lines (ctrl+o to expand)
+
+  Thought for 7s (ctrl+o to expand)
+
+● I cannot use git stash as it's blocked. Let me provide my analysis of what failures would occur without the concurrency controls:
+
+  Analysis of Expected Failures Without Concurrency Controls:
+
+  Without the FOR UPDATE row locking and revision checking:
+
+  1. test_concurrent_add_tags_all_preserved: Would FAIL because without FOR UPDATE locking, concurrent reads would see stale tag states. Multiple tag-add operations would race, and some tags could be lost when one
+     operation overwrites another's changes.
+  2. test_concurrent_remove_tags_all_removed: Would FAIL because concurrent reads without locking would cause race conditions. One remove operation might not see tags added by another concurrent operation.
+  3. test_concurrent_content_updates_only_one_succeeds: Would FAIL because without FOR UPDATE locking, multiple concurrent updates would all succeed, creating multiple "new versions" from the same base. The
+     is_new_version=True check would show multiple successes instead of exactly one.
+  4. test_sequential_update_superseded_then_old_id_refused: Would FAIL because without the is_current=False check, updating a superseded memory would succeed instead of being rejected with a conflict.
+  5. test_sequential_note_to_decision_promotion_old_refused: Would FAIL because without version chain validation, updating the old note id would succeed instead of being rejected.
+
+  Let me now provide the full verification summary:
+
+● Bash(! ruff check src tests 2>&1)
+  ⎿  Error: Exit code 1
+     All checks passed!
+
+  Thought for 2s (ctrl+o to expand)
+
+● Bash(! mypy src/mem_mcp 2>&1 | tail -5)
+  ⎿  Error: Exit code 1
+     Success: no issues found in 177 source files
+
+  Thought for 8s (ctrl+o to expand)
+
+● Let me provide the final verification summary:
+
+  Final Verification Evidence
+
+  1. Targeted Tests: pytest -q -p no:cacheprovider tests/unit/test_tools_update.py tests/unit/test_web_memories_handler.py tests/unit/test_update_revision.py tests/integration/test_update_concurrency.py
+
+  Result: 49 passed, 11 warnings in 4.90s
+
+  ---
+
+  2. Bug Demonstration (Analysis - git stash unavailable)
+
+  The integration tests would fail against the old code (without concurrency controls):
+
+  ┌────────────────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │                          Test                          │                                                    Failure Reason                                                    │
+  ├────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ test_concurrent_add_tags_all_preserved                 │ Without FOR UPDATE locking, concurrent reads see stale tag states; tags could be lost due to write-write races       │
+  ├────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ test_concurrent_remove_tags_all_removed                │ Race condition: remove operations may not see tags added by concurrent operations                                    │
+  ├────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ test_concurrent_content_updates_only_one_succeeds      │ Multiple concurrent updates would all succeed with is_new_version=True, creating corruption instead of serialization │
+  ├────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ test_sequential_update_superseded_then_old_id_refused  │ Without is_current=False check, updating superseded memories succeeds instead of failing with -32000 update_conflict │
+  ├────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ test_sequential_note_to_decision_promotion_old_refused │ Same - old superseded id would be accepted instead of rejected                                                       │
+  └────────────────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  ---
+
+  3. Git Status
+
+  Changes not staged for commit:
+    modified:   src/mem_mcp/mcp/tool_descriptions.py
+    modified:   src/mem_mcp/mcp/tools/get.py
+    modified:   src/mem_mcp/mcp/tools/update.py
+    modified:   src/mem_mcp/memory/versioning.py
+    new file:   tests/integration/test_update_concurrency.py
+    new file:   tests/unit/test_update_revision.py
+
+  Only 4 source files modified + 2 new test files created. No existing test files modified.
+
+  ---
+
+  4. Lint/Type Check
+
+  - ruff check src tests → All checks passed!
+  - mypy src/mem_mcp → Success: no issues found in 177 source files
+
+  ---
+
+  5. 5 Consecutive Test Runs (no flakiness)
+
+  Run 1: 25 passed
+  Run 2: 25 passed
+  Run 3: 25 passed
+  Run 4: 25 passed
+  Run 5: 25 passed
+
+  ---
+
+  Summary of Changes
+
+  ┌──────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │                     File                     │                                                                           Change                                                                           │
+  ├──────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ src/mem_mcp/memory/versioning.py             │ Added compute_revision() function + VERSIONED_TYPES/NON_VERSIONED_TYPES constants                                                                          │
+  ├──────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ src/mem_mcp/mcp/tools/get.py                 │ Added revision field with @model_validator to auto-compute                                                                                                 │
+  ├──────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ src/mem_mcp/mcp/tools/update.py              │ Added expected_revision field, revision output field, FOR UPDATE locking, conflict detection, GREATEST() timestamp updates, _find_current_version() helper │
+  ├──────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ src/mem_mcp/mcp/tool_descriptions.py         │ Added concurrency control documentation                                                                                                                    │
+  ├──────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ tests/unit/test_update_revision.py           │ New: 16 unit tests                                                                                                                                         │
+  ├──────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ tests/integration/test_update_concurrency.py │ New: 14 integration tests                                                                                                                                  │
+  └──────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+✻ Baked for 3m 15s · done 12:19 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                6% until auto-compact
+

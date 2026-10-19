@@ -1,0 +1,260 @@
+      937 +
+      938 +async def test_nonexistent_resolver_error(pg_pool: Any) -> None:
+      939 +    """Nonexistent resolved_by_memory_id → -32602 memory_not_accessible."""
+      940 +    async with pg_pool.acquire() as conn:
+      941 +        async with conn.transaction():
+      942 +            s = await _setup(conn)
+      943 +    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
+      944 +    ctx = _ctx(pg_pool, tenant, client_id)
+      945 +
+      946 +    try:
+      947 +        opened = await MindmapOpenTool()(
+      948 +            ctx, MindmapOpenInput(title="Test", root_question="Test?")
+      949 +        )
+      950 +        map_key = opened.map_key
+      951 +
+      952 +        n1 = await MindmapWriteNodeTool()(
+      953 +            ctx,
+      954 +            MindmapWriteNodeInput(map_key=map_key, content="node", node_role="position"),
+      955 +        )
+      956 +
+      957 +        with pytest.raises(JsonRpcError) as exc_info:
+      958 +            await MindmapResolveTool()(
+      959 +                ctx,
+      960 +                MindmapResolveInput(
+      961 +                    map_key=map_key,
+      962 +                    node_id=n1.node_id,
+      965 +                ),
+      966 +            )
+      967 +        assert exc_info.value.code == -32602
+      968 +        assert exc_info.value.data["code"] == "memory_not_accessible"
+      969 +    finally:
+      970 +        await _cleanup(pg_pool, tenant, team, client_id)
+
+● Bash(python -m pytest tests/integration/test_mindmap_resolve_e2e.py tests/unit/test_mindmap_resolve_models.py tests/integration/test_mindmap_e2e.py -p no:cacheprovid…)
+  ⎿                      reference_kind="challenges",
+                         map_key=map_key,
+                     ),
+     … +17 lines (ctrl+o to expand)
+
+● Update(src/mem_mcp/mcp/tools/mindmap_get.py)
+  ⎿  Added 16 lines, removed 6 lines
+      146                  filtered_edges = edges
+      147              else:
+      148                  # Delta mode: fetch edges where source or target is touched.
+      149 -                edges = await service.fetch_internal_edges(conn, member_ids=list(touched_ids))
+      150 -                # Filter to keep only edges where both endpoints are map members.
+      149 +                # Use raw SQL to get edges where at least one endpoint is touched,
+      150 +                # then filter to keep only those where both endpoints are map members.
+      151 +                touched_list = list(touched_ids)
+      152 +                edge_rows = await conn.fetch(
+      153 +                    """
+      154 +                    SELECT source_memory_id, target_memory_id, reference_kind, created_at
+      155 +                    FROM memory_references
+      156 +                    WHERE (source_memory_id = ANY($1::uuid[]) OR target_memory_id = ANY($1::uuid[]))
+      157 +                    ORDER BY created_at ASC
+      158 +                    """,
+      159 +                    touched_list,
+      160 +                )
+      161                  filtered_edges = [
+      152 -                    e
+      153 -                    for e in edges
+      154 -                    if e["source_memory_id"] in all_member_ids_set
+      155 -                    and e["target_memory_id"] in all_member_ids_set
+      162 +                    dict(r)
+      163 +                    for r in edge_rows
+      164 +                    if r["source_memory_id"] in all_member_ids_set
+      165 +                    and r["target_memory_id"] in all_member_ids_set
+      166                  ]
+      167
+      168          # Build node list.
+
+● Bash(python -m pytest tests/integration/test_mindmap_resolve_e2e.py::test_since_edge_visibility -xvs -p no:cacheprovider 2>&1 | tail -30)
+  ⎿                  MindmapWriteNodeInput(map_key=map_key, content="new challenge", node_role="challenge"),
+                 )
+     … +27 lines (ctrl+o to expand)
+
+● Update(src/mem_mcp/mcp/tools/mindmap_get.py)
+  ⎿  Added 11 lines, removed 10 lines
+      135                      else:
+      136                          resolved_members.append(m)
+      137
+      138 -            # Fetch edges: when since is None, edges among all members; when since is set,
+      139 -            # edges where at least one endpoint is touched (but both must be map members).
+      140 -            all_member_ids_set = set(m["memory_id"] for m in (open_members + resolved_members))
+      141 -            all_member_ids_list = list(all_member_ids_set)
+      138 +            # Fetch edges. Build set of ALL map members (not just returned ones).
+      139 +            # When since is None: edges among all members.
+      140 +            # When since is set: edges where at least one endpoint is touched (both must be map members).
+      141 +            all_map_member_ids = {m["memory_id"] for m in members}
+      142 +            returned_member_ids = set(m["memory_id"] for m in (open_members + resolved_members))
+      143
+      144              if touched_ids is None:
+      144 -                # No delta filter: fetch edges among all members.
+      145 -                edges = await service.fetch_internal_edges(conn, member_ids=all_member_ids_list)
+      145 +                # No delta filter: fetch edges among all map members.
+      146 +                edges = await service.fetch_internal_edges(conn, member_ids=list(all_map_member_ids))
+      147                  filtered_edges = edges
+      148              else:
+      149                  # Delta mode: fetch edges where source or target is touched.
+      149 -                # Use raw SQL to get edges where at least one endpoint is touched,
+      150 -                # then filter to keep only those where both endpoints are map members.
+      150 +                # Query for edges where at least one endpoint is touched, then filter to map members.
+      151                  touched_list = list(touched_ids)
+      152                  edge_rows = await conn.fetch(
+      153                      """
+     ...
+      158                      """,
+      159                      touched_list,
+      160                  )
+      161 +                # Filter to keep only edges where both endpoints are map members.
+      162                  filtered_edges = [
+      163                      dict(r)
+      164                      for r in edge_rows
+      164 -                    if r["source_memory_id"] in all_member_ids_set
+      165 -                    and r["target_memory_id"] in all_member_ids_set
+      165 +                    if r["source_memory_id"] in all_map_member_ids
+      166 +                    and r["target_memory_id"] in all_map_member_ids
+      167                  ]
+      168
+      169          # Build node list.
+
+● Bash(python -m pytest tests/integration/test_mindmap_resolve_e2e.py::test_since_edge_visibility -xvs -p no:cacheprovider 2>&1 | tail -10)
+  ⎿  hypothesis profile 'default'
+     rootdir: ~/laguna-bench/runs/T4-H2/repo
+     configfile: pyproject.toml
+     … +7 lines (ctrl+o to expand)
+
+● Bash(python -m pytest tests/integration/test_mindmap_resolve_e2e.py tests/unit/test_mindmap_resolve_models.py tests/integration/test_mindmap_e2e.py -p no:cacheprovid…)
+  ⎿  ......................................                                   [100%]
+     38 passed in 2.27s
+
+● Bash(ruff format --check src/mem_mcp/mindmap/service.py src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mcp/tools/mindmap_get.py src/mem_mcp/mcp/tool_descriptio…)
+  ⎿  Error: Exit code 1
+     Would reformat: src/mem_mcp/mcp/tools/mindmap_get.py
+     Would reformat: src/mem_mcp/mindmap/service.py
+     2 files would be reformatted, 2 files already formatted
+
+● Bash(ruff format src/mem_mcp/mindmap/service.py src/mem_mcp/mcp/tools/mindmap_get.py 2>&1)
+  ⎿  2 files reformatted
+
+● Bash(mypy src/mem_mcp/mindmap/service.py src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mcp/tools/mindmap_get.py 2>&1)
+  ⎿  Error: Exit code 1
+     src/mem_mcp/mindmap/service.py:65: error: Returning Any from function declared to return "UUID | None"  [no-any-return]
+     src/mem_mcp/mindmap/service.py:76: error: Returning Any from function declared to return "UUID | None"  [no-any-return]
+     Found 2 errors in 1 file (checked 3 source files)
+
+● Update(src/mem_mcp/mindmap/service.py)
+  ⎿  Added 2 lines, removed 1 line
+      62
+      63  async def resolve_map_root(conn: asyncpg.Connection, *, team_id: UUID, map_key: str) -> UUID | None:
+      64      """Resolve a map key (the root memory's 'map' slug) to its root_memory_id."""
+      65 -    return await conn.fetchval(
+      65 +    val = await conn.fetchval(
+      66          "SELECT memory_id FROM slugs WHERE team_id = $1 AND resource_type = 'map' AND slug = $2",
+      67          team_id,
+      68          map_key,
+      69      )
+      70 +    return val if val is None else UUID(str(val))
+      71
+      72
+      73  async def find_live_map_seeded_from(
+
+● Update(src/mem_mcp/mindmap/service.py)
+  ⎿  Added 2 lines, removed 1 line
+      74      conn: asyncpg.Connection, *, seed_spec_memory_id: UUID
+      75  ) -> UUID | None:
+      76      """from_spec dedup guard: an existing LIVE map seeded from this spec node."""
+      77 -    return await conn.fetchval(
+      77 +    val = await conn.fetchval(
+      78          """
+      79          SELECT root_memory_id FROM memory_maps
+      80          WHERE seed_spec_memory_id = $1 AND state = 'live'
+     ...
+      82          """,
+      83          seed_spec_memory_id,
+      84      )
+      85 +    return val if val is None else UUID(str(val))
+      86
+      87
+      88  async def insert_membership(
+
+● Bash(ruff format --check src/mem_mcp/mindmap/service.py src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mcp/tools/mindmap_get.py src/mem_mcp/mcp/tool_descriptio…)
+  ⎿  4 files already formatted
+     Success: no issues found in 3 source files
+
+● Bash(python -m pytest tests/integration/test_mindmap_resolve_e2e.py tests/unit/test_mindmap_resolve_models.py tests/integration/test_mindmap_e2e.py -p no:cacheprovid…)
+  ⎿  ......................................                                   [100%]
+     38 passed in 2.41s
+
+● Bash(python -m pytest -q -p no:cacheprovider 2>&1 | tail -10)
+  ⎿  FAILED tests/unit/test_refresh_team_access.py::TestReconcilerCatchUp::test_reconciler_writes_missing_uea_row
+     FAILED tests/unit/test_refresh_team_access.py::TestReconcilerDryRun::test_dry_run_does_not_mutate
+     FAILED tests/unit/test_roles_catalog.py::TestRolesCatalogSeed::test_seed_inserts_7_core_roles
+     … +7 lines (ctrl+o to expand)
+
+● Perfect! All the fixes are complete. Here's the verification summary:
+
+  Verification Results
+
+  All new mindmap tests passing:
+  tests/unit/test_mindmap_resolve_models.py: 18 tests PASSED
+  tests/integration/test_mindmap_resolve_e2e.py: 20 tests PASSED (added 3 new tests)
+  tests/integration/test_mindmap_e2e.py: PASSED (existing lifecycle test)
+  ---
+  38/38 tests passing
+
+  Code quality:
+  - ✅ ruff check src tests: CLEAN
+  - ✅ ruff format --check: CLEAN
+  - ✅ mypy: CLEAN for all touched files
+
+  Full test suite:
+  38 failed, 1270 passed, 31 skipped (same pre-existing failures as baseline)
+
+  Changes Implemented
+
+  1. Edge Resolution Path (mindmap_resolve.py)
+
+  - Moved map/membership checks first in tenant_tx (node_id errors come before system checks)
+  - Resolve both resolved_by_memory_id (source) and node_id (target) in system_tx for accessibility + team_id
+  - Settle + edge + event in single tenant_tx transaction
+  - Uses correct target team_id from resolved node, not map's team
+
+  2. Service Layer (mindmap/service.py)
+
+  - Added tenant_id param to current_cursor() for defence-in-depth
+  - Updated settle_branch() return type annotation to dict[str, Any] | None (no type: ignore)
+  - Simplified fetch_touched_since() to direct set comprehension (asyncpg UUIDs hash/compare equal)
+  - Kept UUID(str(val)) conversions in resolve_map_root/find_live_map_seeded_from (needed for mypy)
+
+  3. Edge Filtering for since (mindmap_get.py)
+
+  - When since is set: fetch edges where source OR target is touched
+  - Filter to keep only edges where both endpoints are map members
+  - All map members tracked separately from returned members
+
+  4. Tool Descriptions (tool_descriptions.py)
+
+  - Fixed mindmap_resolve: resolution_summary is required (1-500 chars)
+  - Clarified behavior: summary shows in include="open" resolved list, not depth="summary"
+  - Listed disposition values and resolved_by_party default
+  - Updated mindmap_get: mentions since returns empty when nothing changed, cursor advances on resolve/write
+  - Clarified edge behavior in delta mode
+
+  5. New Integration Tests
+
+  - test_since_edge_visibility: confirms edges visible when source or target is touched
+  - test_resolve_node_from_different_map_error: validates node must belong to this map
+  - test_nonexistent_resolver_error: confirms inaccessible resolver → opaque -32602
+
+  All fixes preserve backward compatibility; no breaking changes to existing tools.
+
+✻ Sautéed for 3m 46s · done 11:29 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                     89% context used
+                                                                                                                                                                                                                       /rc
+

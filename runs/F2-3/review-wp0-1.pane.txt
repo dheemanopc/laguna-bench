@@ -1,0 +1,68 @@
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   ~/laguna-bench/runs/F2-3/repo
+
+
+❯ You are the ARCHITECT supervising an engineer who does all of the work on the feature below. This is the wp0 gate
+  (round 1). Review: the implementation of WP0 (see ~/laguna-bench/runs/F2-3/repo/docs/feature/03-plan.md and the code changes): does it deliver its planned scope and tests, is it correct, does it follow the
+  codebase's conventions? The harness gate output is in ~/laguna-bench/runs/F2-3/orders/gates-wp0-1.md (authoritative).
+  Read as much as you need (the repository at ~/laguna-bench/runs/F2-3/repo, the engineer's documents under ~/laguna-bench/runs/F2-3/repo/docs/feature, earlier reviews and
+  orders in ~/laguna-bench/runs/F2-3/orders). Judge against the REQUEST, the existing codebase and its conventions. Spend your effort READING;
+  keep your OUTPUT SHORT. Write to ~/laguna-bench/runs/F2-3/orders/review-wp0-1.md — first line exactly "VERDICT: APPROVE" or "VERDICT: REVISE", then at most 5
+  numbered findings, most important first, each one line with evidence (file:line, doc section or gate line). Hard cap 250
+  words. APPROVE only if the stage is good enough to build on; minor nits go in findings without blocking. No code, no
+  rewrites, no praise. Then end your turn.
+
+  === REQUEST ===
+  F2 — Team workflows for work items (real feature, from Anand's backlog)
+
+  Raw product idea (as written in the backlog — not yet a spec):
+
+  > Mind-map work items exist now, but every team works differently. A team should be able to define
+  > its own workflow — the stages a work item moves through, which moves are allowed, and what a move
+  > needs before it happens (for example a reason, or sign-off from someone other than the owner,
+  > possibly from more than one person). Items should never get stuck or lose their history when a
+  > team changes its workflow. People need to see and move their team's work on a board in the web
+  > app, see why a move is blocked, and see what is waiting on them. Agents must be able to do the
+  > same through the MCP tools.
+
+  Context: work items were added recently (migrations 0046/0047, src/mem_mcp/mindmap/, the work-item
+  MCP tools). Mind maps are described in docs/mindmap-v1-build-design.md and the ADRs; the web app is under web/.
+  Follow the existing patterns of this codebase.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_01PgAJ4mgP6216aj4oZDG1ji
+
+  Searched for 3 patterns, read 4 files (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/F2-3/orders/review-wp0-1.md)
+  ⎿  Wrote 7 lines to ../orders/review-wp0-1.md
+      1 VERDICT: REVISE
+      2
+        t (WP1), and teams created after the migration get no pointer (hooks are WP3). This breaks the plan's promise that WP0 "ships idempotently alone" (plan:103). Fix: leave the column nullable until WP1 stamps
+         it, or add a DB default/trigger that resolves the team's live version and seeds a missing pointer. The existing e2e suite must be green again.
+      4 2. None of the planned WP0 tests exist. `tests/integration/test_mindmap_workflows_migration.py` (plan:115-150) is missing all 7 tests: seed, back-fill, CHECK dropped, change_type relaxed, INSERT-only under
+        es on (the B-moves-A's-item case).
+      5 3. `downgrade()` fails as written: it drops `team_workflow_versions` (0048:463) while the `work_items.workflow_id` FK still references it. The column is only dropped later (0048:473). Drop the column first
+        .
+      7 5. Nothing makes `team_workflow_versions` actually frozen. RLS has no UPDATE policy, but `mem_app` has no DELETE/UPDATE grant either, so it's fine for now. The plan's "cannot UPDATE" test (plan:131-134) is
+         what proves this, and it's still unwritten (see 2).
+     … +2 lines (ctrl+o to expand)
+
+● I've written the review to ~/laguna-bench/runs/F2-3/orders/review-wp0-1.md. The verdict is REVISE: WP0 can't be built on yet.
+
+  1. It breaks the existing test suite. The harness gate shows 56 new failures, including every work-item e2e test. The migration makes work_items.workflow_id required (0048:289), but nothing fills it in yet: that comes
+     in WP1, and the team-creation hooks that set up a default workflow come in WP3. The plan says WP0 must work on its own, so the column needs to stay optional until WP1, or get a database-side default.
+  2. None of the planned WP0 tests exist. All seven tests planned for test_mindmap_workflows_migration.py (plan:115-150) are missing. The only test file added is test_workflow_visibility.py, which is WP3's. It also skips
+     the key case the plan is built around: one tenant moving another tenant's item in a shared team.
+  3. The downgrade fails. It drops the workflow-versions table (0048:463) while work_items.workflow_id still references it; the column is only dropped later (0048:473).
+  4. The new column contradicts itself. It is declared ON DELETE SET NULL (0048:220) but also made NOT NULL (0048:289). It should use RESTRICT, like the other version references.
+  5. Minor, not blocking: the frozen-versions guarantee is untested. The database permissions stop the app from changing workflow versions today. But the planned test that proves it (plan:131-134) is one of the missing
+     ones.
+
+✻ Cooked for 36s · done 11:13 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

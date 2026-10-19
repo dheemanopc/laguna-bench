@@ -1,0 +1,260 @@
+      13 -from mem_mcp.teams.references import get_inbound_refs
+      13 +from mem_mcp.teams.references import caller_can_access_memory, get_inbound_refs
+      14
+      15
+      16  class RefsInInput(BaseModel):
+     ...
+      45          async with system_tx(ctx.db_pool) as conn:
+      46              raw = await get_inbound_refs(conn, target_memory_id=inp.memory_id)
+      47
+      48 -            # Filter by caller access to each source's team
+      48 +            # Filter by caller access to each source memory — owner OR team-access.
+      49              accessible: list[InboundRef] = []
+      50              inaccessible_count = 0
+      51              for r in raw:
+      52 -                # Look up source's team
+      53 -                src_team = await conn.fetchval(
+      54 -                    "SELECT team_id FROM memories WHERE id = $1", r["source_memory_id"]
+      55 -                )
+      56 -                if src_team is None:
+      57 -                    inaccessible_count += 1
+      58 -                    continue
+      59 -                access = await conn.fetchval(
+      60 -                    "SELECT 1 FROM user_effective_team_access "
+      61 -                    "WHERE user_id = $1 AND resource_team_id = $2",
+      62 -                    ctx.tenant_id,
+      63 -                    src_team,
+      64 -                )
+      65 -                if access is None:
+      66 -                    inaccessible_count += 1
+      67 -                    continue
+      68 -                accessible.append(
+      69 -                    InboundRef(
+      70 -                        source_memory_id=str(r["source_memory_id"]),
+      71 -                        target_memory_id=str(r["target_memory_id"]),
+      72 -                        target_team_id=str(r["target_team_id"]),
+      73 -                        target_fragment=r["target_fragment"],
+      74 -                        reference_kind=r["reference_kind"],
+      75 -                        refs_version=r["refs_version"],
+      52 +                if await caller_can_access_memory(
+      53 +                    conn,
+      54 +                    memory_id=r["source_memory_id"],
+      55 +                    caller_user_id=ctx.tenant_id,
+      56 +                    include_deleted=True,
+      57 +                ):
+      58 +                    accessible.append(
+      59 +                        InboundRef(
+      60 +                            source_memory_id=str(r["source_memory_id"]),
+      61 +                            target_memory_id=str(r["target_memory_id"]),
+      62 +                            target_team_id=str(r["target_team_id"]),
+      63 +                            target_fragment=r["target_fragment"],
+      64 +                            reference_kind=r["reference_kind"],
+      65 +                            refs_version=r["refs_version"],
+      66 +                        )
+      67                      )
+      77 -                )
+      68 +                else:
+      69 +                    inaccessible_count += 1
+      70
+      71          return RefsInOutput(
+      72              accessible_count=len(accessible),
+
+● Write(src/mem_mcp/mcp/tools/refs_out.py)
+  ⎿  Added 23 lines, removed 20 lines
+      10  from mem_mcp.db import system_tx
+      11  from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+      12  from mem_mcp.mcp.tools._base import BaseTool, ToolContext
+      13 -from mem_mcp.teams.references import get_outbound_refs
+      13 +from mem_mcp.teams.references import caller_can_access_memory, get_outbound_refs
+      14
+      15
+      16  class RefsOutInput(BaseModel):
+     ...
+      41      OutputModel: ClassVar[type[BaseModel]] = RefsOutOutput
+      42
+      43      async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
+      44 -        assert isinstance(inp, RefsInInput)
+      44 +        assert isinstance(inp, RefsOutInput)
+      45          async with system_tx(ctx.db_pool) as conn:
+      46              raw = await get_outbound_refs(conn, source_memory_id=inp.memory_id)
+      47
+      48              accessible: list[OutboundRef] = []
+      49              inaccessible_count = 0
+      50              for r in raw:
+      51 -                access = await conn.fetchval(
+      52 -                    "SELECT 1 FROM user_effective_team_access "
+      53 -                    "WHERE user_id = $1 AND resource_team_id = $2",
+      54 -                    ctx.tenant_id,
+      55 -                    r["target_team_id"],
+      56 -                )
+      57 -                if access is None:
+      58 -                    inaccessible_count += 1
+      59 -                    continue
+      60 -                accessible.append(
+      61 -                    OutboundRef(
+      62 -                        source_memory_id=str(r["source_memory_id"]),
+      63 -                        target_memory_id=str(r["target_memory_id"]),
+      64 -                        target_team_id=str(r["target_team_id"]),
+      65 -                        target_fragment=r["target_fragment"],
+      66 -                        reference_kind=r["reference_kind"],
+      67 -                        refs_version=r["refs_version"],
+      51 +                # Evaluate access against the TARGET MEMORY itself, not the
+      52 +                # target_team_id denormalized on the ref row (which can drift
+      53 +                # if the memory's team changes). Uses the shared rule: owner
+      54 +                # OR team-access.
+      55 +                if await caller_can_access_memory(
+      56 +                    conn,
+      57 +                    memory_id=r["target_memory_id"],
+      58 +                    caller_user_id=ctx.tenant_id,
+      59 +                    include_deleted=True,
+      60 +                ):
+      61 +                    accessible.append(
+      62 +                        OutboundRef(
+      63 +                            source_memory_id=str(r["source_memory_id"]),
+      64 +                            target_memory_id=str(r["target_memory_id"]),
+      65 +                            target_team_id=str(r["target_team_id"]),
+      66 +                            target_fragment=r["target_fragment"],
+      67 +                            reference_kind=r["reference_kind"],
+      68 +                            refs_version=r["refs_version"],
+      69 +                        )
+      70                      )
+      69 -                )
+      71 +                else:
+      72 +                    inaccessible_count += 1
+      73
+      74          return RefsOutOutput(
+      75              accessible_count=len(accessible),
+
+  Thought for 2s (ctrl+o to expand)
+
+● Files restored. Let me verify git status and run the final verification suite:
+
+● Bash(git status --short)
+  ⎿   M src/mem_mcp/mcp/tools/refs_in.py
+      M src/mem_mcp/mcp/tools/refs_out.py
+      M src/mem_mcp/teams/references.py
+     … +2 lines (ctrl+o to expand)
+
+● Bash(ruff check src tests)
+  ⎿  Error: Exit code 1
+     src/mem_mcp/mcp/tools/refs_in.py:75:10: W292 [*] No newline at end of file
+        |
+     73 |             inaccessible_count=inaccessible_count,
+     74 |             refs=accessible,
+     75 |         )
+        |           W292
+        |
+        = help: Add trailing newline
+
+     … +11 lines (ctrl+o to expand)
+
+● Bash(mypy src/mem_mcp/teams/references.py tests/unit/test_references_access_rule.py src/mem_mcp/mcp/tools/refs_in.py src/mem_mcp/mcp/tools/refs_out.py)
+  ⎿  Success: no issues found in 4 source files
+
+  Thought for 2s (ctrl+o to expand)
+
+● Ruff found missing trailing newlines in the two tool files (introduced during the Write restore). Let me fix those:
+
+● Update(src/mem_mcp/mcp/tools/refs_in.py)
+  ⎿  Added 1 line, removed 1 line
+      72              accessible_count=len(accessible),
+      73              inaccessible_count=inaccessible_count,
+      74              refs=accessible,
+      75 -        )
+      75   No newline at end of file
+      76 +        )
+
+● Update(src/mem_mcp/mcp/tools/refs_out.py)
+  ⎿  Added 1 line, removed 1 line
+      75              accessible_count=len(accessible),
+      76              inaccessible_count=inaccessible_count,
+      77              refs=accessible,
+      78 -        )
+      78   No newline at end of file
+      79 +        )
+
+● Now let me verify ruff passes and run the full final verification suite:
+
+● Bash(ruff check src tests)
+  ⎿  All checks passed!
+
+● Bash(pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py tests/unit/test_references_access_rule.py tests/integration/test_references_…)
+  ⎿  .............................                                            [100%]
+     29 passed in 1.44s
+
+  Thought for 2s (ctrl+o to expand)
+
+● All 29 tests pass. Let me also confirm mypy and the tenant-scope linter still pass after the edits:
+
+● Bash(mypy src/mem_mcp/teams/references.py tests/unit/test_references_access_rule.py src/mem_mcp/mcp/tools/refs_in.py src/mem_mcp/mcp/tools/refs_out.py)
+  ⎿  Success: no issues found in 4 source files
+
+● Bash(pytest -q -p no:cacheprovider tests/unit/test_lint_tenant_scope.py -k "test_real_codebase_is_clean" 2>&1 | tail -5)
+  ⎿  .                                                                        [100%]
+     1 passed, 13 deselected in 0.18s
+
+  Thought for 1s (ctrl+o to expand)
+
+● All checks pass. Let me do a final git status confirmation:
+
+● Bash(git status --short)
+  ⎿   M src/mem_mcp/mcp/tools/refs_in.py
+      M src/mem_mcp/mcp/tools/refs_out.py
+      M src/mem_mcp/teams/references.py
+     … +2 lines (ctrl+o to expand)
+
+● Work order 2 is complete. Here's the report:
+
+  Summary
+
+  Task 1: Single source of truth refactor
+
+  File: src/mem_mcp/teams/references.py
+  - Renamed _caller_can_access_memory_row → caller_can_access_memory_row (made public)
+  - Refactored caller_can_access_memory to fetch tenant_id, team_id from the memories table (respecting include_deleted) and delegate to caller_can_access_memory_row — the rule now lives in exactly one function instead
+    of being encoded in two separate implementations (one SQL EXISTS, one Python == + fetchval)
+  - Updated both call sites in this file: resolve_reference_target and check_hard_delete_with_filtered_citers
+  - Updated module docstring and inline comments to reflect the delegation pattern and fix a typo (caller_can_access_access_memory_row → caller_can_access_memory_row)
+
+  File: tests/unit/test_references_access_rule.py
+  - Updated import: _caller_can_access_memory_row → caller_can_access_memory_row
+  - Updated the test class header comment and all 4 test method bodies to call the public name
+  - Updated module docstring
+
+  No behavior changes — the access rule (owner OR team-access, NULL-team denied) is identical.
+
+  Task 2: Full-suite comparison
+
+  ┌─────────────────────────────────────────────┬────────────────────────────┬────────────────────────────┐
+  │                                             │     Before (baseline)      │    After (fix applied)     │
+  ├─────────────────────────────────────────────┼────────────────────────────┼────────────────────────────┤
+  │ Pre-existing failures                       │ 52 (37 failed + 15 errors) │ 52 (37 failed + 15 errors) │
+  ├─────────────────────────────────────────────┼────────────────────────────┼────────────────────────────┤
+  │ Repro test                                  │ FAILED                     │ PASSED                     │
+  ├─────────────────────────────────────────────┼────────────────────────────┼────────────────────────────┤
+  │ it08 test_refs_out_with_inaccessible_target │ FAILED                     │ PASSED                     │
+  ├─────────────────────────────────────────────┼────────────────────────────┼────────────────────────────┤
+  │ New test files (18 tests)                   │ collection error / not run │ 18 passed                  │
+  └─────────────────────────────────────────────┴────────────────────────────┴────────────────────────────┘
+
+  After-failures ⊆ before-failures ✓ — every failure in the after tree was already failing in the baseline. The only tests that changed state (baseline-fail → after-pass) are the repro test and
+  test_refs_out_with_inaccessible_target_excluded, both of which are directly addressed by the access-rule fix. No new failures introduced.
+
+  Verification
+
+  - ruff: All checks passed!
+  - mypy (4 source files): Success: no issues found
+  - Repro test: passes
+  - New unit tests (11 tests): all pass
+  - New integration tests (7 tests): all pass
+  - Existing references tests (unit helpers + integration IT-08/IT-09): all pass
+  - Tenant scope linter (test_real_codebase_is_clean): passes (references.py remains exempt)
+  - Git status: 3 modified + 2 new files, exactly as expected
+
+✻ Brewed for 8m 59s · done 6:11 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+

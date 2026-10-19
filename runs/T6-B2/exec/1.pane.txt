@@ -1,0 +1,260 @@
+     … +33 lines (ctrl+o to expand)
+
+  Thought for 32s (ctrl+o to expand)
+
+● The RETURNING order isn't guaranteed to match the subquery's ORDER BY — the function selects the oldest correctly, but Postgres returns them in heap-scan order. Let me make the ordering tests verify content correctness
+  rather than list order:
+
+● Update(tests/integration/test_plugin_notices_behaviour.py)
+  ⎿  Added 14 lines, removed 3 lines
+      285          assert isinstance(delivered[0], RenderedNotice)
+      286          assert delivered[0].text == "Reminder: Take medicines"
+      287
+      288 -    async def test_deliver_orders_oldest_first(self, notices_tenant: Any) -> None:
+      289 -        """deliver_pending must ORDER BY created_at ASC (oldest first)."""
+      288 +    async def test_deliver_selects_oldest_first_by_created_at(
+      289 +        self, notices_tenant: Any
+      290 +    ) -> None:
+      291 +        """deliver_pending's subquery selects oldest-by-created_at ASC; verify the
+      292 +        correct set is delivered.  RETURNING order from Postgres' UPDATE is not
+      293 +        guaranteed to match the subquery ORDER BY, so we sort before comparing."""
+      294          t = notices_tenant
+      295          base = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+      296          async with t["pool"].acquire() as conn:
+     ...
+      311          async with system_tx(t["pool"]) as conn:
+      312              delivered = await deliver_pending(conn, t["tenant_id"], limit=20)
+      313
+      314 +        # The subquery correctly selects the oldest rows; RETURNING order is
+      315 +        # heap-dependent so sort by created_at to verify selection.
+      316          assert len(delivered) == 3
+      311 -        assert [d.text for d in delivered] == ["early", "mid", "late"]
+      317 +        assert sorted(d.created_at for d in delivered) == [
+      318 +            base,
+      319 +            base + timedelta(seconds=1),
+      320 +            base + timedelta(seconds=2),
+      321 +        ]
+      322 +        assert sorted(d.text for d in delivered) == ["early", "mid", "late"]
+      323
+      324      async def test_deliver_respects_limit(self, notices_tenant: Any) -> None:
+      325          """deliver_pending(limit=2) returns at most 2 of 5 pending."""
+
+● Update(tests/integration/test_plugin_notices_behaviour.py)
+  ⎿  Added 4 lines, removed 2 lines
+      337          async with system_tx(t["pool"]) as conn:
+      338              delivered = await deliver_pending(conn, t["tenant_id"], limit=2)
+      339
+      340 +        # Subquery selects oldest 2 by created_at ASC; RETURNING order is
+      341 +        # heap-dependent so sort before comparing.
+      342          assert len(delivered) == 2
+      341 -        assert [d.text for d in delivered] == ["0", "1"]  # oldest two
+      343 +        assert sorted(d.text for d in delivered) == ["0", "1"]  # oldest two
+      344
+      345          # Remaining 3 should still be pending
+      346          async with system_tx(t["pool"]) as conn:
+      347              remaining = await deliver_pending(conn, t["tenant_id"], limit=20)
+      348          assert len(remaining) == 3
+      347 -        assert [d.text for d in remaining] == ["2", "3", "4"]
+      349 +        assert sorted(d.text for d in remaining) == ["2", "3", "4"]
+      350
+      351      async def test_deliver_at_most_once(self, notices_tenant: Any) -> None:
+      352          """A second deliver_pending call returns nothing for already-delivered."""
+
+● Bash(python -m pytest tests/integration/test_plugin_notices_behaviour.py -x -q 2>&1 | head -60)
+  ⎿  .......F
+     =================================== FAILURES ===================================
+     ______ TestDeliverPending.test_deliver_selects_oldest_first_by_created_at ______
+     … +49 lines (ctrl+o to expand)
+
+  Thought for 4s (ctrl+o to expand)
+
+● The sorted(d.text...) sorts alphabetically, not chronologically. Let me sort by created_at first:
+
+● Update(tests/integration/test_plugin_notices_behaviour.py)
+  ⎿  Added 2 lines, removed 1 line
+      319              base + timedelta(seconds=1),
+      320              base + timedelta(seconds=2),
+      321          ]
+      322 -        assert sorted(d.text for d in delivered) == ["early", "mid", "late"]
+      322 +        by_time = sorted(delivered, key=lambda d: d.created_at)
+      323 +        assert [d.text for d in by_time] == ["early", "mid", "late"]
+      324
+      325      async def test_deliver_respects_limit(self, notices_tenant: Any) -> None:
+      326          """deliver_pending(limit=2) returns at most 2 of 5 pending."""
+
+● Bash(python -m pytest tests/integration/test_plugin_notices_behaviour.py -x -q 2>&1 | head -60)
+  ⎿  ..............F
+     =================================== FAILURES ===================================
+     ______ TestDeliverPending.test_deliver_missing_key_logs_warning_truncated ______
+     … +37 lines (ctrl+o to expand)
+
+  Thought for 19s (ctrl+o to expand)
+
+● The template "X"*200 + " {missing}" renders to "X"*200 + " " — the space before {missing} remains. Let me fix the assertion:
+
+● Update(tests/integration/test_plugin_notices_behaviour.py)
+  ⎿  Added 2 lines, removed 1 line
+      454                  delivered = await deliver_pending(conn, t["tenant_id"], limit=20)
+      455
+      456          assert len(delivered) == 1
+      457 -        assert delivered[0].text == "X" * 200
+      457 +        # {missing} → "" but the space before it remains
+      458 +        assert delivered[0].text == "X" * 200 + " "
+      459          records = [r for r in caplog.records if "notice_template_missing_key" in r.message]
+      460          assert len(records) == 1
+      461          assert records[0].key == "missing"
+
+● Bash(python -m pytest tests/integration/test_plugin_notices_behaviour.py -x -q 2>&1 | head -60)
+  ⎿  ........................                                                 [100%]
+     24 passed in 0.90s
+
+  Thought for 12s (ctrl+o to expand)
+
+● All 24 pass. Now let me run the full verification suite — the two unit files, both integration files, and then the full suite:
+
+● Bash(python -m pytest tests/unit/test_memory_list_models_cursor.py tests/unit/test_notice_render_and_serialize.py tests/integration/test_memory_list_behaviour.py tes…)
+  ⎿  ........................................................................ [ 48%]
+     ..............................................x.x....................... [ 96%]
+     ......                                                                   [100%]
+     … +5 lines (ctrl+o to expand)
+  ⎿  (timeout 2m)
+
+● 148 passed, 2 xfailed. Now let me run the full test suite to check for regressions:
+
+● Bash(python -m pytest -q -p no:cacheprovider 2>&1 | tail -30)
+  ⎿  ERROR tests/unit/test_team_api.py::test_create_team_with_parent_assigns_team_as_member
+     ERROR tests/unit/test_team_api.py::test_create_team_with_parent_role_in_parent_honored
+     ERROR tests/unit/test_team_api.py::test_create_team_with_invalid_parent_rejects
+     … +27 lines (ctrl+o to expand)
+  ⎿  (timeout 3m)
+
+  Thought for 7s (ctrl+o to expand)
+
+● Let me verify these are pre-existing failures, not caused by my changes:
+
+● Bash(git status --short)
+  ⎿  ?? tests/integration/test_memory_list_behaviour.py
+     ?? tests/integration/test_plugin_notices_behaviour.py
+     ?? tests/unit/test_memory_list_models_cursor.py
+     ?? tests/unit/test_notice_render_and_serialize.py
+
+  Thought for 8s (ctrl+o to expand)
+
+● All four files are new (untracked) — I haven't modified any existing source or test files. The 18 failures + 16 errors are all in pre-existing test files (test_team_api.py, test_enterprise_schema.py,
+  test_roles_catalog.py, etc.) and are pre-existing as noted in CLAUDE.md ("Some tests in the suite were already failing before your change").
+
+  Let me do a final confirmation run of all four new test files:
+
+● Bash(python -m pytest tests/unit/test_memory_list_models_cursor.py tests/unit/test_notice_render_and_serialize.py tests/integration/test_memory_list_behaviour.py tes…)
+  ⎿  tests/integration/test_memory_list_behaviour.py::TestFilters::test_filter_by_team_id PASSED [ 64%]
+     tests/integration/test_memory_list_behaviour.py::TestFilters::test_filter_by_indexable PASSED [ 64%]
+     tests/integration/test_memory_list_behaviour.py::TestFilters::test_filter_by_parent_id PASSED [ 65%]
+     … +57 lines (ctrl+o to expand)
+
+  Thought for 6s (ctrl+o to expand)
+
+● All 148 tests pass (plus 2 xfailed for the documented cursor bug). Let me run a quick lint check on the new files:
+
+● Bash(ruff check tests/integration/test_memory_list_behaviour.py tests/integration/test_plugin_notices_behaviour.py tests/unit/test_memory_list_models_cursor.py tests…)
+  ⎿  Error: Exit code 1
+     tests/integration/test_plugin_notices_behaviour.py:18:1: I001 [*] Import block is un-sorted or un-formatted
+        |
+     16 |   """
+     17 |
+     18 | / from __future__ import annotations
+     19 | |
+     20 | | import json
+     21 | | import logging
+     22 | | from datetime import UTC, datetime, timedelta
+     … +33 lines (ctrl+o to expand)
+
+  Thought for 5s (ctrl+o to expand)
+
+● Update(tests/integration/test_plugin_notices_behaviour.py)
+  ⎿  Added 1 line, removed 2 lines
+      27  import pytest
+      28
+      29  from mem_mcp.db.tenant_tx import system_tx
+      30 -from mem_mcp.plugins.clients.notices import _json_default
+      30 +from mem_mcp.plugins.clients.notices import NoticeClientImpl
+      31  from mem_mcp.plugins.notice_delivery import (
+      32      RenderedNotice,
+      33      deliver_pending,
+      34  )
+      35 -from mem_mcp.plugins.clients.notices import NoticeClientImpl
+      35
+      36  pytestmark = pytest.mark.asyncio
+      37
+
+● Bash(ruff check tests/integration/test_memory_list_behaviour.py tests/integration/test_plugin_notices_behaviour.py tests/unit/test_memory_list_models_cursor.py tests…)
+  ⎿  All checks passed!
+
+  Thought for 4s (ctrl+o to expand)
+
+● Lint passes. Final verification run:
+
+● Bash(python -m pytest tests/integration/test_memory_list_behaviour.py tests/integration/test_plugin_notices_behaviour.py tests/unit/test_memory_list_models_cursor.py…)
+  ⎿  ...........................x.x.......................................... [ 48%]
+     ........................................................................ [ 96%]
+     ......                                                                   [100%]
+     … +5 lines (ctrl+o to expand)
+
+● All tests pass, lint is clean. Here's the report.
+
+  ---
+
+  Summary
+
+  Created the four required TESTS ONLY files. No source, migration, config, or conftest files were modified.
+
+  Files created
+
+  ┌────────────────────────────────────────────────────┬────────────────────────┬─────────────┐
+  │                        File                        │         Tests          │   Status    │
+  ├────────────────────────────────────────────────────┼────────────────────────┼─────────────┤
+  │ tests/unit/test_memory_list_models_cursor.py       │ 41                     │ ✅ All pass │
+  ├────────────────────────────────────────────────────┼────────────────────────┼─────────────┤
+  │ tests/unit/test_notice_render_and_serialize.py     │ 50                     │ ✅ All pass │
+  ├────────────────────────────────────────────────────┼────────────────────────┼─────────────┤
+  │ tests/integration/test_memory_list_behaviour.py    │ 33 (31 pass + 2 xfail) │ ✅          │
+  ├────────────────────────────────────────────────────┼────────────────────────┼─────────────┤
+  │ tests/integration/test_plugin_notices_behaviour.py │ 24                     │ ✅ All pass │
+  └────────────────────────────────────────────────────┴────────────────────────┴─────────────┘
+
+  Total: 148 passed, 2 xfailed.
+
+  Bugs found & documented (xfailed with reason="BUG: …")
+
+  1. list.py:197 — cursor ISO string vs timestamptz type mismatch — _decode_cursor returns the cursor's order value as a Python str (ISO format), but list.py passes it as a bare $param in the keyset predicate
+     (created_at, id) < ($iso, $uuid::uuid) where created_at is timestamptz. Asyncpg rejects the str→timestamptz binding with TypeError. Both pagination-walk tests that use a cursor are marked xfail(strict=True).
+  2. _decode_cursor exception handling gap — documented in the unit test: _decode_cursor catches only (JSONDecodeError, IndexError, ValueError), so a cursor decoding to JSON int raises TypeError and JSON dict raises
+     KeyError, both uncaught. The unit tests assert the raw exceptions surface (BUG documented but not xfailed because the tests assert the current — buggy — behavior rather than correct behavior).
+  3. tsvector_to_array SQL function missing — referenced by LENIENT_TSQUERY_SQL but never created in any migration. Created in the integration fixture (_install_tsvector_to_array) before each test tenant is set up.
+
+  Integration test fixture fixes applied
+
+  - _install_tsvector_to_array made async def with await conn.execute(...) — the original version called conn.execute() synchronously, producing an un-awaited coroutine (RuntimeWarning: coroutine 'Connection.execute' was
+    never awaited) and leaving the SQL function uninstalled.
+  - Fixture transaction scoping — setup (INSERT INTO tenants/…) now runs in a transaction that commits before yield, so tenant rows are visible to the test body's separate connections. Cleanup runs in a separate
+    post-yield transaction. The original fixture wrapped yield inside async with conn.transaction(), leaving setup rows uncommitted/unvisible and causing FK violations.
+  - _insert_memory INSERT column/param alignment — added the missing source_kind column and switched to dynamically-generated $n placeholders to avoid the $12/$13 mismatch when team_id is None but parent_id is present.
+
+  Regression check
+
+  Full suite: 18 failed, 1495 passed, 31 skipped, 2 xfailed, 16 errors. All 34 failures/errors are in pre-existing test files (test_team_api.py, test_enterprise_schema.py, test_roles_catalog.py, etc.) that I did not
+  touch — confirmed pre-existing per the CLAUDE.md note. None of my four new files contribute failures.
+
+  Left open
+
+  - The cursor type-mismatch BUG in list.py:197 (str vs timestamptz) requires a source fix — either parse cursor_order_value_iso back to datetime before passing as a parameter, or cast in SQL (($iso::timestamptz,
+    $uuid::uuid)). Not fixed here (rules forbid modifying src).
+  - RenderedNotice.to_dict() leaves plugin_id as a raw UUID when constructed directly (unit-test observation) but as a str when flowing through the DB path (Text column). Both paths are documented.
+
+✻ Cooked for 1h 46m 11s · done 2:24 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+
+

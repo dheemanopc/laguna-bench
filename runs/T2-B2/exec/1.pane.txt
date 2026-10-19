@@ -1,0 +1,260 @@
+      134
+      135  async def _cleanup(pool: Any, tenants: list[UUID], teams: list[UUID]) -> None:
+
+● Now remove the unused _own_memory_id helper and fix case 3 (remove redundant UUID conversion):
+
+● Update(tests/integration/test_references_owner_access.py)
+  ⎿  Removed 5 lines
+      158              await conn.execute("DELETE FROM tenants WHERE id = ANY($1::uuid[])", tenants)
+      159
+      160
+      161 -async def _own_memory_id(pg_pool: Any, sdk: Any) -> UUID:
+      162 -    assert isinstance(sdk, object)
+      163 -    return UUID(str(await sdk.write("owner memory", type="note")))
+      164 -
+      165 -
+      161  # ── Case 1: own-memory resolve succeeds (UUID + slug-tuple), no UETA ─────────
+      162
+      163
+
+● Update(tests/integration/test_references_owner_access.py)
+  ⎿  Removed 1 line
+      310              m_null = await _insert_memory_direct(
+      311                  conn, tenant_id=owner["tenant"], team_id=None, visibility="external"
+      312              )
+      313 -            m_null = UUID(m_null) if not isinstance(m_null, UUID) else m_null
+      313
+      314      sdk_owner = sdk_client_factory(tenant_id=owner["tenant"], plugin_id=_PLUGIN_ID)
+      315      try:
+
+  Thought for 1m 5s (ctrl+o to expand)
+
+● Let me refine cases 4 and 5 for clean transaction semantics — case 5 uses the wrapping-pytest.raises pattern so the raising path auto-rolls back; case 4 keeps the commit-and-tolerate pattern (matching test_it09) with
+  an accurate comment.
+
+● Update(tests/integration/test_references_owner_access.py)
+  ⎿  Added 49 lines, removed 35 lines
+      401              )
+      402              assert UUID(str(resolved["memory_id"])) == m_shared
+      403              assert resolved["team_id"] == shared_team
+      404 +            # Fixture left in place; rows are UUID-suffixed and tolerated per
+      405 +            # CONVENTIONS §Tests ("shared DB, tolerate leftovers").
+      406
+      405 -            # Roll the whole fixture back — nothing escapes the test.
+      406 -            # (transaction context exits here.)
+      407
+      408 -
+      408  # ── Case 5: check_hard_delete filtered citers, owner sees own citer ──────────
+      409
+      410
+      411  async def test_hard_delete_sees_own_citer_counts_stranger(pg_pool: Any) -> None:
+      412      """WO-1: check_hard_delete_with_filtered_citers, for an owner with NO UETA:
+      414 -    own citer is accessible; a stranger's citer is counted only (inaccessible)."""
+      415 -    async with pg_pool.acquire() as conn:
+      416 -        async with conn.transaction():
+      417 -            owner = await _provision_user(conn, "wo1-del-owner")
+      418 -            stranger = await _provision_user(conn, "wo1-del-stranger")
+      419 -            target = await _insert_memory_direct(
+      420 -                conn, tenant_id=owner["tenant"], team_id=owner["team"], content="target"
+      421 -            )
+      422 -            own_citer = await _insert_memory_direct(
+      423 -                conn, tenant_id=owner["tenant"], team_id=owner["team"], content="own citer"
+      424 -            )
+      425 -            stranger_citer = await _insert_memory_direct(
+      426 -                conn, tenant_id=stranger["tenant"], team_id=stranger["team"], content="stranger citer"
+      427 -            )
+      413 +    own citer is accessible; a stranger's citer is counted only (inaccessible).
+      414
+      429 -            await insert_reference(
+      430 -                conn,
+      431 -                source_memory_id=own_citer,
+      432 -                target_memory_id=target,
+      433 -                target_team_id=owner["team"],
+      434 -                reference_kind="cites",
+      435 -            )
+      436 -            await insert_reference(
+      437 -                conn,
+      438 -                source_memory_id=stranger_citer,
+      439 -                target_memory_id=target,
+      440 -                target_team_id=owner["team"],
+      441 -                reference_kind="cites",
+      442 -            )
+      415 +    The HardDeleteBlockedError is allowed to propagate out of the transaction
+      416 +    (catching it with pytest.raises AROUND the tx, not inside), so
+      417 +    ``async with conn.transaction()`` rolls the fixture back on the passing
+      418 +    path — there's nothing to leave behind.
+      419 +    """
+      420 +    with pytest.raises(HardDeleteBlockedError) as exc:
+      421 +        async with pg_pool.acquire() as conn:
+      422 +            async with conn.transaction():
+      423 +                owner = await _provision_user(conn, "wo1-del-owner")
+      424 +                stranger = await _provision_user(conn, "wo1-del-stranger")
+      425 +                target = await _insert_memory_direct(
+      426 +                    conn,
+      427 +                    tenant_id=owner["tenant"],
+      428 +                    team_id=owner["team"],
+      429 +                    content="target",
+      430 +                )
+      431 +                own_citer = await _insert_memory_direct(
+      432 +                    conn,
+      433 +                    tenant_id=owner["tenant"],
+      434 +                    team_id=owner["team"],
+      435 +                    content="own citer",
+      436 +                )
+      437 +                stranger_citer = await _insert_memory_direct(
+      438 +                    conn,
+      439 +                    tenant_id=stranger["tenant"],
+      440 +                    team_id=stranger["team"],
+      441 +                    content="stranger citer",
+      442 +                )
+      443
+      444 -            with pytest.raises(HardDeleteBlockedError) as exc:
+      444 +                await insert_reference(
+      445 +                    conn,
+      446 +                    source_memory_id=own_citer,
+      447 +                    target_memory_id=target,
+      448 +                    target_team_id=owner["team"],
+      449 +                    reference_kind="cites",
+      450 +                )
+      451 +                await insert_reference(
+      452 +                    conn,
+      453 +                    source_memory_id=stranger_citer,
+      454 +                    target_memory_id=target,
+      455 +                    target_team_id=owner["team"],
+      456 +                    reference_kind="cites",
+      457 +                )
+      458 +
+      459                  await check_hard_delete_with_filtered_citers(
+      460                      conn,
+      461                      target_memory_id=target,
+      462                      caller_user_id=owner["tenant"],
+      463                  )
+      450 -            assert exc.value.accessible_citers == [own_citer]
+      451 -            assert exc.value.inaccessible_count == 1
+      452 -            assert stranger_citer not in exc.value.accessible_citers
+      464 +    assert exc.value.accessible_citers == [own_citer]
+      465 +    assert exc.value.inaccessible_count == 1
+      466 +    assert stranger_citer not in exc.value.accessible_citers
+      467
+      468
+      469  # ── Case 6: refs_in / refs_out filter inaccessible edges, keep owner edges ---
+
+  Thought for 15s (ctrl+o to expand)
+
+● Let me re-read the final references.py to verify coherence, and the full test file.
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  laguna-s-2.1 · API Usage Billing
+ ▝▝   ▝▝   ~/laguna-bench/runs/T2-B2/repo
+
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  laguna-s-2.1 · API Usage Billing
+ ▝▝   ▝▝   ~/laguna-bench/runs/T2-B2/repo
+
+
+✻ Conversation compacted (ctrl+o for history)
+
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  laguna-s-2.1 · API Usage Billing
+ ▝▝   ▝▝   ~/laguna-bench/runs/T2-B2/repo
+
+
+✻ Conversation compacted (ctrl+o for history)
+
+
+  Thought for 1s (ctrl+o to expand)
+
+● The test file is coherent. Let me refine test #1 to mirror the repro path exactly (sdk.write → sdk.get → resolve) instead of sdk.get on a directly-inserted memory, which is more robust and lower-risk.
+
+● Update(tests/integration/test_references_owner_access.py)
+  ⎿  Added 7 lines, removed 5 lines
+      162
+      163
+      164  async def test_resolve_own_memory_uuid_path(pg_pool: Any, sdk_client_factory: Any) -> None:
+      165 -    """WO-1: a raw-SQL-provisioned owner resolves its OWN memory by UUID."""
+      165 +    """WO-1: a raw-SQL-provisioned owner resolves its OWN memory by UUID
+      166 +    (the exact repro path: sdk.write -> sdk.get -> the write tool's internal
+      167 +    resolve_reference_target succeeds)."""
+      168      async with pg_pool.acquire() as conn:
+      169          async with conn.transaction():
+      170              setup = await _provision_user(conn, "wo1-own-uuid")
+      169 -            m1 = await _insert_memory_direct(
+      170 -                conn, tenant_id=setup["tenant"], team_id=setup["team"]
+      171 -            )
+      171
+      172      sdk = sdk_client_factory(tenant_id=setup["tenant"], plugin_id=_PLUGIN_ID)
+      173      try:
+      175 -        # Read it back through the SDK to confirm the memory exists & is readable.
+      174 +        m1 = await sdk.write("target memory for ref", type="note")
+      175 +        assert m1 is not None
+      176 +
+      177 +        # The owner can read it back (mirrors the repro's pre-condition).
+      178          got = await sdk.get(memory_id=m1)
+      179          assert got is not None
+      180          assert UUID(str(got["id"])) == m1
+  ⎿  Referenced file tests/integration/test_references_owner_access.py
+  ⎿  Read src/mem_mcp/mcp/tools/refs_out.py (78 lines)
+  ⎿  Read src/mem_mcp/mcp/tools/refs_in.py (78 lines)
+  ⎿  Read src/mem_mcp/teams/references.py (298 lines)
+  ⎿  Read alembic/versions/0035_2026_06_01_memory_accessible_to.py (87 lines)
+
+  Thought for 15s (ctrl+o to expand)
+
+● Let me verify write.py passes caller_user_id to resolve_reference_target, since I made that parameter required (no default) — a missed call site would be a runtime regression.
+
+  Thought for 7s, searched for 2 patterns (ctrl+o to expand)
+
+● write.py passes caller_user_id=ctx.tenant_id (line 286) to resolve_reference_target, and write.py itself is unchanged — so it already satisfied the required-parameter contract. Let me confirm the hard-delete call site
+  also passes it, then I'm done.
+
+  Thought for 22s, searched for 1 pattern (ctrl+o to expand)
+
+● check_hard_delete_with_filtered_citers is only defined in references.py — no caller in src/. But I must confirm tests/unit/test_references_helpers.py (which I cannot modify) still calls it compatibly, since I kept
+  caller_user_id required on that function. Let me read that test's usage.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● All source is consistent and verified by inspection:
+
+  - write.py (unchanged) already passes caller_user_id=ctx.tenant_id (line 286) to resolve_reference_target, which requires it — the call contract is intact.
+  - check_hard_delete_with_filtered_citers is defined in references.py with caller_user_id: UUID required and called nowhere within src/ (it's an available helper).
+  - tests/unit/test_references_helpers.py (must not modify) is satisfied: it calls resolve_reference_target(..., caller_user_id=...), get_inbound_refs/get_outbound_refs without caller_user_id (the backwards-compatible
+    no-caller branch I preserved), and check_hard_delete_with_filtered_citers(..., caller_user_id=...). My signatures match every existing call.
+  - teams/references.py is already on the tenant-scope linter's exemption list; refs_in.py/refs_out.py now contain zero per-tenant SQL (they delegate to get_inbound_refs/get_outbound_refs, which take an explicit
+    caller_user_id).
+  - The migration (0035) creates memory_accessible_to(uuid, uuid) STABLE SECURITY DEFINER, owning tenant OR UETA, with GRANT EXECUTE ... TO mem_app; its down_revision="0034_safe_current_tenant_id" chains cleanly, and the
+    function is only invoked at the four work-order call sites — write.py stays byte-identical (IT-08 opaque envelope untouched).
+
+  The one step I cannot execute from this sandbox is the runtime verification: alembic upgrade head (so the memory_accessible_to function exists in the test DB) followed by pytest -q ... on the repro + new + baseline
+  suites and ruff check src tests / mypy. Until that migration is applied, the four call sites will raise function memory_accessible_to(uuid, uuid) does not exist.
+
+  Report
+
+  Files changed:
+  - alembic/versions/0035_2026_06_01_memory_accessible_to.py (new) — STABLE SECURITY DEFINER predicate memory_accessible_to(p_user_id,p_memory_id) (owning tenant OR user_effective_team_access row), GRANT EXECUTE … TO
+    mem_app; downgrade drops it. down_revision="0034_safe_current_tenant_id".
+  - src/mem_mcp/teams/references.py (edited) — resolve_reference_target: folds memory_accessible_to($2,id)/memory_accessible_to($4,m.id) into the UUID/slug SELECTs, removing the per-row UETA lookup and the team_id IS
+    NULL → skip hole; miss/no-access/deleted all raise the identical ReferenceTargetNotFoundError("reference target not found or not accessible"). get_inbound_refs/get_outbound_refs: optional caller_user_id annotates
+    each edge with accessible (no-caller branch preserved); single memory_accessible_to($2, …) SELECT, no memories JOIN. check_hard_delete_with_filtered_citers: single SELECT over memory_references with
+    memory_accessible_to($2, mr.source_memory_id) AS accessible.
+  - src/mem_mcp/mcp/tools/refs_in.py (edited) — calls get_inbound_refs(..., caller_user_id=ctx.tenant_id), partitions by accessible, no per-row SQL.
+  - src/mem_mcp/mcp/tools/refs_out.py (edited) — calls get_outbound_refs(..., caller_user_id=ctx.tenant_id), partitions by accessible, no per-row SQL.
+  - tests/integration/test_references_owner_access.py (new) — 7 regression cases.
+  - src/mem_mcp/mcp/tools/write.py — not changed; opaque JsonRpcError(-32602, "reference target not found or not accessible", data={"code":"memory_not_accessible",…}) envelope left byte-identical.
+
+  Verification done here (by inspection, not execution): cross-checked call signatures against write.py and tests/unit/test_references_helpers.py; confirmed no remaining per-tenant SQL in refs_in.py/refs_out.py;
+  confirmed linter exemption covers teams/references.py; confirmed the no-caller branch keeps the unit helpers backwards-compatible.
+
+  Verification NOT done here (Bash tool denied in this sandbox — "don't ask mode"): alembic upgrade head (required so the function exists), then MEM_MCP_TEST_DSN=… pytest -q
+  tests/integration/test_references_own_memory_repro.py tests/integration/test_references_owner_access.py tests/integration/test_references_integration.py tests/unit/test_references_helpers.py, then ruff check src tests
+  and mypy. Until the migration is applied, the four call sites error with function memory_accessible_to(uuid, uuid) does not exist.
+
+  Uncertainties: none at the source level; all remaining risk is the unexecuted verification block above.
+
+✻ Brewed for 43m 2s · done 11:37 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+
+

@@ -1,0 +1,260 @@
+      79      edges: list[MindmapEdge]
+      80      open_loops: list[UUID]
+      81 +    cursor: int
+      82 +    resolved: list[MindmapResolvedEntry] = Field(default_factory=list)
+      83      request_id: str
+      84
+      85
+     ...
+      103              members = await service.fetch_members(
+      104                  conn, root_memory_id=root_id, tenant_id=ctx.tenant_id
+      105              )
+      106 +            # Cursor is read in the same tx as the members so they are consistent.
+      107 +            cursor = await service.current_cursor(
+      108 +                conn, root_memory_id=root_id, tenant_id=ctx.tenant_id
+      109 +            )
+      110 +            touched: set[UUID] | None = None
+      111 +            if inp.since is not None:
+      112 +                touched = await service.touched_since(
+      113 +                    conn, root_memory_id=root_id, tenant_id=ctx.tenant_id, since=inp.since
+      114 +                )
+      115              member_ids = [m["memory_id"] for m in members]
+      116              edges = await service.fetch_internal_edges(conn, member_ids=member_ids)
+      117
+       80 -        nodes = [
+       81 -            MindmapNode(
+       82 -                memory_id=m["memory_id"],
+       83 -                node_role=m["node_role"],
+       84 -                type=m["type"],
+       85 -                content=m["content"],
+       86 -                metadata=m["metadata"],
+       87 -                created_at=m["created_at"],
+      118 +        candidates = [m for m in members if touched is None or m["memory_id"] in touched]
+      119 +        shown = [m for m in candidates if inp.include == "all" or m["status"] == "open"]
+      120 +        settled = [] if inp.include == "all" else [m for m in candidates if m["status"] != "open"]
+      121 +
+      122 +        nodes: list[MindmapNode] = []
+      123 +        for m in shown:
+      124 +            content, truncated = summarize_content(m["content"], inp.depth)
+      125 +            nodes.append(
+      126 +                MindmapNode(
+      127 +                    memory_id=m["memory_id"],
+      128 +                    node_role=m["node_role"],
+      129 +                    type=m["type"],
+      130 +                    content=content,
+      131 +                    metadata=m["metadata"],
+      132 +                    created_at=m["created_at"],
+      133 +                    status=m["status"],
+      134 +                    truncated=truncated,
+      135 +                )
+      136              )
+      137 +        shown_ids = {n.memory_id for n in nodes}
+      138 +        open_loops = [
+      139 +            m["memory_id"]
+      140              for m in members
+      141 +            if m["status"] == "open" and m["metadata"].get("responsible_party") in ("owner", "model")
+      142          ]
+       91 -        open_loops = [
+       92 -            m["memory_id"] for m in members if m["metadata"].get("responsible_party") == "owner"
+       93 -        ]
+      143          return MindmapGetOutput(
+      144              map_key=inp.map_key,
+      145              root_memory_id=root_id,
+     ...
+      156                      reference_kind=e["reference_kind"],
+      157                  )
+      158                  for e in edges
+      159 +                if e["source_memory_id"] in shown_ids or e["target_memory_id"] in shown_ids
+      160              ],
+      161              open_loops=open_loops,
+      162 +            cursor=cursor,
+      163 +            resolved=[
+      164 +                MindmapResolvedEntry(
+      165 +                    memory_id=m["memory_id"],
+      166 +                    resolution_summary=m["resolution_summary"],
+      167 +                    status=m["status"],
+      168 +                    resolved_by_party=m["resolved_by_party"],
+      169 +                )
+      170 +                for m in settled
+      171 +            ],
+      172              request_id=ctx.request_id,
+      173          )
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(src/mem_mcp/mcp/tool_descriptions.py)
+  ⎿  Added 12 lines, removed 3 lines
+      425  Pass map_key to log the link as a map event. Required scope: memory.write.
+      426
+      427  Example: mindmap_link(source_memory_id="<challenge>", target_memory_id="<position>", reference_kind="displaced-from", map_key="caching-strategy").""",
+      428 -    "mindmap_get": """Read a map's current state — its root, all nodes, the edges between them, review status, and open loops.
+      428 +    "mindmap_get": """Read a map's current state — its root, open nodes, the edges between them, review status, open loops, and a change cursor.
+      429
+      430 -Call when: resuming a map mid-conversation; the user asks "where were we", "what have we got so far", "what's still open"; before graduating, to review what was built. open_loops lists nodes whose turn
+          -is the owner's (waiting on the user). Required scope: memory.read.
+      430 +Cheap by default: only OPEN nodes come back in `nodes`, with content cut to 200 chars (truncated=true marks a cut). Settled branches (resolved/dropped, see mindmap_resolve) appear as compact `resolved`
+          +entries with their resolution_summary. Every response carries a `cursor`; pass it back as `since` next time to get only the nodes touched since then (nothing changed → empty nodes/edges, same cursor). L
+          +evers: include="all" returns settled nodes in full too (with status); depth="full" returns whole node content. open_loops lists open nodes with a responsible_party (owner or model) — the resume surface,
+          + always over the whole map.
+      431
+      432 -Example: "Where did we get to on caching?" → mindmap_get(map_key="caching-strategy").""",
+      432 +Call when: resuming a map mid-conversation; the user asks "where were we", "what have we got so far", "what's still open"; before graduating, to review what was built. Do not call for: re-reading a map
+          +you already hold — use since=<cursor> instead of a full read. Required scope: memory.read.
+      433 +
+      434 +Example: "Where did we get to on caching?" → mindmap_get(map_key="caching-strategy"); later → mindmap_get(map_key="caching-strategy", since=42).""",
+      435 +    "mindmap_resolve": """Settle one branch of a live map as resolved or dropped, with a short summary of why.
+      436 +
+      437 +Stores the status on the node (the only source of truth for "settled" — a resolves-under edge from mindmap_link does not settle anything), removes it from open_loops, and logs a resolve/drop event whose
+          + id is returned as `cursor`. Optionally pass resolved_by_memory_id (the node that carries the resolution): a resolves-under (or dropped-under for disposition="dropped") edge from it to the settled node
+          +is recorded in the same step. resolution_summary is required (1-500 chars). Settling is one-way and map-local.
+      438 +
+      439 +Call when: a branch is settled — the user accepted a position, a challenge was answered, or a thread was abandoned on purpose ("drop that one"). Do not call for: closing the whole map or resolving its r
+          +oot (use mindmap_close); nodes of another map; archived maps; branches already settled. Required scope: memory.write.
+      440 +
+      441 +Example: mindmap_resolve(map_key="caching-strategy", node_id="<challenge>", resolution_summary="Ops burden accepted; Redis is managed.", resolved_by_memory_id="<position>").""",
+      442      "mindmap_review": """Run the structural reviewer pass over a map and reset its write-counter.
+      443
+      444  Call when mindmap_write_node returns review_due=true (every 15 owned writes), or before graduating. Returns the map's full structure (nodes, edges, recent events) for you — or a review sub-agent — to sm
+           oke-test for structural problems: orphan positions, unaddressed challenges, nodes that bundle multiple decisions, mislabeled ratifications. The reviewer looks at the MAP ONLY, never the transcript — it
+           catches mistakes, not cheating. It is advisory; it flags, it does not block. Required scope: memory.write.
+
+● Core code is in place; now docs and tests.
+
+● Reading 2 files… (ctrl+o to expand)
+  ⎿  skills/mindmap-driver/SKILL.md
+
+● Update(docs/mindmap-v1-build-design.md)
+  ⎿  Added 1 line
+      131  | `mindmap_write_node` | owned capture | takes **map key** + content + `node_role` (position/challenge/decision) + optional ratification + optional links; writes a core memory, inserts exclusive members
+           hip, bumps `writes_since_review`, logs event. Past a soft byte threshold → returns a **split-suggested** flag (split into linked nodes, never trim). At `writes_since_review >= review_threshold` → return
+           s a sticky `review_due` flag. |
+      132  | `mindmap_link` | typed edge | insert into `memory_references` with a map `reference_kind` |
+      133  | `mindmap_get` | resume/inspect | return the map graph: root, member nodes, edges, open loops (whose-turn), pending flags, state |
+      134 +| `mindmap_resolve` | branch status | settle ONE open branch of a live map as `resolved`/`dropped` with a required ≤500-char `resolution_summary`; optional resolving node → `resolves-under`/`dropped-und
+          +er` edge; logs a `resolve`/`drop` event, returns its id as `cursor`. Root cannot be resolved (use `mindmap_close`); archived maps are immutable. |
+      135  | `mindmap_review` | reviewer | run the map-only structural pass (advisory), surface flags, reset `writes_since_review` to 0 |
+      136  | `mindmap_close` | `close_map` + graduation | propose significant decisions → **human confirms** → for each: new KB `memory_write` (type `decision`) with a `promoted-from` edge to the archived node, ca
+           rrying trajectory + ratification metadata → mint spec-index node → `state='archived'`. |
+      137
+
+● Update(docs/mindmap-v1-build-design.md)
+  ⎿  Added 27 lines
+      188  | 6 | Graduation: propose → confirm → promote-with-`promoted-from` → archive | confirmed decisions become KB decisions referencing archived nodes; archived excluded from search, walkable via refs |
+      189  | 7 | Reviewer + ratification gradient + split-flag | counter hits 15 → sticky `review_due`; `mindmap_review` clears it; gradient + split-flag logged and surfaced |
+      190
+      191 +## Branch status & cheap reads
+      192 +
+      193 +Until now only `mindmap_close` settled anything (the whole map), so open loops
+      194 +only grew and `mindmap_get` re-sent every node in full. Migration `0044` adds
+      195 +per-node status to `memory_map_membership`:
+      196 +
+      197 +```
+      198 +status                 text not null default 'open'   -- open | resolved | dropped
+      199 +resolution_summary     text null                      -- 1..500 chars
+      200 +resolved_by_memory_id  uuid null references memories(id) on delete set null
+      201 +resolved_by_party      text null                      -- owner | model
+      202 +resolved_at            timestamptz null
+      203 +```
+      204 +
+      205 +A CHECK keeps it consistent: `open` ⇒ all resolution columns NULL; settled ⇒
+      206 +summary, party and time present. **Status is the only source of truth for
+      207 +"settled"** — never inferred from `reference_kind`; a `resolves-under` edge
+      208 +drawn by `mindmap_link` alone does not settle a node. `memory_map_events` gets an
+      209 +`(root_memory_id, id)` index; the event id is the map's **cursor**.
+      210 +
+      211 +`mindmap_get` reads are cheap by default: `include="open"` (settled branches as
+      212 +compact `resolved` entries), `depth="summary"` (content cut at
+      213 +`SUMMARY_CHARS=200` + `…`, `truncated=true`), always a `cursor`; `since=<cursor>`
+      214 +returns only nodes touched since (nothing changed → empty). `include="all"` and
+      215 +`depth="full"` opt out. `open_loops` = open members with
+      216 +`metadata.responsible_party` ∈ {owner, model}, computed over the whole map.
+      217 +
+      218  ## ADRs to record
+      219
+      220  - **ADR-0007** — `position`/`challenge` node types added to core; non-versioned
+
+● Update(skills/mindmap-driver/SKILL.md)
+  ⎿  Added 15 lines
+      33  **Atomicity:** one idea per node. If `split_suggested` comes back true, split
+      34  the node into linked nodes — never trim or compress.
+      35
+      36 +## Settle branches & read cheaply
+      37 +When a branch is done, call `mindmap_resolve` with `node_id`, a short required
+      38 +`resolution_summary` (≤500 chars), `disposition` `resolved` (default) or
+      39 +`dropped`, and optionally `resolved_by_memory_id` (the node carrying the
+      40 +resolution — an edge is drawn for you). Status is stored on the node; an edge
+      41 +from `mindmap_link` alone does NOT settle it. The root is settled with
+      42 +`mindmap_close`, not here.
+      43 +
+      44 +`mindmap_get` is cheap by default (open nodes, content cut at 200 chars,
+      45 +settled branches listed compactly under `resolved`). Keep the returned `cursor`
+      46 +and pass it as `since` on the next read to get only what changed. Use
+      47 +`include="all"` to see settled nodes in full and `depth="full"` for whole
+      48 +content. `open_loops` is the resume surface: open nodes whose turn is the
+      49 +`owner`'s or the `model`'s.
+      50 +
+      51  ## Ratify
+      52  When the user endorses a position, record it on the node:
+      53  `ratification_strength` ∈ `survived-challenge` > `explicit-endorse` >
+
+● Write(tests/unit/test_mindmap_resolve_models.py)
+  ⎿  Wrote 104 lines to tests/unit/test_mindmap_resolve_models.py
+       1 """DB-free tests for mindmap_resolve input validation and mindmap_get read levers."""
+       2
+       3 from __future__ import annotations
+       4
+       5 from uuid import uuid4
+       6
+       7 import pytest
+       8 from pydantic import ValidationError
+       9
+      10 from mem_mcp.mcp.tools.mindmap_get import MindmapGetInput, summarize_content
+     … +94 lines (ctrl+o to expand)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Write(tests/integration/test_mindmap_resolve_e2e.py)
+  ⎿  Wrote 473 lines to tests/integration/test_mindmap_resolve_e2e.py
+      1 """End-to-end tests for mindmap branch status: mindmap_resolve + cheap mindmap_get reads.
+      2
+      3 Real tools against a live Postgres pool. Covers settle/drop, every refusal path
+      4 (each must leave the DB untouched), status-vs-edge independence, open_loops,
+      5 include/depth levers, the since/cursor flow and the migration-0044 CHECKs.
+      6 Fixture modelled on tests/integration/test_mindmap_e2e.py (UUID-suffixed names).
+      7 """
+      8
+      9 from __future__ import annotations
+     … +463 lines (ctrl+o to expand)
+
+● The code, migration, docs and tests are written, but I couldn't run any of them because Bash is denied in this session ("don't ask mode"). Nothing is verified yet.
+
+  Files written
+  - alembic/versions/0044_2026_10_15_mindmap_branch_status.py: the new memory_map_membership columns, named CHECKs, the (root_memory_id, id) events index, and a working downgrade().
+  - src/mem_mcp/mindmap/service.py: log_event now returns the event id. It also gains current_cursor, fetch_member, settle_member and touched_since, the MapNodeNotFoundError and NodeNotOpenError exceptions, and
+    fetch_members returns the status columns.
+  - src/mem_mcp/mindmap/__init__.py: SUMMARY_CHARS = 200.
+  - src/mem_mcp/mcp/tools/mindmap_resolve.py: the new tool, registered in src/mem_mcp/main.py.
+  - src/mem_mcp/mcp/tools/mindmap_get.py: since, include, depth, status, truncated, cursor, resolved, the open_loops fix, and a summarize_content helper.
+  - src/mem_mcp/mcp/tool_descriptions.py: updated mindmap_get and new mindmap_resolve entries.
+  - docs/mindmap-v1-build-design.md and skills/mindmap-driver/SKILL.md: tool table row, "Branch status & cheap reads" section, and driver guidance.
+  - tests/unit/test_mindmap_resolve_models.py and tests/integration/test_mindmap_resolve_e2e.py: new files; no existing tests were touched.
+
+  Not done
+  - alembic upgrade head, plus the downgrade/upgrade round-trip.
+  - pytest on the new tests and the full suite, and the baseline-vs-change comparison of pre-existing failures.
+  - ruff check, ruff format --check, mypy, and the tenant-scope linter test.
+
+  Open points
+  - When resolved_by_memory_id is given, the accessibility check runs before the map/state/membership checks, because it has to happen in a system_tx before the write transaction. An inaccessible resolver on an archived
+    map therefore reports memory_not_accessible, not map_not_live. The self-reference check also runs first.
+  - I haven't yet confirmed that mindmap_close accepts an empty confirmed_decisions list, which the archived-map test relies on.
+
+  Allow Bash, or run ! alembic upgrade head && pytest -q -p no:cacheprovider tests/unit tests/integration yourself. Then I can finish verification and fix whatever fails.
+
+✻ Brewed for 2m 54s · done 11:52 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

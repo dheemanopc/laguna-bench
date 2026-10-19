@@ -1,0 +1,314 @@
+NOTICE:  database "sc_t5_h_887455" does not exist, skipping
+....FF..F......                                                          [100%]
+=================================== FAILURES ===================================
+________________ test_updating_a_superseded_version_is_refused _________________
+
+ctx = ToolContext(request_id='req-f1e3a468', tenant_id=UUID('7c2ffe78-3960-49b3-a5a4-47dbac6d0575'), identity_id=UUID('7c2ff...uotas object at 0x76e5aa4595e0>, nli=<mem_mcp.memory.contradiction.NoopContradictionChecker object at 0x76e5aa45a5d0>))
+
+    async def test_updating_a_superseded_version_is_refused(ctx: ToolContext) -> None:
+        d1 = await _write(ctx, "decision: v1", mtype="decision")
+        v2 = await _update(ctx, id=d1, content="decision: v2")
+        assert v2.is_new_version is True
+    
+>       with pytest.raises(JsonRpcError) as exc:
+E       Failed: DID NOT RAISE <class 'mem_mcp.mcp.errors.JsonRpcError'>
+
+tests/integration/test_update_concurrency.py:229: Failed
+_____________ test_superseded_note_after_type_promotion_is_refused _____________
+
+ctx = ToolContext(request_id='req-5ae253d3', tenant_id=UUID('77439b37-129f-4965-a685-75caa636c951'), identity_id=UUID('77439...uotas object at 0x76e5aa45b560>, nli=<mem_mcp.memory.contradiction.NoopContradictionChecker object at 0x76e5aa419d30>))
+
+    async def test_superseded_note_after_type_promotion_is_refused(ctx: ToolContext) -> None:
+        n1 = await _write(ctx, "note that becomes a decision")
+        promoted = await _update(ctx, id=n1, content="now a decision", type="decision")
+        assert promoted.is_new_version is True
+        with pytest.raises(JsonRpcError) as exc:
+>           await _update(ctx, id=n1, tags=["late"], tags_op="add")
+
+tests/integration/test_update_concurrency.py:243: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_update_concurrency.py:129: in _update
+    return await MemoryUpdateTool()(ctx, MemoryUpdateInput(**kw))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <mem_mcp.mcp.tools.update.MemoryUpdateTool object at 0x76e5aa459fa0>
+ctx = ToolContext(request_id='req-5ae253d3', tenant_id=UUID('77439b37-129f-4965-a685-75caa636c951'), identity_id=UUID('77439...uotas object at 0x76e5aa45b560>, nli=<mem_mcp.memory.contradiction.NoopContradictionChecker object at 0x76e5aa419d30>))
+inp = MemoryUpdateInput(id=UUID('919bb4e2-1b42-487a-818f-c6b1a8c465e9'), content=None, type=None, tags=['late'], metadata=None, tags_op='add', expected_revision=None)
+
+    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
+        assert isinstance(inp, MemoryUpdateInput)
+        if ctx.deps is None:
+            raise JsonRpcError(-32603, "tool deps not wired")
+    
+        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
+            # Initial lookup — FOR UPDATE locks the row until commit/rollback
+            # so concurrent transactions serialize on the same target row.
+            target = await conn.fetchrow(
+                """
+                SELECT id, type, content, version, tags, metadata, deleted_at, is_current, updated_at
+                FROM memories
+                WHERE id = $1 AND tenant_id = $2
+                FOR UPDATE
+                """,
+                inp.id,
+                ctx.tenant_id,
+            )
+            if target is None:
+                raise JsonRpcError(
+                    -32602,
+                    "memory not found",
+                    data={"errors": [{"path": "id", "message": "not found in tenant scope"}]},
+                )
+            if target["deleted_at"] is not None:
+                raise JsonRpcError(
+                    -32602,
+                    "cannot update deleted memory",
+                    data={"errors": [{"path": "id", "message": "memory is deleted"}]},
+                )
+    
+            # If the caller passed an expected_revision, verify it matches
+            # the current row's revision before proceeding.  This is optimistic
+            # concurrency control — the caller read a revision earlier and
+            # expects it to still be the same now.
+            if inp.expected_revision is not None:
+                current_rev = compute_revision(str(target["id"]), target["updated_at"])
+                if current_rev != inp.expected_revision:
+                    raise JsonRpcError(
+                        -32000,
+                        "update_conflict",
+                        data={
+                            "code": "update_conflict",
+                            "current_revision": current_rev,
+                        },
+                    )
+    
+            # If the resolved target is itself not the current version
+            # (superseded), walk the chain to find the live head.
+            if not target["is_current"]:
+                live = await self._find_current_in_chain(conn, ctx.tenant_id, target["id"])
+                if live is not None:
+                    raise JsonRpcError(
+                        -32000,
+                        "update_conflict",
+                        data={
+                            "code": "update_conflict",
+                            "current_id": str(live["id"]),
+                            "current_revision": compute_revision(
+                                str(live["id"]), live["updated_at"]
+                            ),
+                        },
+                    )
+    
+            # Decide path
+            content_changed = inp.content is not None and inp.content != target["content"]
+            type_changed = inp.type is not None and inp.type != target["type"]
+            target_was_versioned = target["type"] in VERSIONED_TYPES
+            new_type = inp.type or target["type"]
+            new_is_versioned = new_type in VERSIONED_TYPES
+    
+            # Check if we need new version: either (versioned and content changed) or (type change to versioned)
+            new_version_path = ((target_was_versioned or new_is_versioned) and content_changed) or (
+                type_changed and new_is_versioned and not target_was_versioned
+            )
+    
+            if new_version_path:
+                # NEW VERSION path
+                if target_was_versioned:
+                    new_version_number = int(target["version"]) + 1
+                else:
+                    # Type promotion from non-versioned to versioned
+                    new_version_number = 1
+    
+                # Determine content for embedding
+                new_content = inp.content if inp.content is not None else target["content"]
+    
+                # Check quota before embedding
+                await ctx.deps.quotas.check_write(ctx.tenant_id, len(new_content))
+    
+                # Re-embed UNLESS oversize — same skip-policy as write.py.
+                from mem_mcp.mcp.tools.write import EMBED_MAX_INPUT_CHARS
+    
+                if len(new_content) > EMBED_MAX_INPUT_CHARS:
+                    new_embedding_vec: list[float] | None = None
+                    new_embed_tokens = 0
+                else:
+                    embed = await ctx.deps.embeddings.embed(new_content)
+                    new_embedding_vec = embed.vector
+                    new_embed_tokens = embed.input_tokens
+    
+                # Compute hash
+                content_hash = hash_content(new_content)
+    
+                # Compute final tags
+                final_tags = self._compute_tags(target["tags"], inp.tags, inp.tags_op)
+    
+                # INSERT new row
+                new_row = await conn.fetchrow(
+                    """
+                    INSERT INTO memories (
+                        tenant_id, content, content_hash, embedding,
+                        source_client_id, source_kind,
+                        type, tags, metadata,
+                        version, supersedes, is_current, updated_at
+                    ) VALUES ($1, $2, $3, $4::vector, $5, 'api', $6, $7, $8::jsonb, $9, $10, true, clock_timestamp())
+                    RETURNING id, version, updated_at
+                    """,
+                    ctx.tenant_id,
+                    new_content,
+                    content_hash,
+                    new_embedding_vec,
+                    ctx.client_id,
+                    new_type,
+                    final_tags,
+                    json.dumps(inp.metadata) if inp.metadata is not None else "{}",
+                    new_version_number,
+                    target["id"],
+                )
+    
+                # UPDATE old row: mark as superseded
+                await conn.execute(
+                    """
+                    UPDATE memories
+                    SET is_current = false, superseded_by = $1
+                    WHERE id = $2 AND tenant_id = $3 AND is_current = true
+                    """,
+                    new_row["id"],
+                    target["id"],
+                    ctx.tenant_id,
+                )
+    
+                # Audit
+                await ctx.deps.audit.audit(
+                    conn,
+                    action="memory.update",
+                    result="success",
+                    tenant_id=ctx.tenant_id,
+                    identity_id=ctx.identity_id,
+                    client_id=ctx.client_id,
+                    target_id=new_row["id"],
+                    target_kind="memory",
+                    request_id=ctx.request_id,
+                    details={
+                        "is_new_version": True,
+                        "content_changed": content_changed,
+                        "type_changed": type_changed,
+                        "expected_revision": inp.expected_revision,
+                    },
+                )
+    
+                # Quota
+                await ctx.deps.quotas.increment_write(ctx.tenant_id, new_embed_tokens)
+    
+                return MemoryUpdateOutput(
+                    id=new_row["id"],
+                    version=int(new_row["version"]),
+                    is_new_version=True,
+                    tags=final_tags,
+                    request_id=ctx.request_id,
+                    revision=compute_revision(str(new_row["id"]), new_row["updated_at"]),
+                )
+    
+            else:
+                # IN-PLACE path
+                # Compute final tags
+                final_tags = self._compute_tags(target["tags"], inp.tags, inp.tags_op)
+    
+                # Determine new metadata
+                # asyncpg may return JSONB columns as raw str (see pool codec
+                # quirk noted in get.py); parse to dict so the subsequent
+                # json.dumps doesn't double-encode.
+                existing_meta = target["metadata"]
+                if isinstance(existing_meta, str):
+                    existing_meta = json.loads(existing_meta) if existing_meta else {}
+                new_metadata = inp.metadata if inp.metadata is not None else existing_meta
+    
+                # Only re-embed if content changed
+                embed_tokens = 0
+                inplace_embedding_vec: list[float] | None = None
+                if content_changed and inp.content is not None:
+                    # Quota check
+                    await ctx.deps.quotas.check_write(ctx.tenant_id, len(inp.content))
+    
+                    # Re-embed UNLESS oversize.
+                    from mem_mcp.mcp.tools.write import EMBED_MAX_INPUT_CHARS
+    
+                    if len(inp.content) > EMBED_MAX_INPUT_CHARS:
+                        inplace_embedding_vec = None
+                        embed_tokens = 0
+                    else:
+                        embed = await ctx.deps.embeddings.embed(inp.content)
+                        inplace_embedding_vec = embed.vector
+                        embed_tokens = embed.input_tokens
+    
+                    # Compute hash
+                    content_hash = hash_content(inp.content)
+    
+                    # UPDATE with content change
+                    updated_at = await conn.fetchval(
+                        """
+                        UPDATE memories
+                        SET content = $1, content_hash = $2, embedding = $3::vector,
+                            type = $4, tags = $5, metadata = $6::jsonb,
+                            updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+                        WHERE id = $7 AND tenant_id = $8 AND is_current = true
+                        RETURNING updated_at
+                        """,
+                        inp.content,
+                        content_hash,
+                        inplace_embedding_vec,
+                        new_type,
+                        final_tags,
+                        json.dumps(new_metadata),
+                        target["id"],
+                        ctx.tenant_id,
+                    )
+                    assert updated_at is not None
+                else:
+                    # UPDATE without content change (no embedding)
+                    updated_at = await conn.fetchval(
+                        """
+                        UPDATE memories
+                        SET type = $1, tags = $2, metadata = $3::jsonb,
+                            updated_at = GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')
+                        WHERE id = $4 AND tenant_id = $5 AND is_current = true
+                        RETURNING updated_at
+                        """,
+                        new_type,
+                        final_tags,
+                        json.dumps(new_metadata),
+                        target["id"],
+                        ctx.tenant_id,
+                    )
+>                   assert updated_at is not None
+                           ^^^^^^^^^^^^^^^^^^^^^^
+E                   AssertionError
+
+src/mem_mcp/mcp/tools/update.py:331: AssertionError
+____________ test_concurrent_versioned_updates_never_fork_the_chain ____________
+
+ctx = ToolContext(request_id='req-45663988', tenant_id=UUID('01df5045-2774-4724-9922-ae1b4ad29507'), identity_id=UUID('01df5...uotas object at 0x76e5aa45d3d0>, nli=<mem_mcp.memory.contradiction.NoopContradictionChecker object at 0x76e5aa33e7b0>))
+
+    async def test_concurrent_versioned_updates_never_fork_the_chain(ctx: ToolContext) -> None:
+        for rnd in range(ROUNDS):
+            d1 = await _write(ctx, f"decision round {rnd}: v1", mtype="decision")
+            results = await asyncio.gather(
+                *[
+                    _update(ctx, id=d1, content=f"decision round {rnd}: agent {i}")
+                    for i in range(N_WORKERS)
+                ],
+                return_exceptions=True,
+            )
+            wins = [r for r in results if not isinstance(r, BaseException)]
+            losses = [r for r in results if isinstance(r, BaseException)]
+>           assert len(wins) == 1, f"round {rnd}: {len(wins)} updates succeeded on one parent"
+E           AssertionError: round 0: 6 updates succeeded on one parent
+E           assert 6 == 1
+E            +  where 6 = len([MemoryUpdateOutput(id=UUID('e90de4d2-7507-4b81-8131-488559d2b948'), version=2, is_new_version=True, tags=[], request_...25fff646d3'), version=2, is_new_version=True, tags=[], request_id='req-45663988', revision='1501844b822ace38924d020d')])
+
+tests/integration/test_update_concurrency.py:294: AssertionError
+=========================== short test summary info ============================
+FAILED tests/integration/test_update_concurrency.py::test_updating_a_superseded_version_is_refused
+FAILED tests/integration/test_update_concurrency.py::test_superseded_note_after_type_promotion_is_refused
+FAILED tests/integration/test_update_concurrency.py::test_concurrent_versioned_updates_never_fork_the_chain
+3 failed, 12 passed in 5.03s

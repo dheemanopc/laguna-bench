@@ -1,0 +1,1038 @@
+ .../0035_2026_06_01_memory_accessible_to.py        |  86 +++
+ src/mem_mcp/mcp/tools/refs_in.py                   |  26 +-
+ src/mem_mcp/mcp/tools/refs_out.py                  |  18 +-
+ src/mem_mcp/teams/references.py                    | 167 +++---
+ tests/integration/test_references_owner_access.py  | 613 +++++++++++++++++++++
+ 5 files changed, 824 insertions(+), 86 deletions(-)
+
+diff --git a/alembic/versions/0035_2026_06_01_memory_accessible_to.py b/alembic/versions/0035_2026_06_01_memory_accessible_to.py
+new file mode 100644
+index 0000000..0f7c349
+--- /dev/null
++++ b/alembic/versions/0035_2026_06_01_memory_accessible_to.py
+@@ -0,0 +1,86 @@
++"""SQL access predicate `memory_accessible_to(p_user_id, p_memory_id)`.
++
++Reference-access incident — raw-SQL-provisioned users (the path the 0026
++personal-team backfill takes: tenant + personal team + owner assignment +
++primary identity, with NO `assign_role` call) can `memory_get` their own memory
++but are rejected with `memory_not_accessible` when a *second* memory cites that
++first one via `references=[...]`.
++
++Root cause: `resolve_reference_target` (teams/references.py) gated cross-tenant
++reference resolution on a `user_effective_team_access` (UETA) row, but a
++raw-SQL-provisioned owner is the *owning tenant* of its personal-team memory
++and has NO UETA row for that team. The UETA-only check thus denied the owner
++its own memory. The same hole made `refs_in`/`refs_out`/`check_hard_delete`
++drop or mis-count citers that the owner should see.
++
++Fix: a single STABLE SECURITY-DEFINER SQL predicate that encodes the real
++access rule — the caller is the memory's owning tenant (``m.tenant_id =
++p_user_id``) OR holds an effective team-access row on the target's team
++(``m.team_id IS NOT NULL AND EXISTS (UETA)``). Because it is SECURITY DEFINER
++owned by the migration role (mem_maint, BYPASSRLS in prod / mem_test
++superuser in the test container) RLS cannot hide rows from the predicate
++itself; the tenant_id / UETA filter IS the gate. It deliberately does NOT read
++or filter ``deleted_at`` — callers keep their own deletion filters so that a
++deleted target remains indistinguishable from a missed one (IT-08 opacity:
++"not found" and "no access" collapse to the same outcome).
++
++The function is consumed inline at the four reference-access call sites
++(`resolve_reference_target`, `check_hard_delete_with_filtered_citers`,
++`get_inbound_refs`/`get_outbound_refs`) rather than behind a per-call Python
++wrapper, so each query resolves + authorises in one round-trip and miss /
++no-access / deleted targets raise the identical `ReferenceTargetNotFoundError`.
++
++Revision ID: 0035_memory_accessible_to
++Revises: 0034_safe_current_tenant_id
++Create Date: 2026-06-01
++"""
++
++from __future__ import annotations
++
++import sqlalchemy as sa
++
++from alembic import op
++
++revision = "0035_memory_accessible_to"
++down_revision = "0034_safe_current_tenant_id"
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    op.execute(
++        sa.text(
++            """
++            CREATE OR REPLACE FUNCTION memory_accessible_to(p_user_id uuid, p_memory_id uuid)
++            RETURNS boolean
++            LANGUAGE sql
++            STABLE
++            SECURITY DEFINER
++            SET search_path = public
++            AS $$
++                SELECT EXISTS (
++                    SELECT 1
++                    FROM memories m
++                    WHERE m.id = p_memory_id
++                      AND p_user_id IS NOT NULL
++                      AND (
++                            m.tenant_id = p_user_id
++                            OR (
++                                m.team_id IS NOT NULL
++                                AND EXISTS (
++                                    SELECT 1 FROM user_effective_team_access uea
++                                    WHERE uea.user_id = p_user_id
++                                      AND uea.resource_team_id = m.team_id
++                                )
++                            )
++                      )
++                )
++            $$;
++            GRANT EXECUTE ON FUNCTION memory_accessible_to(uuid, uuid) TO mem_app;
++            """
++        )
++    )
++
++
++def downgrade() -> None:
++    op.execute(sa.text("DROP FUNCTION IF EXISTS memory_accessible_to(uuid, uuid)"))
+diff --git a/src/mem_mcp/mcp/tools/refs_in.py b/src/mem_mcp/mcp/tools/refs_in.py
+index 951582e..edb7498 100644
+--- a/src/mem_mcp/mcp/tools/refs_in.py
++++ b/src/mem_mcp/mcp/tools/refs_in.py
+@@ -43,26 +43,20 @@ class RefsInTool(BaseTool):
+     async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
+         assert isinstance(inp, RefsInInput)
+         async with system_tx(ctx.db_pool) as conn:
+-            raw = await get_inbound_refs(conn, target_memory_id=inp.memory_id)
++            # The `accessible` flag is computed by the memory_accessible_to()
++            # predicate (migration 0035) inside get_inbound_refs, so a missing
++            # source memory (FK can't dangle, but soft-deleted sources read as
++            # owned) and a no-access source both land in inaccessible_count.
++            raw = await get_inbound_refs(
++                conn,
++                target_memory_id=inp.memory_id,
++                caller_user_id=ctx.tenant_id,
++            )
+ 
+-            # Filter by caller access to each source's team
+             accessible: list[InboundRef] = []
+             inaccessible_count = 0
+             for r in raw:
+-                # Look up source's team
+-                src_team = await conn.fetchval(
+-                    "SELECT team_id FROM memories WHERE id = $1", r["source_memory_id"]
+-                )
+-                if src_team is None:
+-                    inaccessible_count += 1
+-                    continue
+-                access = await conn.fetchval(
+-                    "SELECT 1 FROM user_effective_team_access "
+-                    "WHERE user_id = $1 AND resource_team_id = $2",
+-                    ctx.tenant_id,
+-                    src_team,
+-                )
+-                if access is None:
++                if not r["accessible"]:
+                     inaccessible_count += 1
+                     continue
+                 accessible.append(
+diff --git a/src/mem_mcp/mcp/tools/refs_out.py b/src/mem_mcp/mcp/tools/refs_out.py
+index d26b996..8eddd0a 100644
+--- a/src/mem_mcp/mcp/tools/refs_out.py
++++ b/src/mem_mcp/mcp/tools/refs_out.py
+@@ -43,18 +43,20 @@ class RefsOutTool(BaseTool):
+     async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
+         assert isinstance(inp, RefsOutInput)
+         async with system_tx(ctx.db_pool) as conn:
+-            raw = await get_outbound_refs(conn, source_memory_id=inp.memory_id)
++            # The `accessible` flag is computed by the memory_accessible_to()
++            # predicate (migration 0035) inside get_outbound_refs against each
++            # edge's target memory, so missing/unreadable targets are filtered
++            # rather than surfaced.
++            raw = await get_outbound_refs(
++                conn,
++                source_memory_id=inp.memory_id,
++                caller_user_id=ctx.tenant_id,
++            )
+ 
+             accessible: list[OutboundRef] = []
+             inaccessible_count = 0
+             for r in raw:
+-                access = await conn.fetchval(
+-                    "SELECT 1 FROM user_effective_team_access "
+-                    "WHERE user_id = $1 AND resource_team_id = $2",
+-                    ctx.tenant_id,
+-                    r["target_team_id"],
+-                )
+-                if access is None:
++                if not r["accessible"]:
+                     inaccessible_count += 1
+                     continue
+                 accessible.append(
+diff --git a/src/mem_mcp/teams/references.py b/src/mem_mcp/teams/references.py
+index e3f3c08..dd8d4ca 100644
+--- a/src/mem_mcp/teams/references.py
++++ b/src/mem_mcp/teams/references.py
+@@ -64,39 +64,58 @@ async def resolve_reference_target(
+       (a) target_uuid given → SELECT FROM memories.
+       (b) (target_team_id, target_resource_type, target_slug) given → SELECT FROM slugs.
+ 
+-    Access check: caller MUST have an active user_effective_team_access row
+-    for the target's team. Failure (target absent OR access denied) raises
+-    the SAME ReferenceTargetNotFoundError — caller cannot distinguish.
+-
+-    NOTE on tenant scoping: this helper queries `memories` ACROSS tenants
+-    because a reference can legitimately point at a memory owned by a
++    Access is enforced IN THE SAME query as resolution via the
++    ``memory_accessible_to()`` SECURITY-DEFINER predicate (migration 0035):
++    the caller is the owning tenant of the target (``memories.tenant_id``)
++    OR holds an effective team-access row on the target's team
++    (``user_effective_team_access``). ``caller_user_id`` is always supplied by
++    the write-time validator (write.py); omitting it is a programming error.
++
++    IT-08 opacity: a miss (no such memory / no such slug) and a no-access hit
++    collapse to the SAME outcome (row is None → raise), so callers cannot use
++    references as an existence oracle across teams. The predicate also closes
++    the prior ``team_id IS NULL → skip`` hole: a memory with no team is
++    referenceable ONLY by its owning tenant.
++
++    NOTE on tenant scoping: this helper queries `memories` / `slugs` ACROSS
++    tenants because a reference can legitimately point at a memory owned by a
+     DIFFERENT tenant in a shared/cross-team context. The opaque visibility
+-    contract is enforced via user_effective_team_access (below), not via a
+-    same-tenant filter.
++    contract is enforced by the predicate, not by a same-tenant filter.
+ 
+     Raises:
+         ReferenceTargetNotFoundError: target absent OR caller has no access.
+-        ValueError: invalid combination of args.
++        ValueError: invalid combination of args (programming error).
+     """
+     if target_uuid is not None:
+         row = await conn.fetchrow(
+-            "SELECT id, team_id FROM memories WHERE id = $1 AND deleted_at IS NULL",
++            """
++            SELECT id, team_id
++            FROM memories
++            WHERE id = $1
++              AND deleted_at IS NULL
++              AND memory_accessible_to($2, id)
++            """,
+             target_uuid,
++            caller_user_id,
+         )
+     elif (
+         target_team_id is not None and target_resource_type is not None and target_slug is not None
+     ):
+         row = await conn.fetchrow(
+             """
+-            SELECT m.id, m.team_id
++            SELECT m.id AS id, m.team_id AS team_id
+             FROM slugs s
+             JOIN memories m ON m.id = s.memory_id
+-            WHERE s.team_id = $1 AND s.resource_type = $2 AND s.slug = $3
++            WHERE s.team_id = $1
++              AND s.resource_type = $2
++              AND s.slug = $3
+               AND m.deleted_at IS NULL
++              AND memory_accessible_to($4, m.id)
+             """,
+             target_team_id,
+             target_resource_type,
+             target_slug,
++            caller_user_id,
+         )
+     else:
+         raise ValueError(
+@@ -106,19 +125,6 @@ async def resolve_reference_target(
+     if row is None:
+         raise ReferenceTargetNotFoundError("reference target not found or not accessible")
+ 
+-    # Access check: opaque-fail for cross-team unreadable.
+-    if row["team_id"] is not None:
+-        access = await conn.fetchval(
+-            """
+-            SELECT 1 FROM user_effective_team_access
+-             WHERE user_id = $1 AND resource_team_id = $2
+-            """,
+-            caller_user_id,
+-            row["team_id"],
+-        )
+-        if access is None:
+-            raise ReferenceTargetNotFoundError("reference target not found or not accessible")
+-
+     return {"memory_id": row["id"], "team_id": row["team_id"]}
+ 
+ 
+@@ -156,20 +162,38 @@ async def get_inbound_refs(
+     conn: asyncpg.Connection,
+     *,
+     target_memory_id: UUID,
++    caller_user_id: UUID | None = None,
+ ) -> list[dict[str, Any]]:
+     """Backward graph: every reference that targets this memory_id.
+ 
+-    No access filtering here — caller layers it on top via filter_citers_by_access.
++    When ``caller_user_id`` is supplied, each edge is annotated with an
++    ``accessible`` boolean via the ``memory_accessible_to()`` predicate
++    (migration 0035) computed against the edge's *source* memory, so callers
++    need no per-citer access lookup. Without it the raw graph is returned
++    (backwards-compatible) and the caller layers filtering on top.
+     """
+-    rows = await conn.fetch(
+-        """
+-        SELECT source_memory_id, target_memory_id, target_team_id,
+-               target_fragment, reference_kind, refs_version, created_at
+-        FROM memory_references
+-        WHERE target_memory_id = $1
+-        """,
+-        target_memory_id,
+-    )
++    if caller_user_id is not None:
++        rows = await conn.fetch(
++            """
++            SELECT source_memory_id, target_memory_id, target_team_id,
++                   target_fragment, reference_kind, refs_version, created_at,
++                   memory_accessible_to($2, source_memory_id) AS accessible
++            FROM memory_references
++            WHERE target_memory_id = $1
++            """,
++            target_memory_id,
++            caller_user_id,
++        )
++    else:
++        rows = await conn.fetch(
++            """
++            SELECT source_memory_id, target_memory_id, target_team_id,
++                   target_fragment, reference_kind, refs_version, created_at
++            FROM memory_references
++            WHERE target_memory_id = $1
++            """,
++            target_memory_id,
++        )
+     return [dict(r) for r in rows]
+ 
+ 
+@@ -177,17 +201,37 @@ async def get_outbound_refs(
+     conn: asyncpg.Connection,
+     *,
+     source_memory_id: UUID,
++    caller_user_id: UUID | None = None,
+ ) -> list[dict[str, Any]]:
+-    """Forward graph: every reference this memory makes."""
+-    rows = await conn.fetch(
+-        """
+-        SELECT source_memory_id, target_memory_id, target_team_id,
+-               target_fragment, reference_kind, refs_version, created_at
+-        FROM memory_references
+-        WHERE source_memory_id = $1
+-        """,
+-        source_memory_id,
+-    )
++    """Forward graph: every reference this memory makes.
++
++    When ``caller_user_id`` is supplied, each edge is annotated with an
++    ``accessible`` boolean via ``memory_accessible_to()`` (migration 0035)
++    computed against the edge's *target* memory. Without it the raw graph is
++    returned (backwards-compatible).
++    """
++    if caller_user_id is not None:
++        rows = await conn.fetch(
++            """
++            SELECT source_memory_id, target_memory_id, target_team_id,
++                   target_fragment, reference_kind, refs_version, created_at,
++                   memory_accessible_to($2, target_memory_id) AS accessible
++            FROM memory_references
++            WHERE source_memory_id = $1
++            """,
++            source_memory_id,
++            caller_user_id,
++        )
++    else:
++        rows = await conn.fetch(
++            """
++            SELECT source_memory_id, target_memory_id, target_team_id,
++                   target_fragment, reference_kind, refs_version, created_at
++            FROM memory_references
++            WHERE source_memory_id = $1
++            """,
++            source_memory_id,
++        )
+     return [dict(r) for r in rows]
+ 
+ 
+@@ -206,37 +250,36 @@ async def check_hard_delete_with_filtered_citers(
+ 
+     Returns silently when zero inbound refs (caller proceeds with delete).
+ 
+-    NOTE on tenant scoping: this helper deliberately queries `memories` ACROSS
+-    tenants. Filtering by the caller's tenant_id would defeat the entire
+-    purpose — we WANT to count cross-tenant citers as "inaccessible_count"
+-    rather than hide them. The cross-tenant visibility-gating happens at the
+-    application layer via user_effective_team_access (the per-citer access
+-    check below). The tenant-scope linter's intent is satisfied because we
+-    never EXPOSE cross-tenant data — only its count.
++    NOTE on tenant scoping: this helper deliberately queries
++    `memory_references` across tenants; the cross-team visibility gating is
++    the predicate itself (owning tenant OR effective team access), not a
++    same-tenant filter — so we WANT to count cross-tenant citers as
++    "inaccessible_count" rather than hide them. The tenant-scope linter's
++    intent is satisfied because we never EXPOSE cross-tenant data — only its
++    count. Access is computed in the SAME SELECT as the citer scan via the
++    ``memory_accessible_to()`` predicate (migration 0035), so there are no
++    per-citer round-trips. The FK on
++    ``memory_references.source_memory_id ... ON DELETE CASCADE`` guarantees
++    every inbound row has a live source memory, so no JOIN to ``memories`` is
++    needed to materialise the citer.
+     """
+     rows = await conn.fetch(
+         """
+-        SELECT mr.source_memory_id, m.team_id AS source_team_id
++        SELECT mr.source_memory_id,
++               memory_accessible_to($2, mr.source_memory_id) AS accessible
+         FROM memory_references mr
+-        JOIN memories m ON m.id = mr.source_memory_id
+         WHERE mr.target_memory_id = $1
+         """,
+         target_memory_id,
++        caller_user_id,
+     )
+     if not rows:
+         return
+ 
+-    # Per-citer access check via user_effective_team_access lookup.
+     accessible: list[UUID] = []
+     inaccessible_count = 0
+     for r in rows:
+-        access = await conn.fetchval(
+-            "SELECT 1 FROM user_effective_team_access "
+-            "WHERE user_id = $1 AND resource_team_id = $2",
+-            caller_user_id,
+-            r["source_team_id"],
+-        )
+-        if access is not None:
++        if r["accessible"]:
+             accessible.append(r["source_memory_id"])
+         else:
+             inaccessible_count += 1
+diff --git a/tests/integration/test_references_owner_access.py b/tests/integration/test_references_owner_access.py
+new file mode 100644
+index 0000000..d2300e7
+--- /dev/null
++++ b/tests/integration/test_references_owner_access.py
+@@ -0,0 +1,613 @@
++"""Reference-access incident: a raw-SQL-provisioned owner is denied its own memory.
++
++A user provisioned the "natural" backfill way (tenant + personal team + owner
++assignment + primary identity, with NO `assign_role` call and therefore NO
++`user_effective_team_access` rows) must be able to reference its OWN memory.
++The old UETA-only access check denied such an owner its own personal-team
++memory; the `memory_accessible_to()` predicate (migration 0035, "owning tenant
++OR effective team access") fixes this.
++
++Cases covered:
++  1. own-memory resolve succeeds — UUID path AND slug-tuple path.
++  2. cross-tenant denial raises the IDENTICAL opaque error/message as a random
++     UUID miss (domain exception + SDK PluginValidationError envelope).
++  3. a memory with team_id IS NULL is NOT referenceable by another tenant
++     (the old `team_id IS NULL -> skip` hole is closed), but the owner can
++     still resolve its own.
++  4. team access granted via `assign_role` (which fills UETA) still works after
++     the fix — i.e. the fix doesn't break the team-access path.
++  5. check_hard_delete_with_filtered_citers: an owner's own citer shows up in
++     accessible_citers, a stranger's citer is counted in inaccessible_count
++     (no UETA needed for the owner).
++  6. sdk.refs_in / sdk.refs_out filter out edges to/from an inaccessible
++     other-tenant memory, while returning the owner's own edges.
++  7. a soft-deleted target is rejected opaquely (same not-found/not-accessible
++     message) at both the domain and SDK layers.
++
++All provisioning mirrors `_provision_user_like_backfill` in
++`test_references_own_memory_repro.py` (raw SQL, no UETA), so these tests
++exercise the exact bug scenario end-to-end.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++from uuid import UUID, uuid4
++
++import pytest
++
++from mem_mcp.mcp.tools.write import ReferenceInput
++from mem_mcp.plugins.contract import PluginValidationError
++from mem_mcp.teams.assignments import assign_role
++from mem_mcp.teams.references import (
++    HardDeleteBlockedError,
++    ReferenceTargetNotFoundError,
++    check_hard_delete_with_filtered_citers,
++    insert_reference,
++    resolve_reference_target,
++)
++
++pytestmark = pytest.mark.asyncio
++
++# Single synthetic plugin id used by every provisioned user here so the
++# oauth_clients FK row is shared (ON CONFLICT DO NOTHING makes that safe).
++_PLUGIN_ID = "owner-access"
++_OAUTH_CLIENT_ID = f"plugin:{_PLUGIN_ID}"
++_OPAQUE_MSG = "reference target not found or not accessible"
++
++
++async def _provision_user(conn: Any, label: str) -> dict[str, Any]:
++    """Tenant + personal team + owner assignment + primary identity via raw SQL
++    (the way the 0026 backfill provisioned existing users). No `assign_role`
++    call => NO `user_effective_team_access` rows for this user."""
++    tenant = await conn.fetchval(
++        "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++        f"{label}-{uuid4()}@example.test",
++    )
++    team = await conn.fetchval(
++        "INSERT INTO teams (name, created_by_tenant_id, team_type) "
++        "VALUES ($1, $2, 'personal') RETURNING id",
++        f"{label}-{uuid4().hex[:8]}",
++        tenant,
++    )
++    owner_role_id = await conn.fetchval(
++        "SELECT id FROM roles_catalog WHERE role_key = 'owner' AND plugin_id IS NULL"
++    )
++    await conn.execute(
++        """
++        INSERT INTO team_role_assignments
++            (parent_team_id, member_kind, member_id, role_id, status, assigned_by_user_id)
++        VALUES ($1, 'user', $2, $3, 'active', $2)
++        """,
++        team,
++        tenant,
++        owner_role_id,
++    )
++    await conn.execute(
++        """
++        INSERT INTO tenant_identities
++        (tenant_id, cognito_sub, provider, email, is_primary, default_team_id)
++        VALUES ($1, $2, 'cognito', $3, true, $4)
++        """,
++        tenant,
++        f"sub-{label}-{tenant}",
++        f"{label}-{tenant}@example.test",
++        team,
++    )
++    await conn.execute(
++        """
++        INSERT INTO oauth_clients
++        (id, redirect_uris, scope, registration_payload, review_status)
++        VALUES ($1, ARRAY[]::text[], 'memory.read memory.write',
++                '{}'::jsonb, 'auto_allowed')
++        ON CONFLICT (id) DO NOTHING
++        """,
++        _OAUTH_CLIENT_ID,
++    )
++    return {"tenant": tenant, "team": team}
++
++
++async def _insert_memory_direct(
++    conn: Any,
++    *,
++    tenant_id: UUID,
++    team_id: UUID | None,
++    content: str = "c",
++    type: str = "note",
++    visibility: str = "team",
++) -> UUID:
++    mid = await conn.fetchval(
++        "INSERT INTO memories (tenant_id, team_id, content, content_hash, "
++        "embedding, source_kind, type, visibility) "
++        "VALUES ($1, $2, $3, $4, array_fill(0::real, ARRAY[1024])::vector, "
++        "'api', $5, $6) RETURNING id",
++        tenant_id,
++        team_id,
++        content,
++        f"hash-{uuid4().hex}",
++        type,
++        visibility,
++    )
++    assert isinstance(mid, UUID)
++    return mid
++
++
++async def _cleanup(pool: Any, tenants: list[UUID], teams: list[UUID]) -> None:
++    """FK-safe teardown for raw-provisioned tenants/teams (one pass)."""
++    async with pool.acquire() as conn:
++        async with conn.transaction():
++            await conn.execute(
++                """
++                DELETE FROM memory_references
++                WHERE target_team_id = ANY($1::uuid[])
++                   OR source_memory_id IN (
++                       SELECT id FROM memories WHERE tenant_id = ANY($2::uuid[])
++                   )
++                   OR target_memory_id IN (
++                       SELECT id FROM memories WHERE tenant_id = ANY($2::uuid[])
++                   )
++                """,
++                teams,
++                tenants,
++            )
++            # Explicit UETA clearing is robust regardless of whether the
++            # teams FK cascades on delete.
++            await conn.execute(
++                "DELETE FROM user_effective_team_access WHERE resource_team_id = "
++                "ANY($1::uuid[])",
++                teams,
++            )
++            await conn.execute(
++                "DELETE FROM slugs WHERE team_id = ANY($1::uuid[])", teams
++            )
++            await conn.execute(
++                "DELETE FROM memories WHERE tenant_id = ANY($1::uuid[])", tenants
++            )
++            await conn.execute(
++                "DELETE FROM team_role_assignments WHERE parent_team_id = "
++                "ANY($1::uuid[])",
++                teams,
++            )
++            await conn.execute(
++                "DELETE FROM tenant_identities WHERE tenant_id = ANY($1::uuid[])",
++                tenants,
++            )
++            await conn.execute("DELETE FROM teams WHERE id = ANY($1::uuid[])", teams)
++            await conn.execute(
++                "DELETE FROM tenants WHERE id = ANY($1::uuid[])", tenants
++            )
++
++
++# ── Case 1: own-memory resolve succeeds (UUID + slug-tuple), no UETA ─────────
++
++
++async def test_resolve_own_memory_uuid_path(pg_pool: Any, sdk_client_factory: Any) -> None:
++    """A raw-SQL-provisioned owner resolves its OWN memory by UUID
++    (the exact repro path: sdk.write -> sdk.get -> the write tool's internal
++    resolve_reference_target succeeds)."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            setup = await _provision_user(conn, "wo1-own-uuid")
++
++    sdk = sdk_client_factory(tenant_id=setup["tenant"], plugin_id=_PLUGIN_ID)
++    try:
++        m1 = await sdk.write("target memory for ref", type="note")
++        assert m1 is not None
++
++        # The owner can read it back (mirrors the repro's pre-condition).
++        got = await sdk.get(memory_id=m1)
++        assert got is not None
++        assert UUID(str(got["id"])) == m1
++
++        # resolve_reference_target (no caller-side UETA needed — owner branch).
++        async with pg_pool.acquire() as conn:
++            resolved = await resolve_reference_target(
++                conn, target_uuid=m1, caller_user_id=setup["tenant"]
++            )
++        assert UUID(str(resolved["memory_id"])) == m1
++        assert resolved["team_id"] == setup["team"]
++    finally:
++        await _cleanup(pg_pool, [setup["tenant"]], [setup["team"]])
++
++
++async def test_resolve_own_memory_slug_tuple_path(pg_pool: Any, sdk_client_factory: Any) -> None:
++    """A raw-SQL-provisioned owner resolves its OWN decision memory by slug-tuple."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            setup = await _provision_user(conn, "wo1-own-slug")
++
++    sdk = sdk_client_factory(tenant_id=setup["tenant"], plugin_id=_PLUGIN_ID)
++    try:
++        written = await sdk.write(
++            "a decision with a slug",
++            type="decision",
++            slug_clue="own-mem-decision",
++        )
++        assert written is not None
++
++        # Read the freshly-minted slug row (slug generation is server-side).
++        async with pg_pool.acquire() as conn:
++            slug_row = await conn.fetchrow(
++                "SELECT team_id, resource_type, slug FROM slugs WHERE memory_id = $1",
++                written,
++            )
++            assert slug_row is not None
++
++            resolved = await resolve_reference_target(
++                conn,
++                target_team_id=slug_row["team_id"],
++                target_resource_type=slug_row["resource_type"],
++                target_slug=slug_row["slug"],
++                caller_user_id=setup["tenant"],
++            )
++        assert UUID(str(resolved["memory_id"])) == written
++        assert resolved["team_id"] == setup["team"]
++    finally:
++        await _cleanup(pg_pool, [setup["tenant"]], [setup["team"]])
++
++
++# ── Case 2: cross-tenant denial == miss (opaque), domain + SDK ──────────────
++
++
++async def test_cross_tenant_denial_matches_miss(pg_pool: Any, sdk_client_factory: Any) -> None:
++    """A different tenant referencing an owner's personal-team memory is
++    denied with the SAME message as a random-UUID miss (IT-08 opacity)."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            owner = await _provision_user(conn, "wo1-deny-owner")
++            stranger = await _provision_user(conn, "wo1-deny-stranger")
++            m_owner = await _insert_memory_direct(
++                conn, tenant_id=owner["tenant"], team_id=owner["team"]
++            )
++            miss_uuid = uuid4()
++
++    sdk_stranger = sdk_client_factory(tenant_id=stranger["tenant"], plugin_id=_PLUGIN_ID)
++    try:
++        # Domain layer: no-access vs miss -> identical ReferenceTargetNotFoundError.
++        err_no_access: ReferenceTargetNotFoundError | None = None
++        err_miss: ReferenceTargetNotFoundError | None = None
++        async with pg_pool.acquire() as conn:
++            try:
++                await resolve_reference_target(
++                    conn, target_uuid=m_owner, caller_user_id=stranger["tenant"]
++                )
++            except ReferenceTargetNotFoundError as e:
++                err_no_access = e
++            try:
++                await resolve_reference_target(
++                    conn, target_uuid=miss_uuid, caller_user_id=stranger["tenant"]
++                )
++            except ReferenceTargetNotFoundError as e:
++                err_miss = e
++        assert err_no_access is not None
++        assert err_miss is not None
++        assert str(err_no_access) == _OPAQUE_MSG
++        assert str(err_miss) == _OPAQUE_MSG
++        assert err_no_access.args == err_miss.args  # identical, not just same text
++
++        # SDK layer: both raise PluginValidationError(code="memory_not_accessible")
++        # with the identical message.
++        with pytest.raises(PluginValidationError) as ei_no_access:
++            await sdk_stranger.write(
++                "stranger cites owner's memory",
++                type="note",
++                references=[ReferenceInput(target_uuid=m_owner, reference_kind="cites")],
++            )
++        with pytest.raises(PluginValidationError) as ei_miss:
++            await sdk_stranger.write(
++                "stranger cites phantom",
++                type="note",
++                references=[
++                    ReferenceInput(target_uuid=miss_uuid, reference_kind="cites")
++                ],
++            )
++        assert (
++            ei_no_access.value.code
++            == ei_miss.value.code
++            == "memory_not_accessible"
++        )
++        assert ei_no_access.value.message == ei_miss.value.message == _OPAQUE_MSG
++    finally:
++        await _cleanup(
++            pg_pool,
++            [owner["tenant"], stranger["tenant"]],
++            [owner["team"], stranger["team"]],
++        )
++
++
++# ── Case 3: null-team memory not referenceable cross-tenant ─────────────────
++
++
++async def test_null_team_memory_not_referenceable_cross_tenant(
++    pg_pool: Any,
++) -> None:
++    """A memory with team_id IS NULL is referenceable ONLY by its owner.
++    The old ``team_id IS NULL -> skip`` hole (grant access to anyone) is gone."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            owner = await _provision_user(conn, "wo1-null-owner")
++            stranger = await _provision_user(conn, "wo1-null-stranger")
++            # team_id NULL + visibility 'external' (consistency CHECK was dropped
++            # in 0026, so this is a legal row).
++            m_null = await _insert_memory_direct(
++                conn, tenant_id=owner["tenant"], team_id=None, visibility="external"
++            )
++
++    try:
++        # Owner resolves its own null-team memory.
++        async with pg_pool.acquire() as conn:
++            resolved = await resolve_reference_target(
++                conn, target_uuid=m_null, caller_user_id=owner["tenant"]
++            )
++        assert UUID(str(resolved["memory_id"])) == m_null
++
++        # Stranger is denied (team_id IS NULL -> no UETA branch -> owner-only).
++        async with pg_pool.acquire() as conn:
++            with pytest.raises(ReferenceTargetNotFoundError) as excinfo:
++                await resolve_reference_target(
++                    conn, target_uuid=m_null, caller_user_id=stranger["tenant"]
++                )
++        assert str(excinfo.value) == _OPAQUE_MSG
++    finally:
++        await _cleanup(
++            pg_pool,
++            [owner["tenant"], stranger["tenant"]],
++            [owner["team"], stranger["team"]],
++        )
++
++
++# ── Case 4: assign_role team access still works after the fix ───────────────
++
++
++async def test_assign_role_team_access_still_resolves(
++    pg_pool: Any, sdk_client_factory: Any
++) -> None:
++    """Granting a raw-provisioned user access to another team via `assign_role`
++    (which materialises UETA) still lets them resolve a memory in that team —
++    the fix doesn't regress the team-access gate."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            owner = await _provision_user(conn, "wo1-team-owner")
++            member = await _provision_user(conn, "wo1-team-member")
++
++            # A project team owned by `owner` (team_type 'project' is a valid
++            # value; 'shared' would violate the 0022 CHECK).
++            project_team = await conn.fetchval(
++                "INSERT INTO teams (name, created_by_tenant_id, team_type) "
++                "VALUES ($1, $2, 'project') RETURNING id",
++                f"wo1-project-{uuid4().hex[:8]}",
++                owner["tenant"],
++            )
++
++            # A memory owned by `owner` living on the project team.
++            m = await _insert_memory_direct(
++                conn,
++                tenant_id=owner["tenant"],
++                team_id=project_team,
++                visibility="team",
++            )
++
++            # assign_role (member_kind='user') sync-refreshes UETA for
++            # (member, project_team) immediately, in this same transaction.
++            await assign_role(
++                conn,
++                parent_team_id=project_team,
++                member_kind="user",
++                member_id=member["tenant"],
++                role_key="member",
++                assigned_by_user_id=owner["tenant"],
++            )
++
++    try:
++        # member now carries UETA on the project team -> resolves the owner's
++        # memory there despite being a different tenant.
++        async with pg_pool.acquire() as conn:
++            resolved = await resolve_reference_target(
++                conn, target_uuid=m, caller_user_id=member["tenant"]
++            )
++        assert UUID(str(resolved["memory_id"])) == m
++        assert resolved["team_id"] == project_team
++
++        # End-to-end through the write tool: the member can cite the owner's
++        # memory (write.py's resolve_reference_target now succeeds).
++        sdk_member = sdk_client_factory(
++            tenant_id=member["tenant"], plugin_id=_PLUGIN_ID
++        )
++        citer = await sdk_member.write(
++            "member cites owner's project-team memory",
++            type="note",
++            references=[ReferenceInput(target_uuid=m, reference_kind="cites")],
++        )
++        assert citer is not None
++    finally:
++        await _cleanup(
++            pg_pool,
++            [owner["tenant"], member["tenant"]],
++            [owner["team"], member["team"], project_team],
++        )
++
++
++# ── Case 5: check_hard_delete filtered citers, owner sees own citer ──────────
++
++
++async def test_hard_delete_sees_own_citer_counts_stranger(pg_pool: Any) -> None:
++    """check_hard_delete_with_filtered_citers, for an owner with NO UETA:
++    own citer is accessible; a stranger's citer is counted only (inaccessible).
++
++    The HardDeleteBlockedError is allowed to propagate out of the transaction
++    (catching it with pytest.raises AROUND the tx, not inside), so
++    ``async with conn.transaction()`` rolls the fixture back on the passing
++    path — there's nothing to leave behind.
++    """
++    with pytest.raises(HardDeleteBlockedError) as exc:
++        async with pg_pool.acquire() as conn:
++            async with conn.transaction():
++                owner = await _provision_user(conn, "wo1-del-owner")
++                stranger = await _provision_user(conn, "wo1-del-stranger")
++                target = await _insert_memory_direct(
++                    conn,
++                    tenant_id=owner["tenant"],
++                    team_id=owner["team"],
++                    content="target",
++                )
++                own_citer = await _insert_memory_direct(
++                    conn,
++                    tenant_id=owner["tenant"],
++                    team_id=owner["team"],
++                    content="own citer",
++                )
++                stranger_citer = await _insert_memory_direct(
++                    conn,
++                    tenant_id=stranger["tenant"],
++                    team_id=stranger["team"],
++                    content="stranger citer",
++                )
++
++                await insert_reference(
++                    conn,
++                    source_memory_id=own_citer,
++                    target_memory_id=target,
++                    target_team_id=owner["team"],
++                    reference_kind="cites",
++                )
++                await insert_reference(
++                    conn,
++                    source_memory_id=stranger_citer,
++                    target_memory_id=target,
++                    target_team_id=owner["team"],
++                    reference_kind="cites",
++                )
++
++                await check_hard_delete_with_filtered_citers(
++                    conn,
++                    target_memory_id=target,
++                    caller_user_id=owner["tenant"],
++                )
++    assert exc.value.accessible_citers == [own_citer]
++    assert exc.value.inaccessible_count == 1
++    assert stranger_citer not in exc.value.accessible_citers
++
++
++# ── Case 6: refs_in / refs_out filter inaccessible edges, keep owner edges ---
++
++
++async def test_refs_in_out_filter_inaccessible_keep_owner(
++    pg_pool: Any, sdk_client_factory: Any
++) -> None:
++    """For a raw-SQL-provisioned owner, refs_out drops edges whose target is
++    an inaccessible other-tenant memory, and refs_in drops edges whose source is,
++    while still returning the owner's own edges."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            owner = await _provision_user(conn, "wo1-refs-owner")
++            other = await _provision_user(conn, "wo1-refs-other")
++
++    sdk_owner = sdk_client_factory(tenant_id=owner["tenant"], plugin_id=_PLUGIN_ID)
++    sdk_other = sdk_client_factory(tenant_id=other["tenant"], plugin_id=_PLUGIN_ID)
++    try:
++        src = await sdk_owner.write("owner source memory", type="note")
++        own_target = await sdk_owner.write("owner target (accessible)", type="note")
++        other_mem = await sdk_other.write("other tenant memory (inaccessible)", type="note")
++
++        # Inject three citation edges directly (cross-team resolution is IT-08
++        # opaque, so we can't use sdk.write(references=...)).
++        async with pg_pool.acquire() as conn:
++            async with conn.transaction():
++                # owner source -> owner target  (accessible)
++                await conn.execute(
++                    """
++                    INSERT INTO memory_references
++                    (source_memory_id, target_memory_id, target_team_id,
++                     target_fragment, reference_kind, refs_version)
++                    VALUES ($1, $2, $3, -1, 'cites', 'pinned')
++                    """,
++                    src,
++                    own_target,
++                    owner["team"],
++                )
++                # owner source -> other-tenant target  (inaccessible)
++                await conn.execute(
++                    """
++                    INSERT INTO memory_references
++                    (source_memory_id, target_memory_id, target_team_id,
++                     target_fragment, reference_kind, refs_version)
++                    VALUES ($1, $2, $3, -1, 'cites', 'pinned')
++                    """,
++                    src,
++                    other_mem,
++                    other["team"],
++                )
++                # other-tenant source -> owner source (inaccessible inbound)
++                await conn.execute(
++                    """
++                    INSERT INTO memory_references
++                    (source_memory_id, target_memory_id, target_team_id,
++                     target_fragment, reference_kind, refs_version)
++                    VALUES ($1, $2, $3, -1, 'cites', 'pinned')
++                    """,
++                    other_mem,
++                    src,
++                    owner["team"],
++                )
++
++        # refs_out: only the owner-to-owner edge survives.
++        out_edges = await sdk_owner.refs_out(src)
++        out_targets = {e.get("target_memory_id") for e in out_edges}
++        assert str(own_target) in out_targets
++        assert str(other_mem) not in out_targets
++        assert len(out_edges) == 1
++
++        # refs_in: the other-tenant inbound edge is filtered out.
++        in_edges = await sdk_owner.refs_in(src)
++        assert in_edges == []
++    finally:
++        await _cleanup(
++            pg_pool,
++            [owner["tenant"], other["tenant"]],
++            [owner["team"], other["team"]],
++        )
++
++
++# ── Case 7: deleted target rejected opaquely (domain + SDK) ─────────────────
++
++
++async def test_deleted_target_rejected_opaquely(
++    pg_pool: Any, sdk_client_factory: Any
++) -> None:
++    """Soft-deleting the owned target must still surface as the opaque
++    'not found or not accessible' error at both the domain and SDK layers."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            owner = await _provision_user(conn, "wo1-del-target")
++            target = await _insert_memory_direct(
++                conn,
++                tenant_id=owner["tenant"],
++                team_id=owner["team"],
++                content="target soon deleted",
++            )
++
++    sdk_owner = sdk_client_factory(tenant_id=owner["tenant"], plugin_id=_PLUGIN_ID)
++    try:
++        # Soft-delete the target (direct SQL — it's the owner deleting its own).
++        async with pg_pool.acquire() as conn:
++            await conn.execute("UPDATE memories SET deleted_at = now() WHERE id = $1", target)
++
++        # Domain: resolve rejects with the opaque identity-no-leak message.
++        async with pg_pool.acquire() as conn:
++            with pytest.raises(ReferenceTargetNotFoundError) as excinfo:
++                await resolve_reference_target(
++                    conn, target_uuid=target, caller_user_id=owner["tenant"]
++                )
++        assert str(excinfo.value) == _OPAQUE_MSG
++
++        # SDK: citing the deleted target is rejected identically.
++        with pytest.raises(PluginValidationError) as ei:
++            await sdk_owner.write(
++                "citer of a deleted target",
++                type="note",
++                references=[ReferenceInput(target_uuid=target, reference_kind="cites")],
++            )
++        assert ei.value.code == "memory_not_accessible"
++        assert ei.value.message == _OPAQUE_MSG
++    finally:
++        await _cleanup(pg_pool, [owner["tenant"]], [owner["team"]])

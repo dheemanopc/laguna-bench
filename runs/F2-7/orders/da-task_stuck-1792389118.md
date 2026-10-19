@@ -1,0 +1,3 @@
+```json
+{"action":"retry","guidance":"mindmaps.py already had `import asyncpg  # type: ignore[import-untyped]` at baseline (commit 5406436, line 21). Restore that exact line as a top-level import. It is not an added line, so the harness won't flag it. The previous attempt wrongly removed it.\nIn workflows.py, don't import asyncpg. Add `Pool = asyncpg.Pool` next to `Conn = asyncpg.Connection` in mindmap/work_items.py, and use `from mem_mcp.mindmap.work_items import Pool` for `pool: Pool`.\nDon't use `Any` and don't add any new `type: ignore`.\nCheck with `git diff 5406436 | grep '^+.*type: ignore'`, which must print nothing. Then re-run ruff, mypy and pytest.","new_tasks":[]}
+```

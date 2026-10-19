@@ -1,0 +1,1259 @@
+diff --git a/src/mem_mcp/admin/__init__.py b/src/mem_mcp/admin/__init__.py
+new file mode 100644
+index 0000000..fb23345
+--- /dev/null
++++ b/src/mem_mcp/admin/__init__.py
+@@ -0,0 +1 @@
++"""Operator-facing admin services (cross-tenant, transport-agnostic)."""
+diff --git a/src/mem_mcp/admin/errors.py b/src/mem_mcp/admin/errors.py
+new file mode 100644
+index 0000000..74b91bb
+--- /dev/null
++++ b/src/mem_mcp/admin/errors.py
+@@ -0,0 +1,15 @@
++"""Domain exceptions for the admin package.
++
++Transport layers (MCP tools, web handlers) map these to their own error
++types; this package never imports FastAPI or ``JsonRpcError``.
++"""
++
++from __future__ import annotations
++
++
++class AdminError(Exception):
++    """Base class for admin-service errors."""
++
++
++class NotFoundError(AdminError):
++    """The requested record does not exist."""
+diff --git a/src/mem_mcp/admin/service.py b/src/mem_mcp/admin/service.py
+new file mode 100644
+index 0000000..8e70b5d
+--- /dev/null
++++ b/src/mem_mcp/admin/service.py
+@@ -0,0 +1,166 @@
++"""Admin user lookup service — read-only, cross-tenant by design.
++
++Operators with the ``system_admin`` role need to answer "who is X and which
++teams are they in?" across every tenant. That is inherently cross-tenant, so
++these functions:
++
++* do NOT filter by the caller's tenant and never read ``app.current_tenant_id``
++  (after a rolled-back ``tenant_tx`` the GUC reads back ``''``, so reading it
++  would be both meaningless and fragile);
++* MUST be called on a ``system_tx`` connection (BYPASSRLS role in prod);
++* assume the **caller has already authorized** the operator
++  (``system.manage_tenants``). The MCP layer does this via ``AdminTool``;
++  authorization is deliberately not repeated here so the service stays
++  transport-agnostic.
++
++Team membership comes from ``team_role_assignments`` + ``roles_catalog`` (the
++RBAC source of truth), never the legacy ``team_members`` table.
++"""
++
++from __future__ import annotations
++
++from datetime import datetime
++from typing import TYPE_CHECKING, Any
++from uuid import UUID
++
++from pydantic import BaseModel
++
++from mem_mcp.admin.errors import NotFoundError
++
++if TYPE_CHECKING:
++    import asyncpg  # type: ignore[import-untyped]
++
++DEFAULT_LIMIT = 20
++MAX_LIMIT = 100
++MIN_QUERY_LEN = 2
++
++
++class AdminUserSummary(BaseModel):
++    """One tenant plus its primary identity (identity fields null if none)."""
++
++    tenant_id: str
++    email: str
++    display_name: str | None
++    status: str
++    created_at: datetime
++    provider: str | None
++    workspace_domain: str | None
++    default_team_id: str | None
++
++
++class AdminUserTeam(BaseModel):
++    """A team the user actively belongs to, with their role in it."""
++
++    team_id: str
++    team_name: str
++    role_key: str
++
++
++class AdminUserDetail(AdminUserSummary):
++    """Summary plus system roles and team memberships."""
++
++    system_roles: list[str]
++    teams: list[AdminUserTeam]
++
++
++def _escape_like(raw: str) -> str:
++    """Escape LIKE metacharacters. Backslash first so we don't double-escape."""
++    return raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
++
++
++def _clamp_limit(limit: int | None) -> int:
++    """Default None to DEFAULT_LIMIT and clamp into 1..MAX_LIMIT; never raises."""
++    if limit is None:
++        return DEFAULT_LIMIT
++    return max(1, min(MAX_LIMIT, limit))
++
++
++def _summary_fields(r: Any) -> dict[str, Any]:
++    return {
++        "tenant_id": str(r["id"]),
++        "email": r["email"],
++        "display_name": r["display_name"],
++        "status": r["status"],
++        "created_at": r["created_at"],
++        "provider": r["provider"],
++        "workspace_domain": r["workspace_domain"],
++        "default_team_id": str(r["default_team_id"]) if r["default_team_id"] else None,
++    }
++
++
++async def find_users(
++    conn: asyncpg.Connection,
++    *,
++    query: str,
++    limit: int | None = None,
++) -> list[AdminUserSummary]:
++    """Case-insensitive substring search over tenant email / display name.
++
++    Raises ``ValueError`` if the stripped query is shorter than 2 characters
++    (a 1-char substring would dump most of the table).
++    """
++    q = query.strip()
++    if len(q) < MIN_QUERY_LEN:
++        raise ValueError(f"query must be at least {MIN_QUERY_LEN} characters")
++
++    # ESCAPE '\' + _escape_like make the user's text a literal substring.
++    rows = await conn.fetch(
++        """
++        SELECT t.id, t.email, t.display_name, t.status, t.created_at,
++               ti.provider, ti.workspace_domain, ti.default_team_id
++        FROM tenants t
++        LEFT JOIN tenant_identities ti ON ti.tenant_id = t.id AND ti.is_primary
++        WHERE t.email ILIKE '%' || $1 || '%' ESCAPE '\\'
++           OR t.display_name ILIKE '%' || $1 || '%' ESCAPE '\\'
++        ORDER BY t.created_at DESC, t.id
++        LIMIT $2
++        """,
++        _escape_like(q),
++        _clamp_limit(limit),
++    )
++    return [AdminUserSummary(**_summary_fields(r)) for r in rows]
++
++
++async def get_user(conn: asyncpg.Connection, *, tenant_id: UUID) -> AdminUserDetail:
++    """Full admin view of one tenant. Raises ``NotFoundError`` if unknown."""
++    row = await conn.fetchrow(
++        """
++        SELECT t.id, t.email, t.display_name, t.status, t.created_at,
++               ti.provider, ti.workspace_domain, ti.default_team_id
++        FROM tenants t
++        LEFT JOIN tenant_identities ti ON ti.tenant_id = t.id AND ti.is_primary
++        WHERE t.id = $1
++        """,
++        tenant_id,
++    )
++    if row is None:
++        raise NotFoundError(f"user {tenant_id} not found")
++
++    role_rows = await conn.fetch(
++        "SELECT role FROM tenant_system_roles WHERE tenant_id = $1 ORDER BY role",
++        tenant_id,
++    )
++    team_rows = await conn.fetch(
++        """
++        SELECT tm.id AS team_id, tm.name AS team_name, rc.role_key
++        FROM team_role_assignments tra
++        JOIN roles_catalog rc ON rc.id = tra.role_id
++        JOIN teams tm ON tm.id = tra.parent_team_id
++        WHERE tra.member_kind = 'user'
++          AND tra.member_id = $1
++          AND tra.status = 'active'
++          AND tm.deleted_at IS NULL
++        ORDER BY tm.name, tm.id
++        """,
++        tenant_id,
++    )
++    return AdminUserDetail(
++        **_summary_fields(row),
++        system_roles=sorted(r["role"] for r in role_rows),
++        teams=[
++            AdminUserTeam(
++                team_id=str(r["team_id"]), team_name=r["team_name"], role_key=r["role_key"]
++            )
++            for r in team_rows
++        ],
++    )
+diff --git a/src/mem_mcp/audit/logger.py b/src/mem_mcp/audit/logger.py
+index b467fe8..1e63c12 100644
+--- a/src/mem_mcp/audit/logger.py
++++ b/src/mem_mcp/audit/logger.py
+@@ -87,6 +87,9 @@ AUDIT_ACTIONS: tuple[str, ...] = (
+     "skill.kite.intent_confirmed",
+     "skill.kite.intent_cancelled",
+     "skill.kite.intent_smoke_failed",
++    # admin
++    "admin.find_user",
++    "admin.get_user",
+ )
+ 
+ 
+@@ -136,6 +139,8 @@ AuditAction = Literal[
+     "skill.kite.intent_confirmed",
+     "skill.kite.intent_cancelled",
+     "skill.kite.intent_smoke_failed",
++    "admin.find_user",
++    "admin.get_user",
+ ]
+ 
+ AuditResult = Literal["success", "denied", "error"]
+diff --git a/src/mem_mcp/main.py b/src/mem_mcp/main.py
+index 43fd184..d7beed6 100644
+--- a/src/mem_mcp/main.py
++++ b/src/mem_mcp/main.py
+@@ -56,6 +56,8 @@ from mem_mcp.logging_setup import get_logger, setup_logging
+ from mem_mcp.mcp.registry import ToolRegistry
+ from mem_mcp.mcp.tools._deps import make_default_deps
+ from mem_mcp.mcp.tools.add_team_member import AddTeamMemberTool
++from mem_mcp.mcp.tools.admin_find_user import AdminFindUserTool
++from mem_mcp.mcp.tools.admin_get_user import AdminGetUserTool
+ from mem_mcp.mcp.tools.assign_role import AssignRoleTool
+ from mem_mcp.mcp.tools.create_team import CreateTeamTool
+ from mem_mcp.mcp.tools.delete import MemoryDeleteTool
+@@ -515,6 +517,9 @@ def _wire_routers(app: FastAPI) -> None:
+         MindmapAnswerTool,
+         MindmapListTool,
+         MindmapQueueTool,
++        # admin (operator-only; gated by system.manage_tenants via AdminTool)
++        AdminFindUserTool,
++        AdminGetUserTool,
+     ]
+     for tool_cls in tools_list:  # type: ignore[attr-defined]
+         registry.register(tool_cls)  # type: ignore[arg-type]
+diff --git a/src/mem_mcp/mcp/tool_descriptions.py b/src/mem_mcp/mcp/tool_descriptions.py
+index 8259702..f4018d4 100644
+--- a/src/mem_mcp/mcp/tool_descriptions.py
++++ b/src/mem_mcp/mcp/tool_descriptions.py
+@@ -373,6 +373,24 @@ The (team, member_kind, member_id) tuple is unique; this UPSERTs the role_id. Co
+ Required scope: memory.write.
+ 
+ Examples: "Promote user X to admin in team T" → memsys_assign_role(team_id="T", member_kind="user", member_id="X", new_role_key="admin").""",
++    "memsys_admin_find_user": """Operator lookup: search users across ALL tenants by email or display name (case-insensitive substring) and return a short summary for each match.
++
++Call when: an operator asks "who is manasi", "find the user with email <email>", or needs a tenant_id to pass to memsys_admin_get_user. Requires the `system_admin` operator permission (system.manage_tenants); every call is audited, including refusals.
++
++Do not call for: listing the caller's own teams (use memsys_list_my_teams); searching memory content (use memory_search); anything a non-operator asks for — it will be refused.
++
++Inputs: query (2-255 chars; LIKE wildcards are matched literally), limit (1-100, default 20). Results are newest-first. Output: users (array of {tenant_id, email, display_name, status, created_at, provider, workspace_domain, default_team_id}), count.
++
++Examples: "Who is manasi?" → memsys_admin_find_user(query="manasi"). "Find everyone at acme.com" → memsys_admin_find_user(query="@acme.com", limit=50).""",
++    "memsys_admin_get_user": """Operator lookup: fetch one user's full admin view by tenant_id — identity details, system roles and the teams they actively belong to with their role in each.
++
++Call when: an operator asks "which teams is she in", "does this user have system roles", or after memsys_admin_find_user returned a tenant_id to inspect. Requires the `system_admin` operator permission (system.manage_tenants); every call is audited, including refusals.
++
++Do not call for: searching by name or email (use memsys_admin_find_user first); the caller's own teams (use memsys_list_my_teams); anything a non-operator asks for — it will be refused.
++
++Inputs: tenant_id (UUID). Output: user ({tenant_id, email, display_name, status, created_at, provider, workspace_domain, default_team_id, system_roles, teams[{team_id, team_name, role_key}]}). Unknown tenant_id returns an invalid-params error.
++
++Examples: "Which teams is manasi in?" → memsys_admin_find_user(query="manasi") then memsys_admin_get_user(tenant_id="<uuid>").""",
+     "memsys_slug_lookup": """Look up a memory by slug (short human-readable identifier) within a team.
+ 
+ Call when: you have a slug from another memory's reference or from earlier context; you need to resolve a slug-based identifier to a memory UUID for further operations.
+diff --git a/src/mem_mcp/mcp/tools/_admin_base.py b/src/mem_mcp/mcp/tools/_admin_base.py
+new file mode 100644
+index 0000000..6184ce2
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/_admin_base.py
+@@ -0,0 +1,156 @@
++"""AdminTool — base class for operator (system-role) MCP tools.
++
++Why a base class: every admin tool must (1) check an RBAC ``system.*``
++permission before touching any input-dependent data and (2) write exactly one
++audit row per call, attributed to the *caller*. Putting both in a final
++``__call__`` means a future admin tool cannot ship without them: subclasses
++implement ``run()`` only, and defining ``__call__`` is a TypeError at class
++definition time.
++
++Flow (see ``__call__``):
++  * permission check + denial audit share one ``system_tx`` that commits, so
++    the denied row survives; the error is raised after the block. Denial
++    happens before any lookup, so it is identical whether or not the target
++    record exists (no existence oracle).
++  * ``run()`` executes on a ``system_tx``; its success audit rides that tx.
++  * if ``run()`` raises, its tx rolls back (taking its audit with it), so an
++    ``error`` row is written on a fresh ``system_tx`` and the original
++    exception is re-raised unchanged.
++"""
++
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++from typing import TYPE_CHECKING, Any, ClassVar
++
++from pydantic import BaseModel
++
++from mem_mcp.audit.logger import AuditAction, AuditResult
++from mem_mcp.auth.permissions import Permission
++from mem_mcp.auth.rbac import has_permission
++from mem_mcp.db import system_tx
++from mem_mcp.logging_setup import get_logger
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tools._base import ToolContext
++
++if TYPE_CHECKING:
++    import asyncpg  # type: ignore[import-untyped]
++
++_log = get_logger("mem_mcp.mcp.tools.admin")
++
++
++class AdminTool(ABC):
++    """Abstract base for tools gated by a ``system.*`` permission."""
++
++    name: ClassVar[str]
++    description: ClassVar[str]
++    # No `memory.admin` Cognito scope exists yet; the RBAC permission below is
++    # the real control, this scope is only the coarse OAuth gate.
++    required_scope: ClassVar[str] = "memory.read"
++    InputModel: ClassVar[type[BaseModel]]
++    OutputModel: ClassVar[type[BaseModel]]
++    required_permission: ClassVar[Permission]
++    audit_action: ClassVar[AuditAction]
++
++    def __init_subclass__(cls, **kwargs: Any) -> None:
++        super().__init_subclass__(**kwargs)
++        if "__call__" in cls.__dict__:
++            raise TypeError(
++                f"{cls.__name__} must not override __call__; AdminTool owns the "
++                "permission check and audit. Implement run() instead."
++            )
++        # Abstract intermediates may omit the attributes; concrete tools may not.
++        # (ABCMeta computes __abstractmethods__ only after this hook runs, so
++        # test `run` itself.)
++        if getattr(cls.run, "__isabstractmethod__", False):
++            return
++        perm = getattr(cls, "required_permission", None)
++        if not isinstance(perm, Permission) or not perm.value.startswith("system."):
++            raise TypeError(
++                f"{cls.__name__}.required_permission must be a system.* Permission, got {perm!r}"
++            )
++        action = getattr(cls, "audit_action", None)
++        if not isinstance(action, str) or not action.startswith("admin."):
++            raise TypeError(f"{cls.__name__}.audit_action must start with 'admin.', got {action!r}")
++
++    @abstractmethod
++    async def run(self, conn: asyncpg.Connection, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        """Do the work on a ``system_tx`` connection. Caller is already authorized."""
++
++    async def _audit(
++        self,
++        conn: asyncpg.Connection,
++        ctx: ToolContext,
++        *,
++        result: AuditResult,
++        error_code: str | None = None,
++        extra: dict[str, Any] | None = None,
++    ) -> None:
++        if ctx.deps is None:  # same convention as the other tools: no deps, no audit
++            return
++        details: dict[str, Any] = {
++            "via": "mcp",
++            "tool": self.name,
++            "required_permission": self.required_permission.value,
++        }
++        if extra:
++            details.update(extra)
++        await ctx.deps.audit.audit(
++            conn,
++            action=self.audit_action,
++            result=result,
++            tenant_id=ctx.tenant_id,
++            identity_id=ctx.identity_id,
++            client_id=ctx.client_id,
++            request_id=ctx.request_id,
++            error_code=error_code,
++            details=details,
++        )
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        perm = self.required_permission
++        try:
++            async with system_tx(ctx.db_pool) as conn:
++                allowed = await has_permission(conn, ctx.tenant_id, perm)
++                if not allowed:
++                    # Same tx; commits when we leave the block normally.
++                    await self._audit(conn, ctx, result="denied")
++        except Exception as exc:
++            # The check itself failed (DB error etc.): its tx rolled back, so
++            # no denied row exists. Re-raising here means the run() handler
++            # below can never also fire — exactly one row per call.
++            await self._audit_error(ctx, exc)
++            raise
++        if not allowed:
++            raise JsonRpcError(
++                -32603,
++                f"caller lacks required permission: {perm.value}",
++                data={"missing_permission": perm.value},
++            )
++
++        try:
++            async with system_tx(ctx.db_pool) as conn:
++                output = await self.run(conn, ctx, inp)
++                extra: dict[str, Any] = {}
++                count = getattr(output, "count", None)
++                if isinstance(count, int):
++                    extra["result_count"] = count
++                await self._audit(conn, ctx, result="success", extra=extra)
++                return output
++        except Exception as exc:
++            await self._audit_error(ctx, exc)
++            raise
++
++    async def _audit_error(self, ctx: ToolContext, exc: Exception) -> None:
++        """Best-effort ``error`` row on a fresh system_tx; never masks ``exc``."""
++        code = str(exc.code) if isinstance(exc, JsonRpcError) else type(exc).__name__
++        try:
++            async with system_tx(ctx.db_pool) as conn:
++                await self._audit(conn, ctx, result="error", error_code=code)
++        except Exception as audit_exc:
++            _log.warning(
++                "admin_error_audit_failed",
++                tool=self.name,
++                request_id=ctx.request_id,
++                error=type(audit_exc).__name__,
++            )
+diff --git a/src/mem_mcp/mcp/tools/admin_find_user.py b/src/mem_mcp/mcp/tools/admin_find_user.py
+new file mode 100644
+index 0000000..773e137
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/admin_find_user.py
+@@ -0,0 +1,60 @@
++"""memsys_admin_find_user tool — operator cross-tenant user search (read-only)."""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, ClassVar
++
++from pydantic import BaseModel, ConfigDict, Field
++
++from mem_mcp.admin import service
++from mem_mcp.admin.service import AdminUserSummary
++from mem_mcp.audit.logger import AuditAction
++from mem_mcp.auth.permissions import Permission
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._admin_base import AdminTool
++from mem_mcp.mcp.tools._base import ToolContext
++
++if TYPE_CHECKING:
++    import asyncpg  # type: ignore[import-untyped]
++
++
++class AdminFindUserInput(BaseModel):
++    """Input for memsys_admin_find_user."""
++
++    model_config = ConfigDict(extra="forbid")
++
++    query: str = Field(min_length=2, max_length=255)
++    limit: int = Field(default=20, ge=1, le=100)
++
++
++class AdminFindUserOutput(BaseModel):
++    """Output for memsys_admin_find_user."""
++
++    users: list[AdminUserSummary]
++    count: int
++    request_id: str
++
++
++class AdminFindUserTool(AdminTool):
++    """Search tenants by email / display name across all tenants."""
++
++    name: ClassVar[str] = "memsys_admin_find_user"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["memsys_admin_find_user"]
++    required_scope: ClassVar[str] = "memory.read"
++    InputModel: ClassVar[type[BaseModel]] = AdminFindUserInput
++    OutputModel: ClassVar[type[BaseModel]] = AdminFindUserOutput
++    required_permission: ClassVar[Permission] = Permission.SYSTEM_MANAGE_TENANTS
++    audit_action: ClassVar[AuditAction] = "admin.find_user"
++
++    async def run(self, conn: asyncpg.Connection, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, AdminFindUserInput)
++        try:
++            users = await service.find_users(conn, query=inp.query, limit=inp.limit)
++        except ValueError as e:
++            raise JsonRpcError(
++                -32602,
++                "invalid params",
++                data={"errors": [{"path": "query", "message": str(e)}]},
++            ) from e
++        return AdminFindUserOutput(users=users, count=len(users), request_id=ctx.request_id)
+diff --git a/src/mem_mcp/mcp/tools/admin_get_user.py b/src/mem_mcp/mcp/tools/admin_get_user.py
+new file mode 100644
+index 0000000..b105781
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/admin_get_user.py
+@@ -0,0 +1,60 @@
++"""memsys_admin_get_user tool — operator cross-tenant user detail (read-only)."""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, ConfigDict
++
++from mem_mcp.admin import service
++from mem_mcp.admin.errors import NotFoundError
++from mem_mcp.admin.service import AdminUserDetail
++from mem_mcp.audit.logger import AuditAction
++from mem_mcp.auth.permissions import Permission
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._admin_base import AdminTool
++from mem_mcp.mcp.tools._base import ToolContext
++
++if TYPE_CHECKING:
++    import asyncpg  # type: ignore[import-untyped]
++
++
++class AdminGetUserInput(BaseModel):
++    """Input for memsys_admin_get_user."""
++
++    model_config = ConfigDict(extra="forbid")
++
++    tenant_id: UUID
++
++
++class AdminGetUserOutput(BaseModel):
++    """Output for memsys_admin_get_user."""
++
++    user: AdminUserDetail
++    request_id: str
++
++
++class AdminGetUserTool(AdminTool):
++    """Fetch one tenant's identity, system roles and team memberships."""
++
++    name: ClassVar[str] = "memsys_admin_get_user"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["memsys_admin_get_user"]
++    required_scope: ClassVar[str] = "memory.read"
++    InputModel: ClassVar[type[BaseModel]] = AdminGetUserInput
++    OutputModel: ClassVar[type[BaseModel]] = AdminGetUserOutput
++    required_permission: ClassVar[Permission] = Permission.SYSTEM_MANAGE_TENANTS
++    audit_action: ClassVar[AuditAction] = "admin.get_user"
++
++    async def run(self, conn: asyncpg.Connection, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, AdminGetUserInput)
++        try:
++            user = await service.get_user(conn, tenant_id=inp.tenant_id)
++        except NotFoundError as e:
++            raise JsonRpcError(
++                -32602,
++                "invalid params",
++                data={"errors": [{"path": "tenant_id", "message": "user not found"}]},
++            ) from e
++        return AdminGetUserOutput(user=user, request_id=ctx.request_id)
+diff --git a/tests/security/test_admin_tools_authz.py b/tests/security/test_admin_tools_authz.py
+new file mode 100644
+index 0000000..ee273e2
+--- /dev/null
++++ b/tests/security/test_admin_tools_authz.py
+@@ -0,0 +1,300 @@
++"""AuthZ + audit tests for the admin MCP tools (memsys_admin_find_user / get_user)."""
++
++from __future__ import annotations
++
++from typing import Any, ClassVar
++from uuid import uuid4
++
++import pytest
++from pydantic import BaseModel
++
++from mem_mcp.auth.permissions import Permission
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.registry import ToolRegistry
++from mem_mcp.mcp.tools._admin_base import AdminTool
++from mem_mcp.mcp.tools.admin_find_user import AdminFindUserInput, AdminFindUserTool
++from mem_mcp.mcp.tools.admin_get_user import AdminGetUserInput, AdminGetUserTool
++from tests.unit._admin_fixtures import (
++    assign_role,
++    audit_rows,
++    make_ctx,
++    make_team,
++    make_tenant,
++)
++
++pytestmark = pytest.mark.security
++
++PERM = "system.manage_tenants"
++
++
++async def _caller(pool: Any, *, kind: str) -> tuple[Any, Any]:
++    async with pool.acquire() as conn:
++        role = "system_admin" if kind == "admin" else None
++        tid, iid, _ = await make_tenant(conn, system_role=role)
++        if kind == "owner":
++            team_id, _ = await make_team(conn, tid)
++            await assign_role(conn, team_id, tid, "owner")
++    return tid, iid
++
++
++def _boom(*_a: Any, **_k: Any) -> Any:
++    raise AssertionError("run() must not be reached on denial")
++
++
+<email>("kind", ["plain", "owner"])
++class TestDenied:
++    async def test_find_user_denied(
++        self, pg_pool: Any, kind: str, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        monkeypatch.setattr(AdminFindUserTool, "run", _boom)
++        tid, iid = await _caller(pg_pool, kind=kind)
++        ctx = make_ctx(pg_pool, tid, iid)
++        with pytest.raises(JsonRpcError) as ei:
++            await AdminFindUserTool()(ctx, AdminFindUserInput(query="anything"))
++        assert ei.value.code == -32603
++        assert ei.value.data == {"missing_permission": PERM}
++        rows = await audit_rows(pg_pool, ctx.request_id)
++        assert len(rows) == 1
++        r = rows[0]
++        assert (r["action"], r["result"]) == ("admin.find_user", "denied")
++        assert r["tenant_id"] == tid and r["actor_identity_id"] == iid
++        assert r["actor_client_id"] == "test-client"
++        import json
++
++        d = json.loads(r["details"]) if isinstance(r["details"], str) else r["details"]
++        assert d["via"] == "mcp" and d["required_permission"] == PERM
++        assert d["tool"] == "memsys_admin_find_user"
++
++    async def test_get_user_denied_identically_for_existing_and_random(
++        self, pg_pool: Any, kind: str, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        monkeypatch.setattr(AdminGetUserTool, "run", _boom)
++        tid, iid = await _caller(pg_pool, kind=kind)
++        async with pg_pool.acquire() as conn:
++            existing, _, _ = await make_tenant(conn)
++        seen = []
++        for target in (existing, uuid4()):
++            ctx = make_ctx(pg_pool, tid, iid)
++            with pytest.raises(JsonRpcError) as ei:
++                await AdminGetUserTool()(ctx, AdminGetUserInput(tenant_id=target))
++            seen.append((ei.value.code, ei.value.message, ei.value.data))
++            rows = await audit_rows(pg_pool, ctx.request_id)
++            assert len(rows) == 1
++            assert (rows[0]["action"], rows[0]["result"]) == ("admin.get_user", "denied")
++        assert seen[0] == seen[1]
++        assert seen[0][2] == {"missing_permission": PERM}
++
++
++class TestAdminAllowed:
++    async def test_find_user_success(self, pg_pool: Any) -> None:
++        tid, iid = await _caller(pg_pool, kind="admin")
++        token = uuid4().hex[:12]
++        async with pg_pool.acquire() as conn:
++            t1, _, _ = await make_tenant(conn, email=f"Zed-{token}@test.invalid")
++            t2, _, _ = await make_tenant(conn, display_name=f"zed {token}")
++        ctx = make_ctx(pg_pool, tid, iid)
++        out = await AdminFindUserTool()(ctx, AdminFindUserInput(query=f"ZED-{token}"))
++        assert out.count == 1 and out.users[0].tenant_id == str(t1)  # type: ignore[attr-defined]
++        ctx2 = make_ctx(pg_pool, tid, iid)
++        out2 = await AdminFindUserTool()(ctx2, AdminFindUserInput(query=f"ZED {token}"))
++        assert [u.tenant_id for u in out2.users] == [str(t2)]  # type: ignore[attr-defined]
++        rows = await audit_rows(pg_pool, ctx.request_id)
++        assert len(rows) == 1
++        assert (rows[0]["action"], rows[0]["result"]) == ("admin.find_user", "success")
++        assert rows[0]["tenant_id"] == tid and rows[0]["actor_identity_id"] == iid
++
++    async def test_get_user_returns_system_roles_and_teams(self, pg_pool: Any) -> None:
++        tid, iid = await _caller(pg_pool, kind="admin")
++        async with pg_pool.acquire() as conn:
++            target, _, _ = await make_tenant(conn, system_role="system_admin")
++            team_id, name = await make_team(conn, target)
++            await assign_role(conn, team_id, target, "admin")
++        ctx = make_ctx(pg_pool, tid, iid)
++        out = await AdminGetUserTool()(ctx, AdminGetUserInput(tenant_id=target))
++        user = out.user  # type: ignore[attr-defined]
++        assert "system_admin" in user.system_roles
++        assert [(t.team_id, t.team_name, t.role_key) for t in user.teams] == [
++            (str(team_id), name, "admin")
++        ]
++        rows = await audit_rows(pg_pool, ctx.request_id)
++        assert [(r["action"], r["result"]) for r in rows] == [("admin.get_user", "success")]
++
++    async def test_get_user_unknown_is_32602_and_audited_as_error(self, pg_pool: Any) -> None:
++        tid, iid = await _caller(pg_pool, kind="admin")
++        ctx = make_ctx(pg_pool, tid, iid)
++        with pytest.raises(JsonRpcError) as ei:
++            await AdminGetUserTool()(ctx, AdminGetUserInput(tenant_id=uuid4()))
++        assert ei.value.code == -32602
++        assert ei.value.data == {"errors": [{"path": "tenant_id", "message": "user not found"}]}
++        rows = await audit_rows(pg_pool, ctx.request_id)
++        assert len(rows) == 1
++        assert (rows[0]["action"], rows[0]["result"]) == ("admin.get_user", "error")
++        assert rows[0]["error_code"] == "-32602"
++
++    async def test_whitespace_query_is_32602(self, pg_pool: Any) -> None:
++        tid, iid = await _caller(pg_pool, kind="admin")
++        ctx = make_ctx(pg_pool, tid, iid)
++        inp = AdminFindUserInput(query=" a ")  # passes Pydantic min_length
++        with pytest.raises(JsonRpcError) as ei:
++            await AdminFindUserTool()(ctx, inp)
++        assert ei.value.code == -32602
++        assert ei.value.data["errors"][0]["path"] == "query"  # type: ignore[index]
++        rows = await audit_rows(pg_pool, ctx.request_id)
++        assert [(r["action"], r["result"]) for r in rows] == [("admin.find_user", "error")]
++
++
++class TestRegistryDispatch:
++    async def test_end_to_end(self, pg_pool: Any) -> None:
++        registry = ToolRegistry()
++        registry.register(AdminFindUserTool)
++        registry.register(AdminGetUserTool)
++        admin_t, admin_i = await _caller(pg_pool, kind="admin")
++        plain_t, plain_i = await _caller(pg_pool, kind="plain")
++        token = uuid4().hex[:12]
++        async with pg_pool.acquire() as conn:
++            target, _, _ = await make_tenant(conn, email=f"dispatch-{token}@test.invalid")
++
++        out = await registry.dispatch(
++            make_ctx(pg_pool, admin_t, admin_i), "memsys_admin_find_user", {"query": token}
++        )
++        assert out["count"] == 1 and out["users"][0]["tenant_id"] == str(target)
++
++        out = await registry.dispatch(
++            make_ctx(pg_pool, admin_t, admin_i),
++            "memsys_admin_get_user",
++            {"tenant_id": str(target)},
++        )
++        assert out["user"]["tenant_id"] == str(target)
++
++        with pytest.raises(JsonRpcError) as ei:
++            await registry.dispatch(
++                make_ctx(pg_pool, admin_t, admin_i),
++                "memsys_admin_find_user",
++                {"query": token, "limit": 9999},
++            )
++        assert ei.value.code == -32602
++
++        with pytest.raises(JsonRpcError) as ei:
++            await registry.dispatch(
++                make_ctx(pg_pool, plain_t, plain_i), "memsys_admin_find_user", {"query": token}
++            )
++        assert ei.value.code == -32603
++        assert ei.value.data == {"missing_permission": PERM}
++
++
++class TestPermissionCheckFailure:
++    async def test_has_permission_error_is_audited_once_and_propagates(
++        self, pg_pool: Any, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        from mem_mcp.mcp.tools import _admin_base
++
++        async def _raise(*_a: Any, **_k: Any) -> bool:
++            raise RuntimeError("permission backend down")
++
++        monkeypatch.setattr(_admin_base, "has_permission", _raise)
++        monkeypatch.setattr(AdminGetUserTool, "run", _boom)
++        tid, iid = await _caller(pg_pool, kind="admin")
++        ctx = make_ctx(pg_pool, tid, iid)
++        with pytest.raises(RuntimeError, match="permission backend down"):
++            await AdminGetUserTool()(ctx, AdminGetUserInput(tenant_id=uuid4()))
++        rows = await audit_rows(pg_pool, ctx.request_id)
++        assert len(rows) == 1
++        assert (rows[0]["action"], rows[0]["result"]) == ("admin.get_user", "error")
++        assert rows[0]["error_code"] == "RuntimeError"
++        assert rows[0]["tenant_id"] == tid and rows[0]["actor_identity_id"] == iid
++
++
++class TestPooledConnectionAfterRollback:
++    """The permission check and audit INSERT must survive a GUC that reads back ''."""
++
++    async def test_tools_on_single_connection_pool(self) -> None:
++        import os
++
++        from mem_mcp.db import tenant_tx
++
++        dsn = os.environ.get("MEM_MCP_TEST_DSN")
++        if not dsn:
++            pytest.skip("MEM_MCP_TEST_DSN env not set")
++        import asyncpg  # type: ignore[import-untyped]
++
++        from mem_mcp.db.pool import _init_connection
++
++        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=1, init=_init_connection)
++        try:
++            admin_t, admin_i = await _caller(pool, kind="admin")
++            plain_t, plain_i = await _caller(pool, kind="plain")
++            async with pool.acquire() as conn:
++                target, _, _ = await make_tenant(conn)
++
++            with pytest.raises(RuntimeError):
++                async with tenant_tx(pool, uuid4()):
++                    raise RuntimeError("force rollback")
++
++            ctx = make_ctx(pool, admin_t, admin_i)
++            out = await AdminGetUserTool()(ctx, AdminGetUserInput(tenant_id=target))
++            assert out.user.tenant_id == str(target)  # type: ignore[attr-defined]
++            rows = await audit_rows(pool, ctx.request_id)
++            assert [(r["action"], r["result"]) for r in rows] == [("admin.get_user", "success")]
++
++            with pytest.raises(RuntimeError):
++                async with tenant_tx(pool, uuid4()):
++                    raise RuntimeError("force rollback again")
++
++            ctx2 = make_ctx(pool, plain_t, plain_i)
++            with pytest.raises(JsonRpcError) as ei:
++                await AdminFindUserTool()(ctx2, AdminFindUserInput(query="whatever"))
++            assert ei.value.code == -32603
++            assert ei.value.data == {"missing_permission": PERM}
++            rows = await audit_rows(pool, ctx2.request_id)
++            assert [(r["action"], r["result"]) for r in rows] == [("admin.find_user", "denied")]
++        finally:
++            await pool.close()
++
++
++class TestSubclassGuards:
++    def _attrs(self) -> dict[str, Any]:
++        return {
++            "name": "x",
++            "description": "x",
++            "InputModel": BaseModel,
++            "OutputModel": BaseModel,
++        }
++
++    def test_overriding_call_is_type_error(self) -> None:
++        with pytest.raises(TypeError, match="__call__"):
++
++            class Bad(AdminTool):
++                name: ClassVar[str] = "bad"
++                required_permission: ClassVar[Permission] = Permission.SYSTEM_MANAGE_TENANTS
++                audit_action = "admin.find_user"
++
++                async def run(self, conn: Any, ctx: Any, inp: Any) -> Any: ...
++
++                async def __call__(self, ctx: Any, inp: Any) -> Any: ...
++
++    def test_non_system_permission_is_type_error(self) -> None:
++        with pytest.raises(TypeError, match="system"):
++
++            class Bad(AdminTool):
++                required_permission = Permission.TEAM_VIEW
++                audit_action = "admin.find_user"
++
++                async def run(self, conn: Any, ctx: Any, inp: Any) -> Any: ...
++
++    def test_non_admin_audit_action_is_type_error(self) -> None:
++        with pytest.raises(TypeError, match="admin"):
++
++            class Bad(AdminTool):
++                required_permission = Permission.SYSTEM_MANAGE_TENANTS
++                audit_action = "memory.get"
++
++                async def run(self, conn: Any, ctx: Any, inp: Any) -> Any: ...
++
++    def test_valid_subclass_ok(self) -> None:
++        class Good(AdminTool):
++            required_permission = Permission.SYSTEM_MANAGE_TENANTS
++            audit_action = "admin.get_user"
++
++            async def run(self, conn: Any, ctx: Any, inp: Any) -> Any: ...
++
++        assert Good.required_scope == "memory.read"
+diff --git a/tests/unit/_admin_fixtures.py b/tests/unit/_admin_fixtures.py
+new file mode 100644
+index 0000000..0978928
+--- /dev/null
++++ b/tests/unit/_admin_fixtures.py
+@@ -0,0 +1,141 @@
++"""Shared DB-setup helpers for the admin-tool tests (not a test module).
++
++All rows use UUID-suffixed emails / names. The test DB is shared and not reset,
++so nothing here assumes empty tables and nothing is cleaned up (audit_log rows
++FK-reference identities, so deleting tenants afterwards is not possible anyway).
++"""
++
++from __future__ import annotations
++
++from datetime import datetime
++from typing import Any
++from uuid import UUID, uuid4
++
++from mem_mcp.audit.logger import DbAuditLogger
++from mem_mcp.embeddings.bedrock import EmbedResult
++from mem_mcp.mcp.tools._base import ToolContext
++from mem_mcp.mcp.tools._deps import NoopQuotas, ToolDeps
++
++
++class StubEmbeddings:
++    async def embed(self, text: str) -> EmbedResult:
++        return EmbedResult(vector=[0.0] * 1024, input_tokens=1)
++
++
++async def make_tenant(
++    conn: Any,
++    *,
++    email: str | None = None,
++    display_name: str | None = None,
++    created_at: datetime | None = None,
++    identity: bool = True,
++    system_role: str | None = None,
++    workspace_domain: str | None = None,
++) -> tuple[UUID, UUID | None, str]:
++    """Insert a tenant (+ primary identity). Returns (tenant_id, identity_id, email)."""
++    tenant_id = uuid4()
++    email = email or f"adm-{tenant_id}@test.invalid"
++    if created_at is None:
++        await conn.execute(
++            "INSERT INTO tenants (id, email, display_name, status) VALUES ($1, $2, $3, 'active')",
++            tenant_id,
++            email,
++            display_name,
++        )
++    else:
++        await conn.execute(
++            "INSERT INTO tenants (id, email, display_name, status, created_at) "
++            "VALUES ($1, $2, $3, 'active', $4)",
++            tenant_id,
++            email,
++            display_name,
++            created_at,
++        )
++    identity_id: UUID | None = None
++    if identity:
++        identity_id = uuid4()
++        await conn.execute(
++            """
++            INSERT INTO tenant_identities
++                (id, tenant_id, cognito_sub, provider, email, is_primary, workspace_domain)
++            VALUES ($1, $2, $3, 'google', $4, true, $5)
++            """,
++            identity_id,
++            tenant_id,
++            f"sub-{identity_id}",
++            email,
++            workspace_domain,
++        )
++    if system_role:
++        await conn.execute(
++            "INSERT INTO tenant_system_roles (tenant_id, role) VALUES ($1, $2)",
++            tenant_id,
++            system_role,
++        )
++    return tenant_id, identity_id, email
++
++
++async def make_team(conn: Any, creator: UUID, *, deleted: bool = False) -> tuple[UUID, str]:
++    team_id = uuid4()
++    name = f"admteam-{team_id}"
++    await conn.execute(
++        "INSERT INTO teams (id, name, created_by_tenant_id, deleted_at) "
++        "VALUES ($1, $2, $3, CASE WHEN $4 THEN now() ELSE NULL END)",
++        team_id,
++        name,
++        creator,
++        deleted,
++    )
++    return team_id, name
++
++
++async def assign_role(
++    conn: Any,
++    team_id: UUID,
++    tenant_id: UUID,
++    role_key: str,
++    *,
++    status: str = "active",
++    assigned_by: UUID | None = None,
++) -> None:
++    role_id = await conn.fetchval(
++        "SELECT id FROM roles_catalog WHERE role_key = $1 AND plugin_id IS NULL", role_key
++    )
++    assert role_id is not None, f"role {role_key} missing from roles_catalog"
++    await conn.execute(
++        """
++        INSERT INTO team_role_assignments
++            (parent_team_id, member_kind, member_id, role_id, status, assigned_by_user_id)
++        VALUES ($1, 'user', $2, $3, $4, $5)
++        """,
++        team_id,
++        tenant_id,
++        role_id,
++        status,
++        assigned_by or tenant_id,
++    )
++
++
++def make_ctx(pool: Any, tenant_id: UUID, identity_id: UUID | None) -> ToolContext:
++    """ToolContext with a unique request_id and real DB audit logging."""
++    assert identity_id is not None
++    return ToolContext(
++        request_id=f"adm-{uuid4()}",
++        tenant_id=tenant_id,
++        identity_id=identity_id,
++        client_id="test-client",
++        scopes=frozenset({"memory.read"}),
++        db_pool=pool,
++        deps=ToolDeps(embeddings=StubEmbeddings(), audit=DbAuditLogger(), quotas=NoopQuotas()),
++    )
++
++
++async def audit_rows(pool: Any, request_id: str) -> list[Any]:
++    async with pool.acquire() as conn:
++        return list(
++            await conn.fetch(
++                "SELECT action, result, error_code, tenant_id, actor_identity_id, "
++                "actor_client_id, details FROM audit_log WHERE request_id = $1",
++                request_id,
++            )
++        )
+diff --git a/tests/unit/test_admin_service.py b/tests/unit/test_admin_service.py
+new file mode 100644
+index 0000000..ec2a76c
+--- /dev/null
++++ b/tests/unit/test_admin_service.py
+@@ -0,0 +1,215 @@
++"""Tests for mem_mcp.admin.service (pure helpers + real-DB lookups)."""
++
++from __future__ import annotations
++
++import os
++from datetime import UTC, datetime, timedelta
++from typing import Any
++from uuid import uuid4
++
++import pytest
++
++from mem_mcp.admin.errors import NotFoundError
++from mem_mcp.admin.service import (
++    DEFAULT_LIMIT,
++    MAX_LIMIT,
++    _clamp_limit,
++    _escape_like,
++    find_users,
++    get_user,
++)
++from mem_mcp.auth.permissions import ROLE_PERMISSIONS
++from mem_mcp.db import system_tx, tenant_tx
++from tests.unit._admin_fixtures import assign_role, make_team, make_tenant
++
++
++class TestHelpers:
++    def test_constants(self) -> None:
++        assert (DEFAULT_LIMIT, MAX_LIMIT) == (20, 100)
++
++    @pytest.mark.parametrize(
++        ("raw", "expected"),
++        [
++            ("plain", "plain"),
++            ("50%", "50\\%"),
++            ("a_b", "a\\_b"),
++            ("a\\b", "a\\\\b"),
++            ("\\%", "\\\\\\%"),
++        ],
++    )
++    def test_escape_like(self, raw: str, expected: str) -> None:
++        assert _escape_like(raw) == expected
++
++    @pytest.mark.parametrize(
++        ("given", "expected"),
++        [(None, 20), (0, 1), (-5, 1), (9999, 100), (50, 50), (1, 1), (100, 100)],
++    )
++    def test_clamp_limit(self, given: int | None, expected: int) -> None:
++        assert _clamp_limit(given) == expected
++
++    @pytest.mark.parametrize("q", ["a", "", "   ", "  a "])
++    async def test_short_query_is_value_error(self, q: str) -> None:
++        # Validation happens before any DB access, so no connection is needed.
++        with pytest.raises(ValueError):
++            await find_users(None, query=q)
++
++
++class TestFindUsers:
++    async def test_case_insensitive_email_and_display_name(self, pg_pool: Any) -> None:
++        token = uuid4().hex[:12]
++        async with pg_pool.acquire() as conn:
++            by_email, _, _ = await make_tenant(conn, email=f"Manasi-{token}@Example.Test")
++            by_name, _, _ = await make_tenant(conn, display_name=f"Dr ZELDA {token}")
++        async with system_tx(pg_pool) as conn:
++            hits = await find_users(conn, query=f"MANASI-{token}")
++            assert [u.tenant_id for u in hits] == [str(by_email)]
++            hits = await find_users(conn, query=f"zelda {token}")
++            assert [u.tenant_id for u in hits] == [str(by_name)]
++            assert hits[0].display_name == f"Dr ZELDA {token}"
++            assert hits[0].provider == "google"
++
++    async def test_newest_first(self, pg_pool: Any) -> None:
++        token = uuid4().hex[:12]
++        base = datetime.now(UTC) - timedelta(days=1)
++        ids = []
++        async with pg_pool.acquire() as conn:
++            for i in range(3):
++                tid, _, _ = await make_tenant(
++                    conn,
++                    email=f"order{i}-{token}@test.invalid",
++                    created_at=base + timedelta(minutes=i),
++                )
++                ids.append(str(tid))
++        async with system_tx(pg_pool) as conn:
++            hits = await find_users(conn, query=token)
++        assert [u.tenant_id for u in hits] == list(reversed(ids))
++
++    async def test_tenant_without_primary_identity_still_listed(self, pg_pool: Any) -> None:
++        token = uuid4().hex[:12]
++        async with pg_pool.acquire() as conn:
++            tid, _, _ = await make_tenant(
++                conn, email=f"noident-{token}@test.invalid", identity=False
++            )
++        async with system_tx(pg_pool) as conn:
++            hits = await find_users(conn, query=token)
++        assert len(hits) == 1
++        assert hits[0].tenant_id == str(tid)
++        assert hits[0].provider is None
++        assert hits[0].workspace_domain is None
++        assert hits[0].default_team_id is None
++
++    @pytest.mark.parametrize(
++        "q",
++        ["%%", "__", "' OR 1=1 --", "'; DROP TABLE tenants; --", "\\\\", "\\zq9"],
++    )
++    async def test_metacharacters_and_injection_match_nothing(self, pg_pool: Any, q: str) -> None:
++        async with system_tx(pg_pool) as conn:
++            hits = await find_users(conn, query=q)
++            assert hits == []
++            # tenants table still there
++            assert await conn.fetchval("SELECT count(*) FROM tenants") >= 0
++
++    async def test_literal_metacharacters_match_only_literal_user(self, pg_pool: Any) -> None:
++        token = uuid4().hex[:8]
++        name = f"{token} 50%_off\\x"
++        async with pg_pool.acquire() as conn:
++            tid, _, _ = await make_tenant(conn, display_name=name)
++            await make_tenant(conn, display_name=f"{token} 50Xaoffx")  # would match unescaped
++        async with system_tx(pg_pool) as conn:
++            hits = await find_users(conn, query=f"{token} 50%_off\\x")
++            assert [u.tenant_id for u in hits] == [str(tid)]
++            # `%`/`_` are literal: this must not wildcard-match the other user.
++            hits = await find_users(conn, query=f"{token} 50%_")
++            assert [u.tenant_id for u in hits] == [str(tid)]
++
++    async def test_limit_is_clamped(self, pg_pool: Any) -> None:
++        """Seed 105 matching tenants so the clamp is observable on a shared DB."""
++        token = uuid4().hex
++        async with pg_pool.acquire() as conn:
++            await conn.execute(
++                """
++                INSERT INTO tenants (id, email, status)
++                SELECT gen_random_uuid(), 'lim' || g || '-' || $1 || '@test.invalid', 'active'
++                FROM generate_series(1, 105) g
++                """,
++                token,
++            )
++        async with system_tx(pg_pool) as conn:
++            assert len(await find_users(conn, query=token, limit=9999)) == 100
++            assert len(await find_users(conn, query=token, limit=None)) == 20
++            assert len(await find_users(conn, query=token, limit=0)) == 1
++            assert len(await find_users(conn, query=token, limit=-5)) == 1
++            assert len(await find_users(conn, query=token, limit=50)) == 50
++
++
++def test_team_roles_never_confer_system_permissions() -> None:
++    """Only system roles may hold system.*; team roles must never (privilege escalation)."""
++    system_roles = {"system_admin", "system_support"}
++    non_system = {k: v for k, v in ROLE_PERMISSIONS.items() if k not in system_roles}
++    assert non_system, "expected team roles in ROLE_PERMISSIONS"
++    for role_key, perms in non_system.items():
++        leaked = sorted(p.value for p in perms if p.value.startswith("system."))
++        assert leaked == [], f"role {role_key} grants system perms: {leaked}"
++    # sanity: the system roles do hold some
++    assert any(p.value.startswith("system.") for p in ROLE_PERMISSIONS["system_admin"])
++
++
++class TestGetUser:
++    async def test_roles_and_active_teams_only(self, pg_pool: Any) -> None:
++        async with pg_pool.acquire() as conn:
++            tid, _, email = await make_tenant(conn, system_role="system_admin")
++            other, _, _ = await make_tenant(conn)
++            t_active, n_active = await make_team(conn, other)
++            t_second, n_second = await make_team(conn, other)
++            t_deleted, _ = await make_team(conn, other, deleted=True)
++            t_revoked, _ = await make_team(conn, other)
++            await assign_role(conn, t_active, tid, "owner", assigned_by=other)
++            await assign_role(conn, t_second, tid, "viewer", assigned_by=other)
++            await assign_role(conn, t_deleted, tid, "member", assigned_by=other)
++            await assign_role(conn, t_revoked, tid, "member", status="revoked", assigned_by=other)
++        async with system_tx(pg_pool) as conn:
++            user = await get_user(conn, tenant_id=tid)
++        assert user.email == email
++        assert "system_admin" in user.system_roles
++        assert user.system_roles == sorted(user.system_roles)
++        got = {t.team_id: (t.team_name, t.role_key) for t in user.teams}
++        assert got == {
++            str(t_active): (n_active, "owner"),
++            str(t_second): (n_second, "viewer"),
++        }
++        assert [t.team_name for t in user.teams] == sorted(t.team_name for t in user.teams)
++
++    async def test_unknown_tenant(self, pg_pool: Any) -> None:
++        async with system_tx(pg_pool) as conn:
++            with pytest.raises(NotFoundError):
++                await get_user(conn, tenant_id=uuid4())
++
++
++class TestPooledConnectionAfterRollback:
++    async def test_service_works_after_rolled_back_tenant_tx(self) -> None:
++        """Regression: after ROLLBACK the tenant GUC reads back '' (not NULL);
++        the service must not depend on it and must still return correct rows."""
++        dsn = os.environ.get("MEM_MCP_TEST_DSN")
++        if not dsn:
++            pytest.skip("MEM_MCP_TEST_DSN env not set")
++        import asyncpg  # type: ignore[import-untyped]
++
++        from mem_mcp.db.pool import _init_connection
++
++        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=1, init=_init_connection)
++        try:
++            async with pool.acquire() as conn:
++                tid, _, email = await make_tenant(conn, system_role="system_admin")
++            with pytest.raises(RuntimeError):
++                async with tenant_tx(pool, uuid4()):
++                    raise RuntimeError("force rollback")
++            async with system_tx(pool) as conn:  # same single physical connection
++                assert await conn.fetchval(
++                    "SELECT current_setting('app.current_tenant_id', true)"
++                ) in ("", None)
++                user = await get_user(conn, tenant_id=tid)
++                hits = await find_users(conn, query=email)
++            assert user.email == email
++            assert [u.tenant_id for u in hits] == [str(tid)]
++        finally:
++            await pool.close()
+diff --git a/tools/lint_tenant_scope.py b/tools/lint_tenant_scope.py
+index 15a10fc..818d65e 100644
+--- a/tools/lint_tenant_scope.py
++++ b/tools/lint_tenant_scope.py
+@@ -51,6 +51,11 @@ EXEMPT_PREFIXES = (
+     # (matches caller-tenant rows AND cross-team rows with visibility='team').
+     # Same cross-team gating pattern as teams/effective_access.py.
+     "src/mem_mcp/mcp/tools/get_batch.py",
++    # admin/service.py — operator user lookup is cross-tenant by design
++    # (tenants / tenant_identities across all tenants). Callers gate with
++    # system.manage_tenants via AdminTool (mcp/tools/_admin_base.py) before the
++    # service runs, and it only ever runs under system_tx.
++    "src/mem_mcp/admin/service.py",
+ )
+ 
+ CONN_METHODS = frozenset({"execute", "fetch", "fetchrow", "fetchval", "executemany"})

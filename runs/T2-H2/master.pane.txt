@@ -1,0 +1,260 @@
+  ## Symptom (as reported)
+
+  From the PMO plugin (it talks to Memsys through the in-process plugin SDK,
+  `mem_mcp.plugins`):
+
+  > I write memory M1. `memory_get(M1)` returns it fine. Then I write M2 with
+  > `references=[{target_uuid: M1, reference_kind: "cites"}]` and the write is
+  > rejected with `memory_not_accessible` ("reference target not found or not
+  > accessible"). M1 is mine — same account, I just read it.
+
+  It does not happen for every account. It reproduces reliably for users whose
+  account was provisioned the "natural" way — tenant, personal team, owner
+  assignment and primary identity created by raw SQL (this is how the 0026
+  personal-team backfill provisioned all pre-existing users) — rather than
+  through the team-management API. It started after the teams/references work
+  landed (migrations ~0024–0026).
+
+  A failing repro is provided:
+  `tests/integration/test_references_own_memory_repro.py` (already in your
+  working tree). It must pass when you are done.
+
+  ## What we expect
+
+  - A user can always reference (and otherwise act on, via the references
+    machinery) memories they can read. Write-time access checks for references
+    must agree with the read path — i.e. with what `memory_get` lets the caller see.
+  - Find the root cause rather than special-casing the write call. If the
+    faulty rule is evaluated in more than one place, every such place must be
+    fixed and behave consistently — hidden regression tests cover more than the
+    repro.
+  - Cross-tenant protection must not regress: referencing another tenant's memory
+    that you have no team access to is still rejected with the same **opaque**
+    `memory_not_accessible` error envelope (not-found and no-access stay
+    indistinguishable).
+  - Slug-based lookups that are resolved *before* the target is known
+    (`memsys_slug_lookup`, `memory_get` by slug, `memory_get_batch` by slug) gate
+    at the team level on purpose — it prevents slug enumeration in teams the
+    caller cannot see. Do **not** change those.
+
+  ## Constraints
+
+  - Follow existing patterns. If you need a database-side helper, schema changes
+    go through a new Alembic migration in `alembic/versions/` (follow the naming
+    and the `SECURITY DEFINER` / `NULLIF`-guarded GUC conventions used by the
+    existing RLS helper migrations). The scoring harness runs
+    `alembic upgrade head` on a fresh database before running tests.
+  - A fix that only changes tests is an automatic fail. Do not modify existing
+    tests; add regression tests of your own for each site you change.
+  - The rest of the suite must not get new failures (some tests are red before
+    you start — pre-existing; leave them).
+
+  ## Running tests
+
+  `MEM_MCP_TEST_DSN` points at a fresh migrated Postgres (if you add a migration,
+  apply it with `alembic upgrade head`; `MEM_MCP_DB_MAINT_DSN` is set for that).
+  Run the repro with
+  `pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py`
+  and the wider suite with `pytest -q -p no:cacheprovider tests`.
+  The `sdk_client_factory` fixture (`tests/integration/conftest.py`) builds a
+  plugin-SDK client bound to a tenant.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_01Sz1uNpYEoXrvwFt4Z4z1xJ
+
+● I'll start by understanding the repro and the relevant code.
+
+  Searched for 2 patterns, read 9 files, listed 1 directory (ctrl+o to expand)
+
+● The root cause looks clear: write-time reference checks rely on the user_effective_team_access cache table, which raw-SQL-provisioned users never get populated into, whereas memory_get uses RLS instead. I'll check the
+  remaining call sites before writing up the findings.
+
+  Searched for 2 patterns, read 6 files, listed 1 directory (ctrl+o to expand)
+
+● I'll apply a single domain-level access predicate—caller owns the memory or has effective team access—across all four memory-ID-based sites, leaving slug sites untouched. Now writing up the work order.
+
+● Write(~/laguna-bench/runs/T2-H2/orders/order-1.md)
+  ⎿  Wrote 107 lines to ../orders/order-1.md
+       1 # Work order 1 — fix `memory_not_accessible` when referencing your own memory
+       2
+       3 ## Bug
+       4 A user writes memory M1, `memory_get(M1)` returns it, but writing M2 with
+       5 `references=[{target_uuid: M1, reference_kind: "cites"}]` fails with `memory_not_accessible`.
+       6 Reproduces for accounts provisioned by raw SQL (tenant + personal team + owner row in
+       7 `team_role_assignments` + primary identity — the way migration 0026 backfilled existing users),
+       8 NOT via `mem_mcp.teams.assignments.assign_role`.
+       9
+      10 Failing repro (already in tree, must pass, do not modify it):
+     … +97 lines (ctrl+o to expand)
+
+● Order written; dispatching to the executor now (this may take a while).
+
+● Bash(~/laguna-bench/bin/run_executor.sh H T2-H2 ~/laguna-bench/runs/T2-H2/orders/order-1.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +19 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor reports the repro passing, but it skipped the full-suite baseline, lint, and mypy. Reviewing the diff.
+
+● Bash(git status --short && git diff)
+  ⎿   M src/mem_mcp/mcp/tools/refs_in.py
+      M src/mem_mcp/mcp/tools/refs_out.py
+      M src/mem_mcp/teams/references.py
+     … +716 lines (ctrl+o to expand)
+
+● The source changes look correct and minimal, but the tests have gaps—missing refs_in/refs_out tool tests, no stranger citer in the hard-delete test, no verification that no-access and not-found errors match, a likely
+  ruff import-order issue, and no full-suite/lint/mypy results. I'll send a follow-up addressing these.
+
+● Write(~/laguna-bench/runs/T2-H2/orders/order-2.md)
+  ⎿  Wrote 38 lines to ../orders/order-2.md
+       1 # Work order 2 — complete the regression tests + full verification
+       2
+       3 The source changes from order 1 (`teams/references.py`, `refs_in.py`, `refs_out.py`) look good —
+       4 do NOT change them unless a test below reveals a real bug (if so, explain).
+       5
+       6 Extend `tests/integration/test_references_access_rule.py` (only this file):
+       7
+       8 1. **refs_in / refs_out tool tests (missing).** Call `RefsInTool()` / `RefsOutTool()` from
+       9    `mem_mcp.mcp.tools.refs_in` / `refs_out` with a `ToolContext` built like other tool tests do
+      10    (grep `ToolContext(` in `tests/` for an example; `ToolDeps(embeddings=<stub>, audit=NoopAuditLogger(),
+     … +29 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh H T2-H2 ~/laguna-bench/runs/T2-H2/orders/order-2.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +20 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The report is vague: "1043 vs 1042 passed" doesn't match six new tests, and ruff/mypy output is missing. Checking the test file myself.
+
+● Bash(git status --short && git diff --stat && grep -n "^async def test_\|^from\|^import\|accessible_count\|inaccessible_count ==\|str(e" tests/integration/test_refer…)
+  ⎿   M src/mem_mcp/mcp/tools/refs_in.py
+      M src/mem_mcp/mcp/tools/refs_out.py
+      M src/mem_mcp/teams/references.py
+     … +44 lines (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+● The tests are adequate. What's still missing is hard evidence: ruff and mypy output, plus the actual failure lists before and after the change. One short verification-only round.
+
+● Write(~/laguna-bench/runs/T2-H2/orders/order-3.md)
+  ⎿  Wrote 18 lines to ../orders/order-3.md
+       1 # Work order 3 — verification evidence only (no feature changes)
+       2
+       3 Your last report did not include ruff/mypy output or the actual failing-test ids. Please run and
+       4 paste the literal output (trimmed to the relevant lines):
+       5
+       6 1. `ruff check src tests` — paste output. If it reports anything in
+       7    `tests/integration/test_references_access_rule.py`, `src/mem_mcp/teams/references.py`,
+       8    `src/mem_mcp/mcp/tools/refs_in.py` or `refs_out.py`, fix it (also run `ruff format --check` on those 4 files and format them if needed).
+       9 2. `mypy` (project config) — paste the summary line and any errors in the 4 files above; fix errors in those files
+      10    (e.g. if tests are type-checked, `isinstance`-narrow tool outputs to `RefsInOutput`/`RefsOutOutput`).
+     … +8 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh H T2-H2 ~/laguna-bench/runs/T2-H2/orders/order-3.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +25 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor was blocked on bash permissions, probably by the compound git stash command and the /tmp writes. Reissuing with simple standalone commands.
+
+● Write(~/laguna-bench/runs/T2-H2/orders/order-4.md)
+  ⎿  Wrote 19 lines to ../orders/order-4.md
+       1 # Work order 4 — verification evidence (simple commands, no stash, no /tmp)
+       2
+       3 Run these as separate, simple commands (no `git stash`, no writing to /tmp, no `&&` chains)
+       4 and paste the literal output (trimmed to relevant lines):
+       5
+       6 1. `ruff check src tests`
+       7 2. `ruff format --check src/mem_mcp/teams/references.py src/mem_mcp/mcp/tools/refs_in.py src/mem_mcp/mcp/tools/refs_out.py tests/integration/test_references_access_rule.py`
+       8    — if it would reformat, run `ruff format` on those files.
+       9 3. `mypy` — paste the summary line plus any errors mentioning the 4 files above. Fix errors in those
+      10    files only.
+     … +10 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh H T2-H2 ~/laguna-bench/runs/T2-H2/orders/order-4.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +25 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor has now refused bash twice, apparently a sandbox permission change in its session, so I can't get more test runs out of it. I'll check lint-relevant points statically instead.
+
+● Bash(sed -n '/\[tool.ruff/,/^\[tool.[a-qs-z]/p' pyproject.toml | head -40; sed -n '/\[tool.mypy/,/^\[/p' pyproject.toml | head -20; sed -n 15,45p tests/integration/t…)
+  ⎿  Error: Permission to use Bash with command sed -n '/\[tool.ruff/,/^\[tool.[a-qs-z]/p' pyproject.toml has been denied.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● I found three static issues flagged by ruff/mypy: an import order problem, unsafe attribute access on a BaseModel, and indexing into an Optional tuple. I'll send targeted edits to fix these.
+
+● Write(~/laguna-bench/runs/T2-H2/orders/order-5.md)
+  ⎿  Wrote 35 lines to ../orders/order-5.md
+       1 # Work order 5 — lint/type fixes in the new test file (edit only; Bash not required)
+       2
+       3 Only edit `tests/integration/test_references_access_rule.py`. No other files.
+       4 (pyproject: ruff selects I (isort, order-by-type default); mypy `files` includes `tests`.)
+       5
+       6 1. **ruff I001** — the `from mem_mcp.teams.references import (...)` block is mis-sorted. With
+       7    ruff's default order-by-type, classes come before functions:
+       8    ```python
+       9    from mem_mcp.teams.references import (
+      10        HardDeleteBlockedError,
+     … +25 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh H T2-H2 ~/laguna-bench/runs/T2-H2/orders/order-5.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +27 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● I'm done reviewing, with one gap: the 14 targeted tests pass, but ruff, mypy and a reliable before/after full-suite comparison were never run. In later rounds the executor was blocked from running those commands. In an
+  earlier round it said the full suite had no new failures, but it gave no test ids and its pass counts didn't add up.
+
+  Root cause. memory_get lets you read a memory if you own it (it filters on your tenant). The references code instead allowed access only through user_effective_team_access, a cache table. That table gets rows only when
+  membership goes through assign_role or when the periodic reconciler job runs. Accounts set up with raw SQL, like the 0026 backfill, have no row there, so they were refused access to their own memories. The same faulty
+  rule was checked in four places. Separately, when a target had no team (team_id empty), the old code skipped the check entirely, so anyone could reference another tenant's team-less memory.
+
+  Fix (no migration needed):
+  - src/mem_mcp/teams/references.py: added one shared check, caller_can_access_memory. A memory is accessible if it exists and either you own it or you have effective team access to its team. All four places now use it:
+    a. resolve_reference_target, the check when writing references. Not-found and no-access still raise the same opaque error.
+    b. check_hard_delete_with_filtered_citers, which filters the list of citing memories.
+    c. mcp/tools/refs_in.py, which filters by the citing (source) memory.
+    d. mcp/tools/refs_out.py, which now checks the target memory itself instead of only the team recorded on the reference.
+  - Not changed, on purpose: the slug lookups that check team access before the target is known (memsys_slug_lookup, memory_get by slug, memory_get_batch by slug).
+  - New tests: tests/integration/test_references_access_rule.py, 13 tests. They use accounts set up the same raw-SQL way and cover:
+    - resolving your own memory;
+    - another tenant's memory with no access, and one with no team;
+    - another tenant's memory where you do have team access;
+    - hard delete with your own and a stranger's citing memories;
+    - the helper on its own;
+    - refs_in and refs_out through the tools;
+    - through the plugin SDK, that the no-access error is identical to the error for a random UUID.
+
+  Verification (as reported by the executor):
+  - The repro plus the new tests: 14 passed.
+  - The existing reference tests (tests/unit/test_references_helpers.py and tests/integration/test_references_integration.py): 19 passed in an earlier round.
+  - I reviewed every diff myself. The only lint and type problems I found by reading the code (import order, attribute access on a tool's output, indexing a value that may be empty) were fixed in the last round.
+
+  Round-trips: 5 executor calls. Two of them (orders 3 and 4) produced nothing because the executor could not run commands.
+
+  Remaining concerns:
+  - Unverified: ruff check, mypy, and the full suite before and after the change. Please run ruff check src tests, mypy and pytest -q -p no:cacheprovider tests once to confirm.
+  - Not fixed: memsys_refs_in and memsys_refs_out don't check whether you can see the memory you're asking about; they only filter the results. That was true before this change and isn't part of this task.
+
+  Confidence: high (about 85%) that the fix and the security requirements are met. The remaining risk is mostly that lint, type checks and the full suite haven't been confirmed.
+
+✻ Crunched for 11m 34s · done 10:52 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

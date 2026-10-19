@@ -1,0 +1,260 @@
+     index a78e673..3c75508 100644
+     --- a/src/mem_mcp/mcp/tools/mindmap_get.py
+     … +497 lines (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+● The source fixes look right. However, the executor skipped §6 entirely (no new tests, no fixture refactor) and didn't give me the baseline-vs-change failure lists. Order 3 covers only those.
+
+● Write(~/laguna-bench/runs/T4-H1/orders/order-3.md)
+  ⎿  Wrote 67 lines to ../orders/order-3.md
+       1 # Work order 3 — the missing tests (order 2 §6) + full-suite evidence
+       2
+       3 The source fixes from order 2 look correct — **do not change `src/` unless a new test exposes a real bug** (if it
+       4 does, fix it and tell me exactly what and why).
+       5
+       6 Order 2 §6 was not done: `tests/integration/test_mindmap_resolve_e2e.py` still has the same 10 tests as after
+       7 order 1, and no fixture refactor happened. Please do it now.
+       8
+       9 ## A. Refactor the test file
+      10 Replace the per-test copy-pasted setup/ctx/cleanup with one async pytest fixture (in the test file) that creates the
+     … +57 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh H T4-H1 ~/laguna-bench/runs/T4-H1/orders/order-3.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +24 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor says it's done, but the list it gave skips several required cases. Checking the test file.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Several earlier tests seem to have disappeared. Reading the file.
+
+  Read 1 file (ctrl+o to expand)
+
+● The executor dropped six tests it had planned and still hasn't written several others—atomicity, re-settle, model-turn open_loops, inaccessible resolver, dropped-without-resolver, and most since checks. I'll
+  cross-reference these against Order 4, which lists every required test function.
+
+● Write(~/laguna-bench/runs/T4-H1/orders/order-4.md)
+  ⎿  Wrote 79 lines to ../orders/order-4.md
+       1 # Work order 4 — complete the resolve/get test suite (tests only)
+       2
+       3 Do not change `src/` unless a test exposes a real bug (then report exactly what and why).
+       4
+       5 The refactor in order 3 **deleted** previously passing tests (dropped disposition, unknown map, root refusal,
+       6 include="all" status, open_loops-after-resolve), and most of order 3 §B was still not implemented. Below is the
+       7 exact list of test functions that must exist in `tests/integration/test_mindmap_resolve_e2e.py` when you are done
+       8 (use the existing `env` fixture and helpers; add helpers as needed, e.g. `_link`, `_close`, `_row(env, node_id)`
+       9 returning the full membership row, `_resolve_events(env, root_id, node_id)` returning event rows **with payload**
+      10 filtered to `event='resolve' AND memory_id=node_id`). Also fix the annotations: tests use `env: TestEnv` — use the
+     … +69 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh H T4-H1 ~/laguna-bench/runs/T4-H1/orders/order-4.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +25 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor changed mindmap_link to log two events per link. That's outside scope and suspicious, so I'm checking it.
+
+● Bash(git -C ~/laguna-bench/runs/T4-H1/repo diff -- src/mem_mcp/mcp/tools/mindmap_link.py; git -C ~/laguna-bench/runs/T4-H1/repo diff -- src/mem_m…)
+  ⎿  diff --git a/src/mem_mcp/mcp/tools/mindmap_link.py b/src/mem_mcp/mcp/tools/mindmap_link.py
+     index 47f3d63..f0c396b 100644
+     --- a/src/mem_mcp/mcp/tools/mindmap_link.py
+     … +81 lines (ctrl+o to expand)
+
+  Searched for 4 patterns, read 1 file (ctrl+o to expand)
+
+● Found the root cause: the pool's jsonb codec double-encodes payloads already serialized by log_event, leaving them stored as JSON strings so payload->>'target' always returns NULL—so the fix should be making the since
+  query handle both shapes rather than logging a second link event. I'll skim the tests before writing the fix.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● The test suite now covers all 25 cases. One fix is left: undo the duplicate link event and handle the double-encoded payload in the since query instead. Sending order 5.
+
+● Write(~/laguna-bench/runs/T4-H1/orders/order-5.md)
+  ⎿  Wrote 49 lines to ../orders/order-5.md
+       1 # Work order 5 — revert the extra link event; fix the real cause in SQL
+       2
+       3 ## Root cause (please confirm)
+       4 The pool's `_init_connection` (`src/mem_mcp/db/pool.py`) registers a jsonb codec with `encoder=json.dumps`, and
+       5 `service.log_event` passes `json.dumps(payload)` → the payload is double-encoded and stored as a jsonb **string
+       6 scalar** (`jsonb_typeof(payload) = 'string'`). That's why `payload->>'target'` never matched and you added a
+       7 second `link` event in `mindmap_link`. That workaround changes an existing tool's observable behaviour (two
+       8 `link` events per link) and is out of scope.
+       9
+      10 ## Changes
+     … +39 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh H T4-H1 ~/laguna-bench/runs/T4-H1/orders/order-5.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +24 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor reports the fix, but it again left out the full-suite comparison. Checking the code first.
+
+● Bash(git -C ~/laguna-bench/runs/T4-H1/repo status --short; git -C ~/laguna-bench/runs/T4-H1/repo diff --stat)
+  ⎿   A alembic/versions/0044_2026_10_15_mindmap_branch_status.py
+      M docs/mindmap-v1-build-design.md
+      M skills/mindmap-driver/SKILL.md
+     … +18 lines (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+● The code is right and mindmap_link is back to unchanged. I still need real evidence from the full suite, so order 6 asks only for verification.
+
+● Write(~/laguna-bench/runs/T4-H1/orders/order-6.md)
+  ⎿  Wrote 26 lines to ../orders/order-6.md
+       1 # Work order 6 — verification only (no code changes)
+       2
+       3 Do not edit any file. Run these commands and paste their **literal output** (the last lines are enough where noted).
+       4 I need the raw text, not a summary.
+       5
+       6 ```
+       7 cd <repo root>
+       8 alembic downgrade -1 && alembic upgrade head && alembic current
+       9 pytest -q -p no:cacheprovider tests/integration/test_mindmap_resolve_e2e.py tests/unit/test_mindmap_get_shaping.py tests/integration/test_mindmap_e2e.py tests/unit/test_lint_tenant_scope.py 2>&1 | tail -3
+      10 pytest -q -p no:cacheprovider -rfE > /tmp/after_full.txt 2>&1; tail -1 /tmp/after_full.txt
+     … +17 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh H T4-H1 ~/laguna-bench/runs/T4-H1/orders/order-6.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +26 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor stopped to ask permission. Confirming the tree is intact, then telling it to go ahead.
+
+● Bash(git -C ~/laguna-bench/runs/T4-H1/repo status --short; git -C ~/laguna-bench/runs/T4-H1/repo stash list)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Bash(git -C ~/laguna-bench/runs/T4-H1/repo status --short)
+  ⎿   A alembic/versions/0044_2026_10_15_mindmap_branch_status.py
+      M docs/mindmap-v1-build-design.md
+      M skills/mindmap-driver/SKILL.md
+     … +7 lines (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/T4-H1/orders/order-7.md)
+  ⎿  Wrote 6 lines to ../orders/order-7.md
+      1 # Work order 7 — yes, proceed
+      2
+      3 You have permission: run the complete verification sequence from order 6 now (full suite on the changed tree, then
+      4 `git stash -u`, full suite on the baseline, `git stash pop`, comparison, ruff, mypy). No code changes. Make sure
+      5 `git stash pop` succeeds and `git status --short` afterwards lists all 10 changed/new files. Paste the literal
+      6 output of each command as requested in order 6.
+
+● Bash(~/laguna-bench/bin/run_executor.sh H T4-H1 ~/laguna-bench/runs/T4-H1/orders/order-7.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +30 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor's sandbox blocks git stash. Failure counts match the baseline (38 failed) but I don't have the test IDs yet, so one last cheap check without stash.
+
+● Write(~/laguna-bench/runs/T4-H1/orders/order-8.md)
+  ⎿  Wrote 12 lines to ../orders/order-8.md
+       1 # Work order 8 — failure list without stash (no code changes)
+       2
+       3 Skip the stash comparison. Run only these (each is an ordinary test/lint command) and paste literal output:
+       4
+       5 1. `pytest -q -p no:cacheprovider -rfE 2>&1 | grep -E '^(FAILED|ERROR) ' | sed 's/ - .*//' | sort -u`
+       6    followed by the final summary line of that run.
+       7 2. For that list, state for each failing test **file** whether it imports or exercises anything from
+       8    `mem_mcp.mindmap`, `mem_mcp.mcp.tools.mindmap_*`, `mem_mcp.mcp.tool_descriptions` or `mem_mcp.main`
+       9    (grep the test file). For any that does, show its failure message.
+      10 3. `ruff check src tests | tail -3`
+     … +3 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh H T4-H1 ~/laguna-bench/runs/T4-H1/orders/order-8.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +29 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● The 38 test failures match baseline and don't involve mindmap code, but mypy flags 37 errors across 4 unnamed files—I'll double-check none of those are in our files.
+
+● Write(~/laguna-bench/runs/T4-H1/orders/order-9.md)
+  ⎿  Wrote 14 lines to ../orders/order-9.md
+       1 # Work order 9 — mypy cleanliness of our files
+       2
+       3 The project mypy config (`strict = true`, files include `tests`) reported 37 errors in 4 files.
+       4
+       5 1. Run `mypy 2>&1 | grep -E '^[^ ]+\.py:' | cut -d: -f1 | sort | uniq -c` and paste the output.
+         py alembic/versions/0044_2026_10_15_mindmap_branch_status.py`
+       7    and paste the output.
+       8 3. Fix every error that is in one of **our** new/changed files (the six above, plus `main.py` /
+       9    `tool_descriptions.py` if listed) with proper types (e.g. the `env` fixture should be annotated
+      10    `AsyncIterator[MindmapTestEnv]`; avoid blanket `# type: ignore` — use a specific code only where unavoidable,
+     … +6 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh H T4-H1 ~/laguna-bench/runs/T4-H1/orders/order-9.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +30 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● All four parts of the task (A–D) are built, and the tests the executor ran pass. It took 9 executor round-trips: 5 to build and fix, 4 for verification and cleanup. I'm moderately-high confident (~80%) that the
+  acceptance criteria are met.
+
+  What was built:
+  - Branch status (A): a new migration, alembic/versions/0044_2026_10_15_mindmap_branch_status.py, adds to each map node:
+    - a stored status: open by default, or resolved / dropped;
+    - the settlement details: one-line summary (≤500 chars), the resolving node, which party settled it, and when.
+
+    CHECK constraints limit the allowed values and keep "open" and "settled" rows consistent. A downgrade followed by an upgrade runs cleanly.
+  - mindmap_resolve (B): the new tool settles one branch in a single transaction:
+    a. Locks the map and refuses an archived one (map_not_live).
+    b. Checks the node belongs to this map. A node from another map, a random id or a deleted node all return the same -32602 error, so the tool can't be used to probe which ids exist.
+    c. Refuses to settle the map's root node (closing the whole map is mindmap_close).
+    d. Records the status, writes the resolves-under / dropped-under edge through the same insert_reference helper mindmap_link uses (only when a resolving node is named), and logs a resolve event.
+
+    It returns the new cursor. Status is never inferred from edges. The tool is registered in main.py and has a description in tool_descriptions.py.
+  - open_loops (C): now lists open nodes whose responsible_party is owner or model. Settled branches never appear.
+  - Cheap reads (D): mindmap_get takes since, include and depth, all defaulting to the cheap setting, and returns a cursor, a resolved list, and status / truncated on each node. All existing output fields are kept.
+  - Docs: the design doc and skills/mindmap-driver/SKILL.md now cover the new tool and cheap reads.
+
+  Tests and checks (as reported by the executor, which pasted results rather than raw output):
+  - 27 new database-backed tests and 19 new unit tests. Together with the existing mindmap e2e and tenant-scope lint tests, 62 pass.
+  - Full suite: 1280 passed, 38 failed. That's the same failure count as before the change, and none of the failing tests touch mindmap code. The executor couldn't run git stash in its environment, so I have matching
+    counts but not a test-by-test before/after comparison.
+  - ruff is clean. mypy is clean on our files; its remaining errors are all in files we didn't change.
+
+  Problems caught in review and fixed:
+  - The resolve edge recorded the resolving node's team instead of the settled node's team.
+  - since missed link targets because of a hidden quirk: the database pool and log_event both JSON-encode event payloads, so they're stored as strings. The executor first worked around this by making mindmap_link log a
+    second event; I had that reverted and the since query made to read both payload shapes.
+  - The whitespace-only summary check never ran.
+  - During a refactor the executor deleted six of its own earlier tests; they were restored.
+
+  Choices the task didn't settle, which hidden tests could disagree with:
+  - open_loops includes model-turn nodes, not only owner-turn ones. That's my reading of the design doc ("open nodes carry responsible_party (owner|model)").
+  - The root node can't be settled.
+  - Re-settling an already-settled branch is allowed and overwrites it.
+  - resolved_by_memory_id must be a memory in the caller's own tenant.
+  - since reads: edges are limited to those touching a returned node, while open_loops always covers the whole map.
+
+  Open issue: the double-encoded event payloads are an existing bug that I deliberately didn't fix. Any future SQL that reads fields out of event payloads has to handle both shapes.
+
+✻ Brewed for 30m 47s · done 11:46 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+
+

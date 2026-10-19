@@ -1,0 +1,260 @@
+  tests check design-doc rules as well as the points below.
+
+  ## What to build
+
+  ### A. Branch status (stored state)
+
+  - Each map member node has a **stored** status: `open` (default), `resolved`, or
+    `dropped`, plus the settlement details (one-line resolution summary, the
+    resolving node if any, which party resolved it, when).
+  - Status is the source of truth for "is this branch settled". It must **not** be
+    inferred from `memory_references.reference_kind` (that column is unvalidated
+    free text); an edge alone never settles a branch.
+  - Schema changes go through a **new Alembic migration** (`alembic/versions/`,
+    follow the existing naming/revision-chain conventions and constrain the new
+    values with CHECKs). The scoring harness runs `alembic upgrade head` on a fresh
+    database before running tests.
+
+  ### B. New tool `mindmap_resolve` — settle one branch without closing the map
+
+  Module `mem_mcp/mcp/tools/mindmap_resolve.py`, classes `MindmapResolveTool`
+  (name `mindmap_resolve`, scope `memory.write`), `MindmapResolveInput`,
+  `MindmapResolveOutput`; registered in `main.py`, described in
+  `mcp/tool_descriptions.py` (existing "Call when / Do not call" style).
+
+  Input:
+
+  | field | type | notes |
+  |---|---|---|
+  | `map_key` | str (1..64) | map handle, as for the other mindmap tools |
+  | `node_id` | UUID | the branch node to settle |
+  | `disposition` | `"resolved"` \| `"dropped"` | default `"resolved"` |
+  | `resolution_summary` | str (1..500), **required** | the one line every later cheap read shows instead of the branch |
+  | `resolved_by_memory_id` | UUID \| None | the node that settles it, if any |
+  | `resolved_by_party` | `"owner"` \| `"model"` | default `"model"` |
+  | `team_id` | UUID \| None | as for the other mindmap tools |
+
+  Output: `node_id`, `status` (the new status), `resolution_summary`, `cursor`
+  (see D), `request_id`.
+
+  Behaviour:
+  - Unknown map, or a node that is not a member of **this** map → `JsonRpcError`
+    -32602, nothing changed (a caller must not be able to settle a node of a
+    different map by id).
+  - Respect the map lifecycle rules of the design doc.
+  - When a resolving node is named, also record the graph edge from the resolving
+    node (source) to the settled node (target) in `memory_references`, so the graph
+    stays walkable. Use the edge kind the design doc's reference-kind vocabulary
+    prescribes for the disposition, and write it through the same code path
+    `mindmap_link` uses. No resolving node → no edge, but the branch is still
+    settled.
+  - Status change and edge are written in one transaction, and the action is
+    recorded in the map's event log (observability, as for the other map verbs).
+
+  ### C. `open_loops` fix
+
+  `open_loops` must follow the design doc's whose-turn definition **and** exclude
+  settled branches: a resolved/dropped node is never an open loop.
+
+  ### D. Cheap reads on `mindmap_get`
+
+  New input levers on `MindmapGetInput`, all defaulting to the cheap setting:
+
+  | field | values | default |
+  |---|---|---|
+  | `since` | int ≥ 0 \| None | None |
+  | `include` | `"open"` \| `"all"` | `"open"` |
+  | `depth` | `"summary"` \| `"full"` | `"summary"` |
+
+  - `cursor` (int, new output field): a position in the map's append-only event log
+    (`memory_map_events` already has a monotonically increasing id). Every read
+    returns the current cursor; a write/resolve advances it.
+  - `since=<cursor>`: return only nodes touched by map events after that cursor. If
+    nothing changed, return **no nodes** (never "everything") and the same cursor.
+  - `include="open"`: `nodes` holds only open branches; settled branches come back
+    in a separate new output list `resolved`, one compact entry per branch with
+    `memory_id`, `resolution_summary`, `status`, `resolved_by_party`.
+    `include="all"`: every member in `nodes`, each with its `status`.
+  - `depth="summary"`: node `content` longer than 200 characters is cut to at most
+    200 characters followed by a single `…`, and the node's new `truncated` flag
+    is true. Content of 200 characters or fewer is returned as-is with
+    `truncated=false`. `depth="full"` returns content whole, `truncated=false`.
+  - Each node in `nodes` also carries its `status`.
+  - Existing output fields stay (backward compatible for callers that ignore the
+    new ones).
+
+  ## Out of scope
+
+  A cross-map answer queue, map listing, `mindmap_answer`, decision criteria /
+  question nodes, and close-time guards are planned separately — don't build them.
+
+  ## Constraints
+
+  - Follow the existing mindmap layering: SQL in `mem_mcp/mindmap/service.py`,
+    tools thin; `tenant_tx`; `JsonRpcError` conventions from `mcp/errors.py`.
+  - Do not modify existing tests; add your own (unit + DB-backed through the
+    tools). The rest of the suite must not get new failures (some tests are red
+    before you start — pre-existing; leave them).
+
+  ## Running tests
+
+  `MEM_MCP_TEST_DSN` / `MEM_MCP_DB_MAINT_DSN` point at a fresh database migrated to
+  the base revision; after adding your migration run `alembic upgrade head`, then
+  e.g. `pytest -q -p no:cacheprovider tests/unit tests/integration`.
+  `tests/integration/test_mindmap_e2e.py` shows how to set up a tenant/team and
+  drive the mindmap tools against the real DB with a stub embedder.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_01Uu9BDsmW7NNZ7R1vtZCkot
+
+  Searched for 2 patterns, read 12 files, listed 1 directory (ctrl+o to expand)
+
+● I've read the design doc, ADRs, and the mindmap code; now checking the reference-insert helper and the e2e test before writing the first work order.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Writing the first work order now.
+
+● Write(~/laguna-bench/runs/T4-D1/orders/order-1.md)
+  ⎿  Wrote 158 lines to ../orders/order-1.md
+       1 # Work order 1 — Mind-map branch status + `mindmap_resolve` + cheap `mindmap_get` reads
+       2
+       3 Read first: `CONVENTIONS.md`, `docs/mindmap-v1-build-design.md` (source of truth where this order is
+       4 silent), `skills/mindmap-driver/SKILL.md`, `src/mem_mcp/mindmap/service.py`,
+       5 `src/mem_mcp/mcp/tools/mindmap_*.py`, `src/mem_mcp/mcp/tools/_mindmap_common.py`,
+       6 `src/mem_mcp/teams/references.py`, `alembic/versions/0038_2026_06_19_mindmap_tables.py`,
+       7 `tests/integration/test_mindmap_e2e.py` (fixture pattern for DB-backed tool tests).
+       8
+       9 ## Problem
+      10 Every `mindmap_get` returns every node in full. There is no per-branch settlement (only
+     … +148 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh D T4-D1 ~/laguna-bench/runs/T4-D1/orders/order-1.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +30 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Bash(git status && git diff -- src alembic && cat alembic/versions/0044_2026_10_16_mindmap_branch_status.py src/mem_mcp/mcp/tools/mindmap_resolve.py)
+  ⎿  On branch master
+     Changes not staged for commit:
+       (use "git add <file>..." to update what will be committed)
+     … +743 lines (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/T4-D1/orders/order-2.md)
+  ⎿  Wrote 70 lines to ../orders/order-2.md
+      1 # Work order 2 — finish & fix order 1
+      2
+      3 Good core work. The following must be fixed / finished. Keep the design from order 1.
+      4
+      5 ## 1. Remove scratch files from the repo root
+      6 Delete: `CHANGES_SUMMARY.txt`, `FINAL_REPORT.txt`, `IMPLEMENTATION_SUMMARY.md`, `VERIFICATION_REPORT.md`,
+      7 `fix_context.py`, `fix_pool_references.py`, `fix_tests.py`, `verify_implementation.sh`.
+      8 `git status` afterwards must show only: the migration, `main.py`, `tool_descriptions.py`, `mindmap_get.py`,
+      9 `mindmap_resolve.py`, `mindmap/service.py`, the two new test files, and the two doc files below.
+     … +60 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh D T4-D1 ~/laguna-bench/runs/T4-D1/orders/order-2.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +30 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Order 2 came back after one turn with no changes, so I'm sending it again with an explicit instruction to act on it.
+
+● Write(~/laguna-bench/runs/T4-D1/orders/order-3.md)
+  ⎿  Wrote 20 lines to ../orders/order-3.md
+       1 # Work order 3 — execute order 2 (nothing was changed last time)
+       2
+       3 Your previous turn replied "Task completed." without making any change — every item is still open.
+       4 Please now actually carry out **every item** of
+       5 `~/laguna-bench/runs/T4-D1/orders/order-2.md` (read that file now; it is the full spec):
+       6
+       7 1. delete the 8 scratch files at the repo root;
+       8 2. `mindmap_get.py`: open_loops over the whole map regardless of `since` (no early return with empty
+       9    open_loops), edges fetched over all members and kept when AT LEAST ONE endpoint is returned,
+      10    module-level truncation constant + helper, docstring;
+     … +10 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh D T4-D1 ~/laguna-bench/runs/T4-D1/orders/order-3.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +30 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Write(~/laguna-bench/runs/T4-D1/orders/order-4.md)
+  ⎿  Wrote 8 lines to ../orders/order-4.md
+      1 # Work order 4
+      2
+      3 Start now with one concrete action: run `git -C ~/laguna-bench/runs/T4-D1/repo status`, then
+      4 delete the scratch files `CHANGES_SUMMARY.txt FINAL_REPORT.txt IMPLEMENTATION_SUMMARY.md
+      5 VERIFICATION_REPORT.md fix_context.py fix_pool_references.py fix_tests.py verify_implementation.sh` at the
+      6 repo root. Then read `~/laguna-bench/runs/T4-D1/orders/order-2.md` and do items 2–7 one by one,
+      7 using tools for each. Replying without tool calls is not acceptable. Finish with the report requested at the
+      8 bottom of order-2.md.
+
+● Bash(~/laguna-bench/bin/run_executor.sh D T4-D1 ~/laguna-bench/runs/T4-D1/orders/order-4.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +30 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor has now answered three orders in a row with "Task completed." after one turn (4 output tokens) and changed nothing. I'm checking the runner script for a way to start a fresh session.
+
+  Read 1 file (ctrl+o to expand)
+
+● I've stopped: I couldn't finish the task because the executor stopped responding after the first round-trip. A first version of the feature is in the repo, but it has known bugs, its new integration tests don't pass,
+  and the docs aren't updated.
+
+  Executor round-trips: 4 orders sent, and only the first one changed any code.
+  - Order 1: about 40 min, 160 turns. Produced most of the feature.
+  - Orders 2, 3 and 4: each came back in 6–22 seconds, after one turn, with "Task completed." (4 output tokens) and no file changes. The executor session is resumed every time and is now at about 154k input tokens. My
+    guess is it hit the model's context limit, so retrying the same session won't help.
+  - Fresh session: that needs runs/T4-D1/exec_session removed, which is harness state I'm not allowed to touch.
+  - Scratch files: the executor's tool allowlist has no rm, so it can't delete the 8 files it left at the repo root either way.
+
+  What's in place (from order 1):
+  - Migration 0044_2026_10_16_mindmap_branch_status.py: adds status (open/resolved/dropped), resolution_summary, resolved_by_memory_id, resolved_by_party and resolved_at to memory_map_membership. The new values are
+    limited by named CHECKs, plus one that keeps the status and settlement fields consistent. It has a downgrade().
+  - mindmap/service.py:
+    - New functions: get_membership, set_branch_status, current_cursor, memory_ids_touched_since.
+    - log_event now returns the event id.
+    - fetch_members now returns the status fields.
+  - mindmap_resolve.py: behaves as the packet asks.
+    - Unknown map, a node that isn't in this map, or the root node → -32602.
+    - Archived map → -32602 map_not_live.
+    - The resolving node gets the same access check mindmap_link uses.
+    - Status, edge (resolves-under / dropped-under, resolver → settled node, via insert_reference) and the event log entry are written in one transaction, and the cursor is returned.
+    - It's registered in main.py and has a tool description.
+  - mindmap_get.py: has the since / include / depth inputs, the cursor, resolved, status and truncated outputs, 200 characters + … truncation, and open_loops = owner's turn and status open.
+
+  Known problems still in the tree:
+  1. open_loops is wrong when since is set. With nothing changed it comes back empty, and otherwise it only covers the touched nodes instead of the whole map.
+  2. Edges are dropped too often. With since, edges are only fetched among the touched nodes, and the filter needs both ends of an edge in the response rather than at least one.
+  3. New integration tests don't pass. The executor said tests/integration/test_mindmap_branch_status.py "needs helper function fixes". I never got exact pytest output, and there was no before/after run of the full
+     suite, so I can't rule out new failures elsewhere.
+  4. Docs not updated: docs/mindmap-v1-build-design.md and skills/mindmap-driver/SKILL.md.
+  5. Scratch files to delete at the repo root: CHANGES_SUMMARY.txt, FINAL_REPORT.txt, IMPLEMENTATION_SUMMARY.md, VERIFICATION_REPORT.md, fix_context.py, fix_pool_references.py, fix_tests.py, verify_implementation.sh.
+  6. Lint and tidy-up:
+     - Some migration lines are over 100 columns and the imports in mindmap_resolve.py are out of order.
+     - Constants are defined inside functions instead of at module level.
+     - There's an unused duplicate MindmapResolvedEntry class.
+     - current_cursor isn't wrapped in int(), which mypy will flag.
+     - The tenant-scope linter may flag the new memory_map_events queries, which don't filter on tenant_id.
+
+  Confidence the acceptance criteria are met: low to moderate. Part B (mindmap_resolve) and the schema look right. Part C has the bug in point 1, part D has the bug in point 2, and nothing is verified by passing tests.
+  Order 2 (runs/T4-D1/orders/order-2.md) lists every fix needed. To finish, run it in a fresh executor session (clear runs/T4-D1/exec_session) and let it delete files.
+
+✻ Cogitated for 42m 52s · done 3:11 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ I cleared exec_session, rerun order-2 in a fresh session
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+
+

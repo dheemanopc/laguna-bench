@@ -1,0 +1,866 @@
+NOTICE:  database "lb_t6green_665343" does not exist, skipping
+.FFFFFxFFFFFFFFFFFFFFFF.x....F..F......x..xF...........................x [ 45%]
+x.........................xxxx...................x.......x..x........... [ 91%]
+..............                                                           [100%]
+=================================== FAILURES ===================================
+_______________________ test_single_memory_exact_fields ________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d599ea680>
+
+    async def test_single_memory_exact_fields(pg_pool: Any) -> None:
+        """One memory: verify every field of MemoryListItem matches the DB row."""
+        nid = uuid4()
+        base = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+>               mem_id = await _insert_memory(
+                    conn,
+                    s["tenant"],
+                    s["team"],
+                    content="hello world content",
+                    mem_type="decision",
+                    tags=["important", "reviewed"],
+                    created_at=base,
+                    updated_at=base + timedelta(hours=1),
+                    embedding_status="completed",
+                )
+
+tests/integration/test_memory_list_behaviour.py:300: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (ec1b9fc1-dd93-4bda-a705-0aeedec28ab1, b44ca870-9169-4d79-804a-67e01c2e0ef2, hello world content, hash-281c3504f88845ecbee8d62a43ef4a94, 'content':3 'hello':1 'world':2, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, decision, {important,reviewed}, {}, 1, null, null, t, 2026-06-10 12:00:00+00, 2026-06-10 13:00:00+00, null, null, null, 0, null, t, completed, team, 924b3a52-bf22-4b0a-ac7f-83c3ee3642ae, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+_____________________ test_pagination_next_cursor_present ______________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f1480>
+
+    async def test_pagination_next_cursor_present(pg_pool: Any) -> None:
+        """More rows than limit → next_cursor is non-None."""
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+                base = datetime.now(tz=UTC)
+>               await _insert_many(conn, s["tenant"], s["team"], 5, base_time=base)
+
+tests/integration/test_memory_list_behaviour.py:343: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:260: in _insert_many
+    mid = await _insert_memory(
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (e767b7a8-5d45-4d74-8212-7c8818120838, 693607a2-94d6-453b-b612-fd3119349d8b, memory 0, hash-a1f0abf5b4884691b6750769a2662520, '0':2 'memori':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-10-15 18:56:15.294654+00, 2026-10-15 18:56:15.294654+00, null, null, null, 0, null, t, completed, team, 6b70b821-2bdc-4fb2-9aa9-c8f7bda9d9cf, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+_____________________ test_pagination_exact_fit_no_cursor ______________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f1f00>
+
+    async def test_pagination_exact_fit_no_cursor(pg_pool: Any) -> None:
+        """Exactly *limit* rows → next_cursor is None (fetch_limit=len, not >limit)."""
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+                base = datetime.now(tz=UTC)
+>               await _insert_many(conn, s["tenant"], s["team"], 3, base_time=base)
+
+tests/integration/test_memory_list_behaviour.py:359: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:260: in _insert_many
+    mid = await _insert_memory(
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (ebd84fd9-a2f8-4a2c-9be6-7ed1c137c8bc, e00a1ae8-b5a6-4def-be7a-343811b1005c, memory 0, hash-a94cfa5e2cf24a2a90c9ea6a057f14cf, '0':2 'memori':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-10-15 18:56:15.351561+00, 2026-10-15 18:56:15.351561+00, null, null, null, 0, null, t, completed, team, b04d109c-8122-4a9a-9153-59500fe988bf, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+________________ test_pagination_next_page_returns_continuation ________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f1c00>
+
+    async def test_pagination_next_page_returns_continuation(pg_pool: Any) -> None:
+        """Second page returns rows that come after the first page in sort order."""
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+                base = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
+>               await _insert_many(
+                    conn, s["tenant"], s["team"], 5, base_time=base,
+                    content_prefix="row",
+                )
+
+tests/integration/test_memory_list_behaviour.py:375: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:260: in _insert_many
+    mid = await _insert_memory(
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (4ff5012d-4598-4fe2-8b5f-a34d726b98e7, 4f87771e-48b2-4aa2-a443-f7c7bbed436d, row 0, hash-3933bb086b1b4971abfa11ac937dfae3, '0':2 'row':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-06-10 12:00:00+00, 2026-06-10 12:00:00+00, null, null, null, 0, null, t, completed, team, b8fa9936-05eb-4d57-a140-cddc784db793, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+___________________ test_pagination_single_page_all_returned ___________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f2440>
+
+    async def test_pagination_single_page_all_returned(pg_pool: Any) -> None:
+        """When all memories fit in one page (count <= limit), no cursor."""
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+                base = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
+>               ids = await _insert_many(
+                    conn, s["tenant"], s["team"], 3, base_time=base,
+                    content_prefix="single",
+                )
+
+tests/integration/test_memory_list_behaviour.py:404: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:260: in _insert_many
+    mid = await _insert_memory(
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (549a2fd1-0c6b-409b-811b-0c61bad3352d, c84ade2d-3b3b-4c91-80f9-aa4ad7f16e87, single 0, hash-5c2a131dc4334228b0a164b456fab496, '0':2 'singl':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-06-10 12:00:00+00, 2026-06-10 12:00:00+00, null, null, null, 0, null, t, completed, team, f3c61399-a09a-44f7-870f-84520ba0a2bd, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+_____________________ test_order_desc_returns_newest_first _____________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f3580>
+
+    async def test_order_desc_returns_newest_first(pg_pool: Any) -> None:
+        """DESC (default): newest created_at first."""
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+                base = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
+>               await _insert_many(
+                    conn, s["tenant"], s["team"], 3, base_time=base,
+                    content_prefix="desc",
+                )
+
+tests/integration/test_memory_list_behaviour.py:463: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:260: in _insert_many
+    mid = await _insert_memory(
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (60d87538-7a3a-40a4-b3ca-cae6ed430126, 46f98ca1-b213-44b6-9efc-dcd74c56660c, desc 0, hash-d2f35dadd9bb4c859804bf5703a61a1a, '0':2 'desc':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-06-10 12:00:00+00, 2026-06-10 12:00:00+00, null, null, null, 0, null, t, completed, team, 7a42d229-83dc-4df1-b3dd-0cc3e6606fc0, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+_____________________ test_order_asc_returns_oldest_first ______________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f3700>
+
+    async def test_order_asc_returns_oldest_first(pg_pool: Any) -> None:
+        """ASC: oldest created_at first."""
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+                base = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
+>               await _insert_many(
+                    conn, s["tenant"], s["team"], 3, base_time=base,
+                    content_prefix="asc",
+                )
+
+tests/integration/test_memory_list_behaviour.py:484: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:260: in _insert_many
+    mid = await _insert_memory(
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (f25f3294-386f-4e1a-931a-43c313a71b74, 251afdf3-b6cb-413e-9022-41d79fac6e48, asc 0, hash-8f3695eebb264beabd10ed0cf81317df, '0':2 'asc':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-06-10 12:00:00+00, 2026-06-10 12:00:00+00, null, null, null, 0, null, t, completed, team, 32191caa-d16d-4236-b0db-80bd6b8c03a5, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+___________________________ test_order_by_updated_at ___________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f3340>
+
+    async def test_order_by_updated_at(pg_pool: Any) -> None:
+        """order_by='updated_at' sorts by updated_at, not created_at."""
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+                base = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
+                # Memory A: created 12:00, updated 22:00 (10h later)
+>               await _insert_memory(
+                    conn, s["tenant"], s["team"],
+                    content="updated-later",
+                    created_at=base,
+                    updated_at=base + timedelta(hours=10),
+                )
+
+tests/integration/test_memory_list_behaviour.py:503: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (f23e6da5-64b5-4ea3-be03-2670140aa516, 69078d5b-9234-4d4e-ad75-16f5c8a7443c, updated-later, hash-60adac8747f5492aa475382c48b8dbc7, 'later':3 'updat':2 'updated-lat':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-06-10 12:00:00+00, 2026-06-10 22:00:00+00, null, null, null, 0, null, t, completed, team, 70361703-f3b8-4a97-b1c1-d1cf500cab8d, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+_____________________________ test_filter_by_type ______________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f1e40>
+
+    async def test_filter_by_type(pg_pool: Any) -> None:
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+>               await _insert_memory(conn, s["tenant"], s["team"], content="note 1", mem_type="note")
+
+tests/integration/test_memory_list_behaviour.py:534: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (8455e86b-52e6-42bb-a851-605557e635f5, 5c417844-d8a8-4ed1-96c0-be5b91016b12, note 1, hash-1b9e2ec09cb14bf5b6246d406d61f20d, '1':2 'note':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-10-15 18:56:15.782783+00, 2026-10-15 18:56:15.782783+00, null, null, null, 0, null, t, completed, team, c9fd287a-769a-4dbf-8862-9b663d3aa87d, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+______________________ test_filter_by_tags_all_must_match ______________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f0580>
+
+    async def test_filter_by_tags_all_must_match(pg_pool: Any) -> None:
+        """tags @> ARRAY[...] — memory must contain ALL specified tags."""
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+>               await _insert_memory(conn, s["tenant"], s["team"], content="ab", tags=["python"])
+
+tests/integration/test_memory_list_behaviour.py:555: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (e8237e14-8089-45b3-948c-db149c9a6c65, 56a081f0-eefd-474d-a839-dc6b104047a2, ab, hash-1d25b70843ce413abe96eb655d8d31ce, 'ab':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {python}, {}, 1, null, null, t, 2026-10-15 18:56:15.832526+00, 2026-10-15 18:56:15.832526+00, null, null, null, 0, null, t, completed, team, 51915ffa-b274-4b88-86c0-323a817017ad, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+___________________________ test_filter_by_keywords ____________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f3640>
+
+    async def test_filter_by_keywords(pg_pool: Any) -> None:
+        """keywords filter uses tsvector matching on content."""
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+>               await _insert_memory(conn, s["tenant"], s["team"], content="postgres database note")
+
+tests/integration/test_memory_list_behaviour.py:578: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (548a2ea8-7542-4aab-8dd1-523399eef916, af53e37d-a806-44c9-8aca-25f1bca1fe63, postgres database note, hash-e19c40be46d84c3c813a90289c33b3ac, 'databas':2 'note':3 'postgr':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-10-15 18:56:15.885872+00, 2026-10-15 18:56:15.885872+00, null, null, null, 0, null, t, completed, team, ae1532f4-3a0e-45af-9d84-e9044e879aaa, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+_____________________________ test_filter_by_since _____________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f22c0>
+
+    async def test_filter_by_since(pg_pool: Any) -> None:
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+                base = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
+>               await _insert_many(
+                    conn, s["tenant"], s["team"], 3, base_time=base,
+                    content_prefix="since", step=timedelta(hours=1),
+                )
+
+tests/integration/test_memory_list_behaviour.py:599: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:260: in _insert_many
+    mid = await _insert_memory(
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (082f19ab-3219-446a-a55b-54ada4b15fbe, 4e78dbb0-23b7-461c-8d6a-2fc3daefa1ad, since 0, hash-25733061ac804bc6a120851650c49884, '0':2 'sinc':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-06-10 12:00:00+00, 2026-06-10 12:00:00+00, null, null, null, 0, null, t, completed, team, 1472025d-9357-49f1-b742-3d1a689a26a8, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+_____________________________ test_filter_by_until _____________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f3e80>
+
+    async def test_filter_by_until(pg_pool: Any) -> None:
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+                base = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
+>               await _insert_many(
+                    conn, s["tenant"], s["team"], 3, base_time=base,
+                    content_prefix="until", step=timedelta(hours=1),
+                )
+
+tests/integration/test_memory_list_behaviour.py:620: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:260: in _insert_many
+    mid = await _insert_memory(
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (949710de-3df4-43f8-8353-5bebd2833e19, 6c43172b-8270-415b-a48c-2b2d801da575, until 0, hash-ef20f91535d54499a4f078f28bcbe6fa, '0':2, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-06-10 12:00:00+00, 2026-06-10 12:00:00+00, null, null, null, 0, null, t, completed, team, 99784baf-b29a-43e4-bfab-f9224ec0a423, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+___________________________ test_filter_by_indexable ___________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f2a40>
+
+    async def test_filter_by_indexable(pg_pool: Any) -> None:
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+>               await _insert_memory(conn, s["tenant"], s["team"], content="indexed", indexable=True)
+
+tests/integration/test_memory_list_behaviour.py:640: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (4765bd63-c0ba-4b59-a893-1e035d488e42, c4e967f7-3191-46cf-beca-a8813348353c, indexed, hash-efcdf1560cd646a3bbf7ec5b9d0f7006, 'index':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-10-15 18:56:16.093884+00, 2026-10-15 18:56:16.093884+00, null, null, null, 0, null, t, completed, team, f3a8db73-4398-4e60-83dc-e718df3d8f30, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+____________________________ test_filter_by_team_id ____________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f1480>
+
+    async def test_filter_by_team_id(pg_pool: Any) -> None:
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+>               await _insert_memory(conn, s["tenant"], s["team"], content="in-team")
+
+tests/integration/test_memory_list_behaviour.py:659: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (bb8479b1-e5d9-47ee-8ba8-ae3c7dbc3d0a, 40386374-aadc-4edb-bab6-f4fc80098d37, in-team, hash-0356c96627bf470890f7600b5b3c0f3b, 'in-team':1 'team':3, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-10-15 18:56:16.149055+00, 2026-10-15 18:56:16.149055+00, null, null, null, 0, null, t, completed, team, 80d8c684-e18f-4894-a037-52ba8084dc63, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+___________________________ test_filter_by_parent_id ___________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f0b80>
+
+    async def test_filter_by_parent_id(pg_pool: Any) -> None:
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+                # parent_id FK references memories(id), so we must insert the parent
+                # row first and use its id for the child.
+>               parent_id = await _insert_memory(
+                    conn, s["tenant"], s["team"], content="parent", parent_id=None,
+                )
+
+tests/integration/test_memory_list_behaviour.py:675: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (5756b61c-8bb4-4328-88e7-679649e814ed, 9f658586-b534-4a83-ab65-33d456ad17ef, parent, hash-056dca4caced48409b5016ca3bb8a9c0, 'parent':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-10-15 18:56:16.205668+00, 2026-10-15 18:56:16.205668+00, null, null, null, 0, null, t, completed, team, 24577b9d-5093-4ec2-85d0-120385db052e, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+_____________________________ test_include_deleted _____________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f25c0>
+
+    async def test_include_deleted(pg_pool: Any) -> None:
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+>               await _insert_memory(conn, s["tenant"], s["team"], content="active")
+
+tests/integration/test_memory_list_behaviour.py:700: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (4c10efb1-73f6-4eb6-ae8b-da10af57a518, afaf49b3-c7cd-4441-a1d5-77bab7c1a0ea, active, hash-c82ba61992974ae5a0499f1c935a22d6, 'activ':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-10-15 18:56:16.273206+00, 2026-10-15 18:56:16.273206+00, null, null, null, 0, null, t, completed, team, 72a9c738-206e-4dd3-a30c-48acc546ca47, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+_____________________________ test_include_expired _____________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f2d40>
+
+    async def test_include_expired(pg_pool: Any) -> None:
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+>               await _insert_memory(conn, s["tenant"], s["team"], content="active")
+
+tests/integration/test_memory_list_behaviour.py:725: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (07b15332-465d-4aea-9a21-6075e928cd86, 67a86aa9-934d-47fc-aedc-b4037decea69, active, hash-0be2b085234d40709dcbeda176fc5037, 'activ':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-10-15 18:56:16.345497+00, 2026-10-15 18:56:16.345497+00, null, null, null, 0, null, t, completed, team, d5f99ae6-7242-4f8a-873a-6df83f4053b5, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+_____________________________ test_include_history _____________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f3640>
+
+    async def test_include_history(pg_pool: Any) -> None:
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+                now = datetime.now(tz=UTC)
+                # Current version (is_current=true, version=2)
+>               await _insert_memory(
+                    conn, s["tenant"], s["team"], content="current", is_current=True, version=2,
+                    created_at=now, updated_at=now,
+                )
+
+tests/integration/test_memory_list_behaviour.py:750: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (a29107df-d2d7-41b7-94f4-56702c441eae, e4449bfa-2dc2-46b4-938b-0a71a4410e64, current, hash-4ac4052b9f024b319dd5b8cd62caf970, 'current':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 2, null, null, t, 2026-10-15 18:56:16.414824+00, 2026-10-15 18:56:16.414824+00, null, null, null, 0, null, t, completed, team, 75936fcb-69f8-4a3f-9021-bee2bbc548ad, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+____________________________ test_audit_log_success ____________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f28c0>
+
+    async def test_audit_log_success(pg_pool: Any) -> None:
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+>               await _insert_memory(conn, s["tenant"], s["team"], content="audit-test")
+
+tests/integration/test_memory_list_behaviour.py:784: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (725c276a-27f9-4108-ab8e-8b08e43c37cf, bca73b10-791a-4fec-870a-45bd384a1e16, audit-test, hash-0d73bb002bb5487190d5b887e074ef2a, 'audit':2 'audit-test':1 'test':3, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-10-15 18:56:16.466101+00, 2026-10-15 18:56:16.466101+00, null, null, null, 0, null, t, completed, team, 647e4804-6007-4340-9ba3-fe7b9cc82c95, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+_______________________ test_audit_log_reflects_has_next _______________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f1900>
+
+    async def test_audit_log_reflects_has_next(pg_pool: Any) -> None:
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                s = await _setup(conn)
+                base = datetime.now(tz=UTC)
+>               await _insert_many(conn, s["tenant"], s["team"], 5, base_time=base, content_prefix="audit")
+
+tests/integration/test_memory_list_behaviour.py:808: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_memory_list_behaviour.py:260: in _insert_many
+    mid = await _insert_memory(
+tests/integration/test_memory_list_behaviour.py:209: in _insert_memory
+    return await conn.fetchval(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:714: in fetchval
+    data = await self._execute(query, args, 1, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.CheckViolationError: new row for relation "memories" violates check constraint "memories_embedding_status_check"
+E   DETAIL:  Failing row contains (60279529-0ada-4b71-8db4-3670e1196745, 3fa78b5a-5139-4c99-a075-efedb2da20d9, audit 0, hash-d1466c713b2e4ba5936d4c16ca98e886, '0':2 'audit':1, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0..., null, null, api, note, {}, {}, 1, null, null, t, 2026-10-15 18:56:16.522128+00, 2026-10-15 18:56:16.522128+00, null, null, null, 0, null, t, completed, team, 12e7912d-5492-4961-8cf8-b68db1b03c80, null).
+
+asyncpg/protocol/protocol.pyx:206: CheckViolationError
+__________________________ test_deliver_oldest_first ___________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d5950c640>
+
+    async def test_deliver_oldest_first(pg_pool: Any) -> None:
+        """deliver_pending orders by created_at ASC (oldest first)."""
+        base = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                tenant = await _setup_tenant(conn, "order")
+                await _insert_notice_direct(
+                    conn, tenant, template="third {v}", payload={"v": 3},
+                    created_at=base + timedelta(hours=2),
+                )
+                await _insert_notice_direct(
+                    conn, tenant, template="first {v}", payload={"v": 1},
+                    created_at=base,
+                )
+                await _insert_notice_direct(
+                    conn, tenant, template="second {v}", payload={"v": 2},
+                    created_at=base + timedelta(hours=1),
+                )
+        try:
+            async with pg_pool.acquire() as conn:
+                async with conn.transaction():
+                    notices = await deliver_pending(conn, tenant, limit=20)
+    
+            assert len(notices) == 3
+>           assert [n.text for n in notices] == ["first 1", "second 2", "third 3"]
+E           AssertionError: assert ['first 1', '...', 'second 2'] == ['first 1', '...2', 'third 3']
+E             
+E             At index 1 diff: 'third 3' != 'second 2'
+E             Use -v to get more diff
+
+tests/integration/test_plugin_notices_behaviour.py:168: AssertionError
+__________________________ test_deliver_pending_limit __________________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d5950c400>
+
+    async def test_deliver_pending_limit(pg_pool: Any) -> None:
+        """limit caps the number of notices returned per call."""
+        base = datetime(2026, 6, 10, 12, 0, 0, tzinfo=UTC)
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                tenant = await _setup_tenant(conn, "limit")
+                for i in range(5):
+                    await _insert_notice_direct(
+                        conn, tenant, template="item {n}", payload={"n": i},
+                        created_at=base + timedelta(seconds=i),
+                    )
+        try:
+            async with pg_pool.acquire() as conn:
+                async with conn.transaction():
+                    notices = await deliver_pending(conn, tenant, limit=2)
+            assert len(notices) == 2
+>           assert [n.payload["n"] for n in notices] == [0, 1]  # oldest first
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           assert [1, 0] == [0, 1]
+E             
+E             At index 0 diff: 1 != 0
+E             Use -v to get more diff
+
+tests/integration/test_plugin_notices_behaviour.py:245: AssertionError
+______________________ test_queue_auto_expires_after_ttl _______________________
+
+pg_pool = <asyncpg.pool.Pool object at 0x7d7d592f3e80>
+
+    async def test_queue_auto_expires_after_ttl(pg_pool: Any) -> None:
+        """queue() with ttl_seconds sets expires_at ≈ now + ttl (within a window)."""
+        async with pg_pool.acquire() as conn:
+            async with conn.transaction():
+                tenant = await _setup_tenant(conn, "ttl")
+                client = NoticeClientImpl(pg_pool, tenant, plugin_id="reminders")
+                now = datetime.now(tz=UTC)
+>               await client.queue(
+                    kind="reminder_fired",
+                    template="ttl-test",
+                    payload={},
+                    ttl_seconds=3600,
+                )
+
+tests/integration/test_plugin_notices_behaviour.py:493: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/mem_mcp/plugins/clients/notices.py:50: in queue
+    await conn.execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:352: in execute
+    _, status, _ = await self._execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1864: in _execute
+    result, _ = await self.__execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:1961: in __execute
+    result, stmt = await self._do_execute(
+../../../wt/lead/.venv/lib/python3.12/site-packages/asyncpg/connection.py:2024: in _do_execute
+    result = await executor(stmt, None)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   asyncpg.exceptions.ForeignKeyViolationError: insert or update on table "plugin_notices" violates foreign key constraint "plugin_notices_tenant_id_fkey"
+E   DETAIL:  Key (tenant_id)=(e3dba82d-b092-4463-a5f0-255ea73548d7) is not present in table "tenants".
+
+asyncpg/protocol/protocol.pyx:206: ForeignKeyViolationError
+=========================== short test summary info ============================
+FAILED tests/integration/test_memory_list_behaviour.py::test_single_memory_exact_fields
+FAILED tests/integration/test_memory_list_behaviour.py::test_pagination_next_cursor_present
+FAILED tests/integration/test_memory_list_behaviour.py::test_pagination_exact_fit_no_cursor
+FAILED tests/integration/test_memory_list_behaviour.py::test_pagination_next_page_returns_continuation
+FAILED tests/integration/test_memory_list_behaviour.py::test_pagination_single_page_all_returned
+FAILED tests/integration/test_memory_list_behaviour.py::test_order_desc_returns_newest_first
+FAILED tests/integration/test_memory_list_behaviour.py::test_order_asc_returns_oldest_first
+FAILED tests/integration/test_memory_list_behaviour.py::test_order_by_updated_at
+FAILED tests/integration/test_memory_list_behaviour.py::test_filter_by_type
+FAILED tests/integration/test_memory_list_behaviour.py::test_filter_by_tags_all_must_match
+FAILED tests/integration/test_memory_list_behaviour.py::test_filter_by_keywords
+FAILED tests/integration/test_memory_list_behaviour.py::test_filter_by_since
+FAILED tests/integration/test_memory_list_behaviour.py::test_filter_by_until
+FAILED tests/integration/test_memory_list_behaviour.py::test_filter_by_indexable
+FAILED tests/integration/test_memory_list_behaviour.py::test_filter_by_team_id
+FAILED tests/integration/test_memory_list_behaviour.py::test_filter_by_parent_id
+FAILED tests/integration/test_memory_list_behaviour.py::test_include_deleted
+FAILED tests/integration/test_memory_list_behaviour.py::test_include_expired
+FAILED tests/integration/test_memory_list_behaviour.py::test_include_history
+FAILED tests/integration/test_memory_list_behaviour.py::test_audit_log_success
+FAILED tests/integration/test_memory_list_behaviour.py::test_audit_log_reflects_has_next
+FAILED tests/integration/test_plugin_notices_behaviour.py::test_deliver_oldest_first
+FAILED tests/integration/test_plugin_notices_behaviour.py::test_deliver_pending_limit
+FAILED tests/integration/test_plugin_notices_behaviour.py::test_queue_auto_expires_after_ttl
+24 failed, 121 passed, 13 xfailed in 2.89s

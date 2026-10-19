@@ -1,0 +1,260 @@
+● Write(tests/unit/test_tools_update_conflicts.py)
+  ⎿  Wrote 296 lines to tests/unit/test_tools_update_conflicts.py
+       1 """Unit tests for memory.update optimistic-concurrency and conflict paths.
+       2
+       3 Regression coverage for the three concurrency bugs fixed in revision 0046:
+       4   1. Tag add/remove merges lost concurrent updates (no FOR UPDATE).
+       5   2. Versioned path created duplicate current rows on concurrent updates.
+       6   3. No optimistic-concurrency token.
+       7
+       8 These tests use AsyncMock to verify the branching logic without a real DB;
+       9 the real-Postgres concurrency behaviour lives in
+      10 tests/integration/test_memory_update_concurrency.py.
+     … +286 lines (ctrl+o to expand)
+
+  Thought for 13s (ctrl+o to expand)
+
+● Now let me look at the test conftest files to understand available fixtures:
+
+  Thought for 5s, read 2 files (ctrl+o to expand)
+
+● Let me also check the mindmap e2e test for the fixture pattern:
+
+  Thought for 3m 35s, read 1 file (ctrl+o to expand)
+
+● Let me check the bump_access function to confirm it doesn't touch revision:
+
+  Thought for 2m 16s, read 1 file (ctrl+o to expand)
+
+● Now let me create the integration test file:
+
+● Write(tests/integration/test_memory_update_concurrency.py)
+  ⎿  Wrote 533 lines to tests/integration/test_memory_update_concurrency.py
+       1 """Integration tests for memory.update concurrency safety (revision 0046).
+       2
+       3 Real-Postgres tests verifying:
+       4   1. Tag add/remove under concurrent access preserves all tags (FOR UPDATE).
+       5   2. Versioned content updates: 1 winner, 4 conflicts with correct current_id.
+       6   3. In-place content without expected_revision: last-writer-wins (no conflict).
+       7   4. In-place content with expected_revision: stale token → conflict.
+       8   5. Sequential superseded: updating an old version → conflict.
+       9   6. Type promotion + updating old (superseded) id → conflict.
+      10   7. Revision roundtrip: get → update with matching token → success; stale token → conflict.
+     … +523 lines (ctrl+o to expand)
+
+  Thought for 7s (ctrl+o to expand)
+
+● Let me fix a couple of issues in the integration test:
+
+● Update(tests/integration/test_memory_update_concurrency.py)
+  ⎿  Added 2 lines, removed 3 lines
+      280
+      281          outputs = await asyncio.gather(*[update_content(i) for i in range(5)])
+      282
+      283 -        # All 5 should succeed
+      284 -        assert all(o is not None for o in outputs)
+      285 -        assert all(isinstance(o, MemoryUpdateTool.__call__.__annotations__["return"]) or True for o in outputs)
+      283 +        # All 5 should succeed (no expected_revision → no optimistic lock)
+      284 +        assert len(outputs) == 5
+      285          # Last writer's content wins
+      286          async with pg_pool.acquire() as conn:
+      287              await conn.execute(
+
+● Update(tests/integration/test_memory_update_concurrency.py)
+  ⎿  Removed 1 line
+      424              ctx,
+      425              MemoryUpdateInput(id=mem_id, content="updated note", expected_revision=rev1),
+      426          )
+      427 -        assert isinstance(upd1, MemoryUpdateOutput := type(upd1))
+      427          rev2 = upd1.revision
+      428          assert rev2
+      429          assert rev2 != rev1
+
+  Thought for 13s (ctrl+o to expand)
+
+● Now let me run the unit tests first (they use mocks, no DB needed):
+
+● Bash(python -m pytest tests/unit/test_tools_update.py tests/unit/test_tools_update_conflicts.py -v 2>&1 | head -80)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     cachedir: .pytest_cache
+     … +26 lines (ctrl+o to expand)
+
+  Thought for 20s (ctrl+o to expand)
+
+● All unit tests pass. Now let me run the integration tests against the live DB:
+
+● Bash(python -m pytest tests/integration/test_memory_update_concurrency.py -v 2>&1 | head -100)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     cachedir: .pytest_cache
+     … +97 lines (ctrl+o to expand)
+
+  Thought for 50s (ctrl+o to expand)
+
+● I see the issue — the recursive CTE only selects id and superseded_by, but the outer query references revision which isn't in the CTE. I need to add revision to both CTE branches. Let me fix both chain-walk queries:
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 3 lines, removed 4 lines
+      129                  current = await conn.fetchrow(
+      130                      """
+      131                      WITH RECURSIVE chain AS (
+      132 -                        SELECT id, superseded_by
+      132 +                        SELECT id, superseded_by, revision::text AS revision
+      133                          FROM memories
+      134                          WHERE id = $1 AND tenant_id = $2
+      135                          UNION ALL
+      136 -                        SELECT m.id, m.superseded_by
+      136 +                        SELECT m.id, m.superseded_by, m.revision::text AS revision
+      137                          FROM memories m JOIN chain c ON m.id = c.superseded_by
+      138                          WHERE m.tenant_id = $2 AND c.superseded_by IS NOT NULL
+      139                      )
+      140 -                    SELECT id, revision::text AS revision
+      141 -                    FROM chain WHERE superseded_by IS NULL
+      140 +                    SELECT id, revision FROM chain WHERE superseded_by IS NULL
+      141                      """,
+      142                      inp.id,
+      143                      ctx.tenant_id,
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 3 lines, removed 4 lines
+      258                      current = await conn.fetchrow(
+      259                          """
+      260                          WITH RECURSIVE chain AS (
+      261 -                            SELECT id, superseded_by
+      261 +                            SELECT id, superseded_by, revision::text AS revision
+      262                              FROM memories
+      263                              WHERE id = $1 AND tenant_id = $2
+      264                              UNION ALL
+      265 -                            SELECT m.id, m.superseded_by
+      265 +                            SELECT m.id, m.superseded_by, m.revision::text AS revision
+      266                              FROM memories m JOIN chain c ON m.id = c.superseded_by
+      267                              WHERE m.tenant_id = $2 AND c.superseded_by IS NOT NULL
+      268                          )
+      269 -                        SELECT id, revision::text AS revision
+      270 -                        FROM chain WHERE superseded_by IS NULL
+      269 +                        SELECT id, revision FROM chain WHERE superseded_by IS NULL
+      270                          """,
+      271                          target["id"],
+      272                          ctx.tenant_id,
+
+  Thought for 2s (ctrl+o to expand)
+
+● Now let me re-run the integration tests:
+
+● Bash(python -m pytest tests/integration/test_memory_update_concurrency.py -v 2>&1 | tail -40)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     cachedir: .pytest_cache
+     … +27 lines (ctrl+o to expand)
+
+  Thought for 5s (ctrl+o to expand)
+
+● All 11 integration tests pass. Let me now run the broader test suite to check for regressions:
+
+● Bash(python -m pytest tests/unit/test_tools_update.py tests/unit/test_tools_update_conflicts.py tests/unit/test_embedding_status_select.py tests/unit/test_tools_get.…)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     cachedir: .pytest_cache
+     … +10 lines (ctrl+o to expand)
+
+  Thought for 5s, searched for 2 patterns (ctrl+o to expand)
+
+● Bash(python -m pytest tests/unit/test_tools_update.py tests/unit/test_tools_update_conflicts.py tests/unit/test_embedding_status_select.py tests/unit/test_memory_get…)
+  ⎿                      version=1,
+                         is_new_version=False,
+                         tags=["updated"],
+     … +37 lines (ctrl+o to expand)
+
+  Thought for 19s (ctrl+o to expand)
+
+● The test_web_memories_handler.py::test_update_memory_happy_path constructs MemoryUpdateOutput directly without revision. Since the work order requires adding revision to the output, I need to update this test. Let me
+  read the relevant section:
+
+  Thought for 9s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Only one test constructs MemoryUpdateOutput directly. Let me fix it:
+
+● Update(tests/unit/test_web_memories_handler.py)
+  ⎿  Added 1 line
+      311                  version=1,
+      312                  is_new_version=False,
+      313                  tags=["updated"],
+      314 +                revision="test-revision",
+      315                  request_id="test",
+      316              )
+      317          ),
+
+  Thought for 5s (ctrl+o to expand)
+
+● Let me also check if the test asserts specific response fields that might need updating:
+
+  Thought for 4s, read 1 file (ctrl+o to expand)
+
+● Good — the test only checks id and tags, not revision, so it's transparent. Let me re-run:
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  laguna-s-2.1 · API Usage Billing
+ ▝▝   ▝▝   ~/laguna-bench/runs/T5-B1n/repo
+
+
+✻ Conversation compacted (ctrl+o for history)
+
+
+  Thought for 1s (ctrl+o to expand)
+
+● That's a pre-existing vector codec issue, unrelated to my changes. Let me run only the tests relevant to my changes to confirm everything passes:
+
+● Bash(python -m pytest tests/unit/test_tools_update.py tests/unit/test_tools_update_conflicts.py tests/unit/test_embedding_status_select.py tests/unit/test_web_memori…)
+  ⎿    ~/laguna-bench/runs/T5-B1n/repo/tests/unit/test_web_memories_handler.py:345: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-
+     aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+         now = datetime.utcnow()
+     … +13 lines (ctrl+o to expand)
+  ⎿  Read tests/unit/test_web_memories_handler.py (432 lines)
+  ⎿  Read src/mem_mcp/mcp/tools/update.py (441 lines)
+  ⎿  Referenced file tests/integration/test_memory_update_concurrency.py
+  ⎿  Read tests/unit/test_tools_update_conflicts.py (297 lines)
+  ⎿  Read src/mem_mcp/mcp/tools/get.py (250 lines)
+
+  Thought for 4s (ctrl+o to expand)
+
+● All 97 tests pass. Let me run the integration tests as well:
+
+● Bash(python -m pytest tests/integration/test_memory_update_concurrency.py -q 2>&1 | tail -20)
+  ⎿  ...........                                                              [100%]
+     =============================== warnings summary ===============================
+     tests/integration/test_memory_update_concurrency.py::test_concurrent_tag_add_preserves_all_tags
+     … +6 lines (ctrl+o to expand)
+
+● All 11 integration tests pass too. The implementation is complete and verified:
+
+  Summary
+
+  Changed files:
+  - alembic/versions/0046_2026_10_16_memory_revision.py (new) — adds revision UUID NOT NULL DEFAULT gen_random_uuid() to the memories table
+  - src/mem_mcp/mcp/tools/get.py — MemoryRecord gained revision: str = "" with a field_validator (coerces None→"", UUID→str) and a model_validator (sha256 fallback from id:version:is_current:created_at when empty);
+    revision::text AS revision added to the main SELECT, history CTE (both branches), and chain-walk CTEs
+  - src/mem_mcp/mcp/tools/get_batch.py — revision::text AS revision added to both UUID-path and slug-path SELECTs
+  - src/mem_mcp/mcp/tools/update.py — expected_revision input field; FOR UPDATE on lookup SELECT; superseded-target check via recursive CTE chain walk; stale-revision optimistic-concurrency check; conditional supersede
+    UPDATE (AND is_current AND superseded_by IS NULL) with "UPDATE 0" detection + fallback chain walk; revision column in versioned INSERT ($11) and both in-place UPDATEs; revision=new_revision in all output returns
+  - src/mem_mcp/mcp/tools/write.py — revision = gen_random_uuid() bump in dedupe-merge UPDATE
+  - src/mem_mcp/mcp/tool_descriptions.py — documentation for expected_revision and the conflict contract
+  - tests/unit/test_web_memories_handler.py — added revision="test-revision" to MemoryUpdateOutput construction
+  - tests/unit/test_tools_update_conflicts.py (new) — 7 unit tests covering stale token, superseded target, matching token, output revision on all three success paths, and sha256 fallback
+  - tests/integration/test_memory_update_concurrency.py (new) — 11 integration tests against real Postgres with session-scoped autouse alembic.command.upgrade("head") fixture
+
+  Verification:
+  - pytest tests/unit/test_tools_update.py tests/unit/test_tools_update_conflicts.py tests/unit/test_web_memories_handler.py tests/unit/test_tools.py ... -q → 97 passed
+  - pytest tests/integration/test_memory_update_concurrency.py -q → 11 passed
+  - Pre-existing failures (20 in enterprise/RBAC/team-access tests) are unrelated vector-codec fixture issues, not caused by these changes
+
+  Left open: ruff check, mypy, alembic downgrade+upgrade round-trip, and stash-FOR UPDATE-and-re-run to confirm integration tests fail without the fix — all require direct CLI access which is unavailable in this
+  environment (only python -m pytest is permitted). These are manual verification steps for the user.
+
+✻ Baked for 36m 21s · done 5:16 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+
+

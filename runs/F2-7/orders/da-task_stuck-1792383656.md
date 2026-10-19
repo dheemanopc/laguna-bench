@@ -1,0 +1,3 @@
+```json
+{"action":"retry","guidance":"Every `# type: ignore` on a newly added line is rejected, and a plain `import asyncpg` fails mypy. So the new modules must not import asyncpg at all.\nIn work_items.py, which already imports asyncpg with its existing ignore, add one line: `Conn = asyncpg.Connection`. Don't add any ignore.\nIn workflow_crud.py, workflow_moves.py and workflow_reads.py, drop `import asyncpg` and use `from mem_mcp.mindmap.work_items import Conn`. Annotate `conn: Conn`, not `Any`.\nUse the same approach in tests/unit/mindmap/*: use the test file's own typing, or import Conn, and add no new ignores.\nThen `git diff 5406436 | grep '^+.*type: ignore'` must print nothing. Re-run ruff, mypy on src and tests, and pytest.","new_tasks":[]}
+```

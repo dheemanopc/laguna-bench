@@ -1,0 +1,118 @@
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  Sonnet 5.5 · Claude Max
+ ▝▝   ▝▝   ~/laguna-bench/runs/T6-A1/repo
+
+
+❯ # Work order 1 — Behavioural test suite for `memory_list` and the plugin-notice pipeline
+
+  ## Goal
+  Write **new test files only** that thoroughly pin down the behaviour of three modules. The suite will be
+  scored by **mutation testing (mutmut)** restricted to these modules, so every assertion should be exact
+  (exact id sets / ordered id lists, exact strings, exact error codes, exact dicts) — not "doesn't crash".
+
+  Modules under test:
+  1. `src/mem_mcp/mcp/tools/list.py` — `MemoryListTool`, `MemoryListInput/Item/Output`, `_encode_cursor`, `_decode_cursor`.
+     Behavioural contract: `TOOL_DESCRIPTIONS["memory_list"]` in `src/mem_mcp/mcp/tool_descriptions.py`.
+  2. `src/mem_mcp/plugins/clients/notices.py` — `NoticeClientImpl.queue`, `_json_default`.
+  3. `src/mem_mcp/plugins/notice_delivery.py` — `deliver_pending`, `_render`, `RenderedNotice.to_dict`.
+
+  ## Hard rules
+  - **Do NOT modify anything under `src/`, `alembic/`, existing tests, any `conftest.py`, or `pyproject.toml`.** New files only.
+  - Suggested files: `tests/integration/test_memory_list_behaviour.py`, `tests/integration/test_plugin_notices_behaviour.py`,
+    `tests/unit/test_memory_list_units.py`, `tests/unit/test_notice_units.py` (names are up to you; must be new).
+  - Tests must pass on the current unmodified source.
+  - Tests run hundreds of times in **parallel worker processes against one shared DB**: create your own tenant/team/identity/
+    oauth client with UUID-suffixed names per test (or per module fixture), never assume empty tables, never depend on
+    order between tests, no wall-clock races (no sleeps; don't rely on two inserts getting different `now()`).
+    Clean up what you create. Keep the whole new suite fast (a few seconds).
+  - No network. Use a stub embedder (see `_build_deps()` in `tests/integration/test_mindmap_e2e.py`) if you use `MemoryWriteTool`.
+  - Use the `pg_pool` fixture from `tests/conftest.py`. Follow the setup/cleanup pattern of
+    `tests/integration/test_mindmap_e2e.py` (`_setup`, `_cleanup`, `_ctx`) — tenant + team + `assign_role` +
+    primary `tenant_identities` row with `default_team_id` + `oauth_clients` row for the ToolContext `client_id`.
+  - **Deterministic data**: I strongly recommend inserting memories (via `MemoryWriteTool` or direct SQL — check the
+    `memories` schema in `alembic/versions/` for required columns) and then setting `created_at`, `updated_at`,
+    `expires_at`, `deleted_at`, `is_current`, `version`, `indexable`, `parent_id`, `team_id`, `tags`, `type` with
+    direct `UPDATE`s on
+  ──── (77 lines hidden) ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  aces) not a placeholder,
+    `{{a}}` behaviour (assert whatever it actually does is consistent with the regex).
+
+  ## Suspected bugs — verify empirically
+  Please check each of these against the real DB. For each one that is real, write a test asserting the **correct**
+  behaviour and mark it `@pytest.mark.xfail(strict=True, reason="BUG: <one line>")`. Separately keep a passing test
+  that pins the current behaviour only where it's not the buggy part. If a suspicion is wrong, just write a normal
+  passing test and tell me.
+  1. **Pagination skips a row at every page boundary**: `next_cursor` is built from `rows[inp.limit]` (the first row
+     of the *next* page), and the next page uses a strict `<`/`>` predicate, so that row is never returned.
+  2. **Tie-break direction mismatch**: ORDER BY is `created_at DESC, id` (id ASC) but the keyset predicate is a row
+     comparison `(created_at, id) < (...)` (id DESC) — with tied timestamps, pages may skip/duplicate rows.
+  3. **Cursor timestamp passed as an ISO string** to a timestamptz comparison — check whether asyncpg even accepts it
+     (pagination with a cursor may raise a DataError instead of working at all). If cursor pages crash, that is a bug.
+  4. **Malformed-but-decodable cursors not mapped to -32602**: `{}` (KeyError), `5` (TypeError), a bad timestamp or
+     bad uuid inside a well-formed cursor (DB error) — likely escape as non-JsonRpcError exceptions.
+  5. **Contract mismatch on `team_id`**: the description says `team_id` accepts a UUID **or team name**, and
+     `team_id="*"` for cross-team queries; `MemoryListInput.team_id` is `UUID | None`, so these are rejected.
+  6. Anything else you discover.
+
+  Report each bug with a one-line explanation and its test name.
+
+  ## Acceptance / verification
+  - `ruff check tests` and `mypy` clean for your new files (or report any issue you couldn't resolve).
+  - Run: `pytest -q -p no:cacheprovider tests/unit/test_tools_list.py tests/unit/test_notice_delivery.py tests/unit/test_notice_client_serialization.py <your new files>`
+    — all pass (xfails counted as xfailed, no XPASS).
+  - Run your new files 3 times in a row and once with `-p xdist -n 4` if pytest-xdist is installed (to prove isolation);
+    report results.
+  - Run the full suite `pytest -q` and report pass/fail counts; confirm no new failures vs. baseline.
+  - `git status` must show only new files under `tests/`.
+
+  Report: files added, test counts, exact command outputs (summary lines), the list of confirmed bugs, and any suspicion that turned out false.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_01B7g32RRptnniH5fpXmitwP
+
+● I'll start by reading the modules under test and the reference test patterns.
+
+● Bash(cat src/mem_mcp/mcp/tools/list.py src/mem_mcp/plugins/clients/notices.py src/mem_mcp/plugins/notice_delivery.py && sed -n 1,400p tests/integration/test_mindmap_…)
+  ⎿  """memory.list tool — paginated listing with cursor-based pagination."""
+
+     from __future__ import annotations
+     … +692 lines (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+● Bash(grep -n "HEADLINE_OPTIONS\|PREVIEW_MAX_CHARS\|PREVIEW_FALLBACK_CHARS\|HEADLINE_SOURCE_MAX_CHARS\|LENIENT_TSQUERY_SQL" -B1 -A8 src/mem_mcp/memory/hybrid_query.py…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● I can't finish this work order in the current session, because Bash is denied here (don't-ask permission mode) and the order depends on running things.
+
+  I tried one compound read-only command (cat/grep/pip list over the schema, hybrid_query.py, errors.py and conftest.py). The harness refused it, and I haven't tried to work around that.
+
+  What I have so far: the full source of list.py, notices.py and notice_delivery.py, the memory_list contract text, and the _setup/_cleanup/_ctx pattern from test_mindmap_e2e.py. Reading the code, suspicions 1–5 all look
+  plausible:
+  - Pagination row skip: the cursor is built from rows[limit], which is the first row of the next page, and the next page uses a strict </>, so that row is dropped.
+  - Tie-break mismatch: the ORDER BY has id ascending, but the keyset predicate is a row comparison on (col, id), so with desc and tied timestamps rows will skip or duplicate.
+  - Cursor timestamp as a string: the cursor timestamp is bound as an ISO string against a timestamptz column, and asyncpg may reject that.
+  - Malformed cursors: _decode_cursor only catches JSONDecodeError, IndexError and ValueError, so {} (KeyError) and 5 (TypeError) escape unmapped.
+  - team_id contract: team_id is typed UUID | None, so team names and "*" are rejected.
+
+  I can't confirm any of these without a database.
+
+  What blocks me:
+  1. Running pytest against the test DB. The suspected bugs have to be checked empirically, and xfail(strict=True) tests fail the suite if I guess wrong.
+  2. Reading the schema and constants I still need: memories and plugin_notices columns, any updated_at trigger, the hybrid_query.py constants, JsonRpcError attributes, and the pg_pool fixture. Read/Grep can cover this
+     part.
+  3. The acceptance commands: ruff, mypy, three repeat runs, xdist, the full suite and git status.
+
+  How would you like to proceed?
+  - Allow Bash (at least pytest, ruff, mypy, git status, and read-only cat/grep), and I'll carry on and deliver everything including the report.
+  - Or have me write the files without running them. I would use Read/Grep/Write only, and I wouldn't assert the bug/xfail outcomes, so you'd have to run and fix the suite yourself.
+
+✻ Churned for 16s · done 6:22 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

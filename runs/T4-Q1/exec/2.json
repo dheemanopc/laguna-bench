@@ -1,0 +1,24 @@
+{
+  "session_id": "50a7cfc6-ef98-442d-9336-845bff75a9cf",
+  "exit_code": 0,
+  "remote_control_url": "",
+  "is_error": false,
+  "num_turns": 86,
+  "result": "---\n\n## Report: Work Order 2 Fixes Complete\n\n### What changed\n\n**Files modified:**\n\n1. **`src/mem_mcp/mcp/tools/mindmap_resolve.py`**\n   - Changed `disposition` and `resolved_by_party` from `str` to `Literal[\"resolved\",\"dropped\"]` / `Literal[\"owner\",\"model\"]` — Pydantic now rejects invalid values at the model level\n   - Removed redundant manual validation (Literal handles it)\n   - Moved `SELECT team_id FROM memories` into `service.fetch_node_team_id()`\n   - Added `FOR UPDATE` row lock on the target membership in the write tx for atomic check+write\n   - Added `lock_membership()` service helper\n\n2. **`src/mem_mcp/mcp/tools/mindmap_get.py`**\n   - Changed `include` and `depth` from `str` to `Literal[\"open\",\"all\"]` / `Literal[\"summary\",\"full\"]`\n   - `open_loops` now computed via `service.fetch_open_loop_ids()` (whole-map, independent of since/include)\n   - `open_loops` call moved inside the `tenant_tx` block (was outside, causing `InterfaceError`)\n   - Fixed truncation: now uses truncated content in the `content` field (not original)\n   - Removed dead code (first `nodes` list comprehension was overwritten)\n\n3. **`src/mem_mcp/mindmap/service.py`**\n   - Added `fetch_node_team_id()` — team_id lookup for insert_reference FK\n   - Added `lock_membership()` — `SELECT ... FOR UPDATE` for atomic resolve\n   - `fetch_members_cursor()`: when `since=None`, returns ALL members without event-log dependency\n   - `fetch_settled_members()`: same fix for `since=None`\n   - `fetch_touched_member_ids()`: guards `(payload->>'target')::uuid` cast with UUID pattern regex\n\n4. **`src/mem_mcp/mcp/tools/write.py`** (3 places)\n   - **Root cause fix**: Removed `json.dumps()` around `inp.metadata` — asyncpg binds Python dicts as jsonb natively; `json.dumps()` output was being stored as a JSON *string* rather than a JSON *object*, making `metadata->>'key'` return NULL\n\n5. **`alembic/versions/0044_2026_10_16_mindmap_branch_status.py`**\n   - Fixed index from `(root_memory_id, memory_id)` to `(root_memory_id, id)` to serve cursor reads\n   - Renamed index to `memory_map_events_root_id_idx` (matching upgrade/downgrade)\n\n6. **`tests/unit/test_mindmap_resolve_get_models.py`**\n   - Changed invalid disposition/party tests to assert `ValidationError` (now Literal types)\n   - Added `test_include_invalid_rejected` and `test_depth_invalid_rejected`\n\n7. **`tests/integration/test_mindmap_resolve_e2e.py`**\n   - Added `test_since_none_returns_all` — verifies since=None returns all members\n   - Added `test_resolve_drops_from_open_loops` — verifies resolved nodes leave open_loops\n\n### Verification results\n\n| Check | Result |\n|---|---|\n| `ruff check` on all changed files | All checks passed |\n| `ruff format --check` | All 7 files formatted |\n| `alembic downgrade -1 && upgrade head` | OK |\n| Mindmap unit + integration + e2e tests | **37 passed, 0 failed** |\n| Pre-existing failures (full suite) | Unchanged (enterprise, schema, team API tests — not related to this work order) |\n\n### Open/uncertain items\n\n- **Debug test files** (`test_debug_open_loops.py`, `test_jsonb_cast.py`, `test_jsonb_minimal.py`) were created during debugging and need cleanup. Due to sandbox restrictions on `rm`, these should be removed manually:\n  ```\n  rm tests/integration/test_debug_open_loops.py tests/integration/test_jsonb_cast.py tests/integration/test_jsonb_minimal.py\n  ```\n\n- **`update.py` and other files**: The same `json.dumps(metadata)` bug exists in `update.py` and `feedback.py`. These were not in scope for this work order (which targets mindmap files) but should be fixed in a follow-up to prevent future metadata corruption.\n\n- **`test_json_cast_behavior`**: The debug test from investigation was not cleaned up in the full suite run (it was one of the pre-existing test failures in the grep output). This needs manual removal.",
+  "usage": {
+    "input_tokens": 9193346,
+    "output_tokens": 43628,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  },
+  "modelUsage": {
+    "qwen3.6-35b-a3b": {
+      "inputTokens": 9193346,
+      "outputTokens": 43628,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0
+    }
+  },
+  "thinking_blocks": 86,
+  "transcript": "~/.claude/projects/-home-anand-laguna-bench-runs-T4-Q1-repo/50a7cfc6-ef98-442d-9336-845bff75a9cf.jsonl"
+}

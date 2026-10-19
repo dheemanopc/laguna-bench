@@ -1,0 +1,7 @@
+VERDICT: REVISE
+
+1. `map_work_item_error` uses `JsonRpcError` without importing it (`src/mem_mcp/mcp/tools/_work_item_common.py:182-379`, no import in lines 1-37). Every error path throws NameError. This is the most likely cause of the 18 NEW failures (gate lines 7-22), including the 12 existing work-item error tests that used to pass. Also, the fallback at :375 `raise`s where every other branch `return`s.
+2. The existing tools catch only `WorkItemError` (`mindmap_work_set_status.py:60`, `mindmap_work_mark.py:62`). Any `WorkflowError` raised under them (SignoffAlreadyPending, WorkflowNotFound) skips the mapper and surfaces as an internal error. Catch both, as the mapper at :187 expects.
+3. `set_status` on a guarded move returns a success payload and audits `change: "status"` even though nothing moved (`mindmap_work_set_status.py:63-80`, `work_items.py:662-689`). Plan §WP2 (03-plan.md:224, :254-259) requires `code="signoff_required"` plus `signoff_state`, and the audit is misleading. The `approvers` field is always `[]` (`_work_item_common.py:153`), which breaks the planned `signoff_state{…approvers}` contract.
+4. Static gates are red: mypy reports 28 errors in 4 files and ruff reports 10 fixable issues (gate lines 2-3). The CONVENTIONS gate requires both to be clean before building on this.
+5. `blocked` is set to `status == "blocked"` (`_work_item_common.py:178`). R7 asks for why a move is blocked: the guard or sign-off blocker. A literal status name doesn't answer that, and custom workflows may not have a `blocked` status at all.

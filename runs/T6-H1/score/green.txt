@@ -1,0 +1,118 @@
+NOTICE:  database "lb_t6green_1926588" does not exist, skipping
+x......................xxxx.......xxx.xx.x...x.F.......xF.............x. [ 35%]
+........................................................................ [ 70%]
+.............................................................            [100%]
+=================================== FAILURES ===================================
+_____________ TestDeliverPending.test_deliver_pending_oldest_first _____________
+
+self = <tests.integration.test_plugin_notices_db.TestDeliverPending object at 0x742fff4429c0>
+pg_pool = <asyncpg.pool.Pool object at 0x742fff0f2ec0>
+
+    async def test_deliver_pending_oldest_first(self, pg_pool: Any) -> None:
+        """Test deliver_pending returns notices oldest-first.
+    
+        The UPDATE ... RETURNING preserves the order from the SELECT
+        subquery, returning results oldest-first as documented.
+        """
+        tenant_id = await _setup_tenant(pg_pool)
+    
+        try:
+            # Insert three notices with explicit created_at
+            now = datetime.now(tz=UTC)
+            notice_ids = []
+    
+            for i in range(3):
+                async with pg_pool.acquire() as conn:
+                    nid = await conn.fetchval(
+                        """
+                        INSERT INTO plugin_notices
+                            (tenant_id, plugin_id, kind, template, payload, created_at, expires_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        RETURNING id
+                        """,
+                        tenant_id,
+                        "p",
+                        f"k{i}",
+                        f"template {i}",
+                        json.dumps({}),
+                        now + timedelta(hours=i),  # Oldest first (i=0)
+                        now + timedelta(days=1),
+                    )
+                    notice_ids.append(nid)
+    
+            async with system_tx(pg_pool) as conn:
+                result = await deliver_pending(conn, tenant_id, limit=10)
+    
+            # Should be in order: k0, k1, k2 (oldest first)
+            assert len(result) == 3
+            assert result[0].kind == "k0"
+>           assert result[1].kind == "k1"
+E           AssertionError: assert 'k2' == 'k1'
+E             
+E             - k1
+E             + k2
+
+tests/integration/test_plugin_notices_db.py:295: AssertionError
+_____________ TestDeliverPending.test_limit_takes_oldest_then_rest _____________
+
+self = <tests.integration.test_plugin_notices_db.TestDeliverPending object at 0x742fff474aa0>
+pg_pool = <asyncpg.pool.Pool object at 0x742fff4ee2c0>
+
+    async def test_limit_takes_oldest_then_rest(self, pg_pool: Any) -> None:
+        """Test limit correctly returns oldest notices then rest."""
+        tenant_id = await _setup_tenant(pg_pool)
+    
+        try:
+            now = datetime.now(tz=UTC)
+            o1_id = await _insert_notice(
+                pg_pool,
+                tenant_id,
+                kind="o1",
+                created_at=now - timedelta(hours=5),
+                expires_at=now + timedelta(hours=1),
+            )
+            o2_id = await _insert_notice(
+                pg_pool,
+                tenant_id,
+                kind="o2",
+                created_at=now - timedelta(hours=4),
+                expires_at=now + timedelta(hours=1),
+            )
+            o3_id = await _insert_notice(
+                pg_pool,
+                tenant_id,
+                kind="o3",
+                created_at=now - timedelta(hours=3),
+                expires_at=now + timedelta(hours=1),
+            )
+            o4_id = await _insert_notice(
+                pg_pool,
+                tenant_id,
+                kind="o4",
+                created_at=now - timedelta(hours=2),
+                expires_at=now + timedelta(hours=1),
+            )
+            o5_id = await _insert_notice(
+                pg_pool,
+                tenant_id,
+                kind="o5",
+                created_at=now - timedelta(hours=1),
+                expires_at=now + timedelta(hours=1),
+            )
+    
+            async with system_tx(pg_pool) as conn:
+                result = await deliver_pending(conn, tenant_id, limit=3)
+    
+            # limit=3 → [o1, o2, o3]
+            ids = [r.id for r in result]
+>           assert ids == [o1_id, o2_id, o3_id]
+E           AssertionError: assert [UUID('45e41f...25a5f888fc8')] == [UUID('45e41f...9e861b1587f')]
+E             
+E             At index 1 diff: UUID('fce3c6c2-6ff5-4bbf-9d2b-39e861b1587f') != UUID('ede7c424-647c-4fcf-801c-c25a5f888fc8')
+E             Use -v to get more diff
+
+tests/integration/test_plugin_notices_db.py:610: AssertionError
+=========================== short test summary info ============================
+FAILED tests/integration/test_plugin_notices_db.py::TestDeliverPending::test_deliver_pending_oldest_first
+FAILED tests/integration/test_plugin_notices_db.py::TestDeliverPending::test_limit_takes_oldest_then_rest
+2 failed, 189 passed, 14 xfailed in 4.27s

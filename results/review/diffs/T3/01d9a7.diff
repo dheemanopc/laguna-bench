@@ -1,0 +1,1511 @@
+ src/mem_mcp/auth/permissions.py                    |  32 +-
+ src/mem_mcp/mcp/tool_descriptions.py               |   8 +-
+ src/mem_mcp/mcp/tools/_team_authz.py               |  67 ++
+ src/mem_mcp/mcp/tools/add_team_member.py           |   8 +
+ src/mem_mcp/mcp/tools/assign_role.py               |   5 +
+ src/mem_mcp/mcp/tools/remove_team_member.py        |  20 +
+ src/mem_mcp/teams/authz.py                         |  55 ++
+ .../security/test_team_member_management_authz.py  | 911 +++++++++++++++++++++
+ tests/unit/test_team_role_permissions.py           | 256 ++++++
+ 9 files changed, 1351 insertions(+), 11 deletions(-)
+
+diff --git a/src/mem_mcp/auth/permissions.py b/src/mem_mcp/auth/permissions.py
+index 99d6814..0dc1315 100644
+--- a/src/mem_mcp/auth/permissions.py
++++ b/src/mem_mcp/auth/permissions.py
+@@ -1,7 +1,12 @@
+ """Permission + Role enums and ROLE_PERMISSIONS matrix.
+ 
+-System roles live in tenant_system_roles. Team roles live in team_members.role.
+-A permission resolver (rbac.py) checks both.
++System roles live in tenant_system_roles. Team roles live in roles_catalog.role_key
++(via team_role_assignments / team_members). A permission resolver (rbac.py) checks
++both.
++
++No team role holds any system.* permission — that requires an entry in
++tenant_system_roles (see spec §2). The team-role entries below mirror the 7
++core catalog roles exactly.
+ """
+ 
+ from __future__ import annotations
+@@ -12,9 +17,9 @@ from enum import StrEnum
+ class Role(StrEnum):
+     SYSTEM_ADMIN = "system_admin"
+     SYSTEM_SUPPORT = "system_support"
+-    # Team roles aren't in this enum because they're free-text in team_members.role
+-    # (already 'admin'/'member' per enterprise PR 1.A). We treat them as strings
+-    # in the resolver to avoid coupling.
++    # Team roles aren't in this enum because they live in roles_catalog.role_key
++    # (owner, admin, member, viewer, vendor, customer, service-bot) and are
++    # resolved as free-text strings in the resolver to avoid coupling.
+ 
+ 
+ class Permission(StrEnum):
+@@ -27,7 +32,7 @@ class Permission(StrEnum):
+     SYSTEM_VIEW_AUDIT = "system.view_audit"
+     SYSTEM_IMPERSONATE = "system.impersonate"  # reserved, not granted in v1
+ 
+-    # Team-level (resolved against team_members.role)
++    # Team-level (resolved against team_role_assignments → roles_catalog)
+     TEAM_VIEW = "team.view"
+     TEAM_MANAGE_MEMBERS = "team.manage_members"
+     TEAM_MANAGE_SETTINGS = "team.manage_settings"
+@@ -52,14 +57,27 @@ _TEAM_MEMBER_PERMS = {
+     Permission.TEAM_WRITE_MEMORY,
+     Permission.TEAM_READ_MEMORY,
+ }
++_TEAM_VIEWER_PERMS = {
++    Permission.TEAM_VIEW,
++    Permission.TEAM_READ_MEMORY,
++}
+ 
+-# System roles: keys are Role enum values. Team roles: keys are 'admin'/'member'.
++# System roles: keys are Role enum values (system_admin, system_support).
++# Team roles: keys are the role_key values from roles_catalog (the 7 core roles).
++# No team role holds any system.* permission — that requires an entry in
++# tenant_system_roles (see spec §2).
+ ROLE_PERMISSIONS: dict[str, set[Permission]] = {
+     Role.SYSTEM_ADMIN.value: _ALL_SYSTEM,
+     # ^ system_admin gets ALL system permissions
+     # (design note: system_admin does NOT implicitly hold team-level write permissions —
+     # that requires explicit team membership. See spec §2.)
+     Role.SYSTEM_SUPPORT.value: _SUPPORT_SYSTEM_READS,
++    # Team roles — map exactly to the 7 core catalog roles.
++    "owner": _TEAM_ADMIN_PERMS,
+     "admin": _TEAM_ADMIN_PERMS,
+     "member": _TEAM_MEMBER_PERMS,
++    "service-bot": _TEAM_MEMBER_PERMS,
++    "viewer": _TEAM_VIEWER_PERMS,
++    "vendor": _TEAM_VIEWER_PERMS,
++    "customer": _TEAM_VIEWER_PERMS,
+ }
+diff --git a/src/mem_mcp/mcp/tool_descriptions.py b/src/mem_mcp/mcp/tool_descriptions.py
+index 7c495ce..4726dc2 100644
+--- a/src/mem_mcp/mcp/tool_descriptions.py
++++ b/src/mem_mcp/mcp/tool_descriptions.py
+@@ -356,21 +356,21 @@ Roles come from the global role catalog (call memsys_list_roles when that ships;
+ 
+ For member_kind='user': provide EITHER member_id (UUID, existing user) OR member_email (string, existing user). Cross-org invitation by email of a non-existent user is not yet supported and returns -32000.
+ 
+-Required scope: memory.write. Caller must have admin-level access to the team (enforced once Spec 5's effective-access table ships; for now this is a placeholder).
++Required scope: memory.write. Caller must hold the team.manage_members permission on the team (i.e. be owner or admin). Refusal returns -32603 with data.missing_permission. The check is opaque: a refused caller cannot distinguish whether the team, email, or role exists.
+ 
+ Examples: "Add user with email alice@example.com as member" → memsys_add_team_member(team_id="...", member_kind="user", member_email="alice@example.com", role_key="member"). "Add sub-team T2 to T1 as vendor" → memsys_add_team_member(team_id="T1-uuid", member_kind="team", member_id="T2-uuid", role_key="vendor").""",
+     "memsys_remove_team_member": """Remove a user or sub-team from a team.
+ 
+-Sole owner of a team cannot be removed (raises sole_owner_cannot_self_remove); assign another owner first.
++Sole owner of a team cannot be removed (raises sole_owner_cannot_self_remove); assign another owner first. A user may always remove their own membership (self-removal is exempt from the team.manage_members check); the sole-owner guard still applies to self-removals.
+ 
+-Required scope: memory.write. Caller must have admin-level access to the team.
++Required scope: memory.write. Caller must hold the team.manage_members permission on the team (i.e. be owner or admin) — except for the self-removal exemption above. Refusal returns -32603 with data.missing_permission.
+ 
+ Examples: "Remove user X from team T" → memsys_remove_team_member(team_id="T", member_kind="user", member_id="X").""",
+     "memsys_assign_role": """Change a member's role in a team (user or sub-team).
+ 
+ The (team, member_kind, member_id) tuple is unique; this UPSERTs the role_id. Common role_key values: owner, admin, member, viewer, vendor, customer.
+ 
+-Required scope: memory.write.
++Required scope: memory.write. Caller must hold the team.manage_members permission on the team (i.e. be owner or admin). Refusal returns -32603 with data.missing_permission.
+ 
+ Examples: "Promote user X to admin in team T" → memsys_assign_role(team_id="T", member_kind="user", member_id="X", new_role_key="admin").""",
+     "memsys_slug_lookup": """Look up a memory by slug (short human-readable identifier) within a team.
+diff --git a/src/mem_mcp/mcp/tools/_team_authz.py b/src/mem_mcp/mcp/tools/_team_authz.py
+new file mode 100644
+index 0000000..ae4acea
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/_team_authz.py
+@@ -0,0 +1,67 @@
++"""Shared team-authorization gate for the ``memsys_*_team_member*`` tools.
++
++The domain-level :func:`mem_mcp.teams.authz.require_team_permission` raises
++:class:`TeamPermissionDeniedError`.  The MCP layer needs a *single* place
++that maps that exception to the canonical ``-32603`` JSON-RPC error so that
++every tool that gates on a team permission produces the identical envelope
++(CONVENTIONS.md §Error model).
++
++Error shape (matches ``_admin_base.py`` and spec §9.4):
++
++    JsonRpcError(-32603, "caller lacks required permission: <perm>",
++                 data={"missing_permission": "<perm>"})
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++from uuid import UUID
++
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.teams.authz import TeamPermissionDeniedError, require_team_permission
++
++if TYPE_CHECKING:
++    import asyncpg  # type: ignore[import-untyped]
++
++
++#: The team-scoped permission required to add / assign / remove team members.
++TEAM_MANAGE_MEMBERS = "team.manage_members"
++
++
++async def check_team_permission(
++    conn: asyncpg.Connection,
++    caller_id: UUID,
++    team_id: UUID,
++    permission: str,
++) -> None:
++    """Enforce a team permission, raising JsonRpcError on denial.
++
++    Wraps :func:`require_team_permission` so each tool needs only a single
++    one-line call instead of repeating the try/except → JsonRpcError mapping.
++
++    Must be called *inside* a ``system_tx`` (or ``tenant_tx``) block — the
++    DB connection is used by the underlying ``has_permission`` lookup.
++    """
++    try:
++        await require_team_permission(conn, caller_id, team_id, permission)
++    except TeamPermissionDeniedError as e:
++        raise JsonRpcError(
++            -32603,
++            f"caller lacks required permission: {e.permission}",
++            data={"missing_permission": e.permission},
++        ) from e
++
++
++async def caller_has_active_team_role(
++    conn: asyncpg.Connection, caller_id: UUID, team_id: UUID
++) -> bool:
++    """True if *caller_id* has an active team role on *team_id*.
++
++    Lazy-imports ``get_team_role`` from ``mem_mcp.auth.rbac`` (same pattern as
++    :mod:`mem_mcp.mcp.tools._admin_base`) to avoid pulling FastAPI into the
++    MCP domain path.
++    """
++    from mem_mcp.auth.rbac import get_team_role
++
++    role = await get_team_role(conn, caller_id, team_id)
++    return role is not None
+diff --git a/src/mem_mcp/mcp/tools/add_team_member.py b/src/mem_mcp/mcp/tools/add_team_member.py
+index be18aac..780da97 100644
+--- a/src/mem_mcp/mcp/tools/add_team_member.py
++++ b/src/mem_mcp/mcp/tools/add_team_member.py
+@@ -11,6 +11,7 @@ from mem_mcp.db import system_tx
+ from mem_mcp.mcp.errors import JsonRpcError
+ from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+ from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._team_authz import TEAM_MANAGE_MEMBERS, check_team_permission
+ from mem_mcp.teams.assignments import assign_role
+ from mem_mcp.teams.dag import CycleWouldFormError, MaxDepthExceededError
+ from mem_mcp.teams.roles import RoleNotFoundError
+@@ -62,6 +63,13 @@ class AddTeamMemberTool(BaseTool):
+                 raise JsonRpcError(-32602, "provide either member_id or member_email, not both")
+ 
+         async with system_tx(ctx.db_pool) as conn:
++            # Permission gate FIRST — before the member_email → tenant lookup so a
++            # refused caller gets the identical error whether the email exists or
++            # not, and whether the team exists or not (cross-boundary opacity).
++            await check_team_permission(
++                conn, ctx.tenant_id, inp.team_id, TEAM_MANAGE_MEMBERS
++            )
++
+             # Resolve member_email → member_id if applicable
+             resolved_member_id: UUID | None = inp.member_id
+             status = "active"
+diff --git a/src/mem_mcp/mcp/tools/assign_role.py b/src/mem_mcp/mcp/tools/assign_role.py
+index 5dfa62e..85525fe 100644
+--- a/src/mem_mcp/mcp/tools/assign_role.py
++++ b/src/mem_mcp/mcp/tools/assign_role.py
+@@ -11,6 +11,7 @@ from mem_mcp.db import system_tx
+ from mem_mcp.mcp.errors import JsonRpcError
+ from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+ from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._team_authz import TEAM_MANAGE_MEMBERS, check_team_permission
+ from mem_mcp.teams.assignments import assign_role
+ from mem_mcp.teams.roles import RoleNotFoundError
+ 
+@@ -42,6 +43,10 @@ class AssignRoleTool(BaseTool):
+     async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
+         assert isinstance(inp, AssignRoleInput)
+         async with system_tx(ctx.db_pool) as conn:
++            # Permission gate FIRST — before the role assignment.
++            await check_team_permission(
++                conn, ctx.tenant_id, inp.team_id, TEAM_MANAGE_MEMBERS
++            )
+             try:
+                 await assign_role(
+                     conn,
+diff --git a/src/mem_mcp/mcp/tools/remove_team_member.py b/src/mem_mcp/mcp/tools/remove_team_member.py
+index c1ead02..9e5341d 100644
+--- a/src/mem_mcp/mcp/tools/remove_team_member.py
++++ b/src/mem_mcp/mcp/tools/remove_team_member.py
+@@ -11,6 +11,11 @@ from mem_mcp.db import system_tx
+ from mem_mcp.mcp.errors import JsonRpcError
+ from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+ from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._team_authz import (
++    TEAM_MANAGE_MEMBERS,
++    caller_has_active_team_role,
++    check_team_permission,
++)
+ from mem_mcp.teams.assignments import SoleOwnerCannotSelfRemoveError, remove_member
+ 
+ 
+@@ -40,6 +45,21 @@ class RemoveTeamMemberTool(BaseTool):
+     async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
+         assert isinstance(inp, RemoveTeamMemberInput)
+         async with system_tx(ctx.db_pool) as conn:
++            # Self-removal exception: a user removing their *own* membership
++            # (member_kind='user', member_id == caller) never needs
++            # team.manage_members — leaving must always be possible.  The sole-
++            # owner guard inside remove_member() still applies.  A user with no
++            # active role in the team gets the normal refusal instead.
++            self_removing = (
++                inp.member_kind == "user"
++                and inp.member_id == ctx.tenant_id
++                and await caller_has_active_team_role(conn, ctx.tenant_id, inp.team_id)
++            )
++            if not self_removing:
++                await check_team_permission(
++                    conn, ctx.tenant_id, inp.team_id, TEAM_MANAGE_MEMBERS
++                )
++
+             try:
+                 await remove_member(
+                     conn,
+diff --git a/src/mem_mcp/teams/authz.py b/src/mem_mcp/teams/authz.py
+new file mode 100644
+index 0000000..cd66e93
+--- /dev/null
++++ b/src/mem_mcp/teams/authz.py
+@@ -0,0 +1,55 @@
++"""Team-level authorization helpers.
++
++Transport-agnostic: raises its own exception type
++(``TeamPermissionDeniedError``) which the MCP layer maps to JsonRpcError and
++the web layer maps to HTTPException — same layering as
++``mem_mcp.admin.errors``.
++
++This module lives in the *teams* domain (not ``mcp/``) because it is pure SQL +
++business rule and must be callable from jobs/ and web/ as well as from tools.
++"""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++from uuid import UUID
++
++if TYPE_CHECKING:
++    import asyncpg  # type: ignore[import-untyped]
++
++
++class TeamPermissionDeniedError(Exception):
++    """Raised when a caller lacks a team-scoped permission on a team.
++
++    Carries ``.permission`` so the transport layer can build the canonical
++    JsonRpcError / HTTP error payload without re-deriving the string.
++    """
++
++    def __init__(self, permission: str) -> None:
++        self.permission = permission
++        super().__init__(
++            f"caller lacks required permission: {permission}"
++        )
++
++
++async def require_team_permission(
++    conn: asyncpg.Connection,
++    caller_id: UUID,
++    team_id: UUID,
++    permission: str,
++) -> None:
++    """Require ``permission`` (e.g. ``"team.manage_members"``) on ``team_id``.
++
++    Calls ``mem_mcp.auth.rbac.has_permission`` with ``team_id=...`` and raises
++    :class:`TeamPermissionDeniedError` if the caller does not hold it.
++
++    The import of ``rbac`` is done lazily inside the function body because
++    ``rbac`` pulls in FastAPI + ``web.sessions`` for its ``require_permission``
++    dependency, which the MCP path does not need.  This mirrors the pattern in
++    ``mcp/tools/_admin_base.py`` / ``mcp/registry.py``.
++    """
++    # Imported lazily to avoid pulling FastAPI into the MCP domain path.
++    from mem_mcp.auth.rbac import has_permission
++
++    if not await has_permission(conn, caller_id, permission, team_id=team_id):
++        raise TeamPermissionDeniedError(permission)
+diff --git a/tests/security/test_team_member_management_authz.py b/tests/security/test_team_member_management_authz.py
+new file mode 100644
+index 0000000..af4f307
+--- /dev/null
++++ b/tests/security/test_team_member_management_authz.py
+@@ -0,0 +1,911 @@
++"""Security tests for RBAC gating on team-member-management tools ([RUN]).
++
++Verifies that ``memsys_add_team_member``, ``memsys_assign_role``, and
++``memsys_remove_team_member`` correctly enforce the ``team.manage_members``
++permission instead of relying solely on the coarse OAuth scope ``memory.write``.
++
++All data is committed (no wrapping transaction) so it is visible to the tool's
++``system_tx`` / ``tenant_tx`` connections.  Teardown deletes everything in
++FK-safe order, including user_effective_team_access rows.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Any, cast
++from uuid import uuid4
++
++import pytest
++
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tools._base import ToolContext
++from mem_mcp.mcp.tools.add_team_member import (
++    AddTeamMemberInput,
++    AddTeamMemberOutput,
++    AddTeamMemberTool,
++)
++from mem_mcp.mcp.tools.assign_role import AssignRoleInput, AssignRoleOutput, AssignRoleTool
++from mem_mcp.mcp.tools.create_team import CreateTeamInput, CreateTeamOutput, CreateTeamTool
++from mem_mcp.mcp.tools.remove_team_member import (
++    RemoveTeamMemberInput,
++    RemoveTeamMemberOutput,
++    RemoveTeamMemberTool,
++)
++from mem_mcp.teams.assignments import assign_role as assign_role_fn
++
++pytestmark = pytest.mark.skipif(
++    not os.getenv("MEM_MCP_TEST_DSN"),
++    reason="MEM_MCP_TEST_DSN not set",
++)
++
++#: The permission that gates add/assign/remove operations.
++MANAGE_MEMBERS = "team.manage_members"
++
++
++def _ctx(pool: Any, tenant_id: Any, scopes: frozenset[str] | None = None) -> ToolContext:
++    """Build a ToolContext with the standard ``memory.write`` scope."""
++    return ToolContext(
++        request_id=str(uuid4()),
++        tenant_id=tenant_id,
++        identity_id=uuid4(),
++        client_id="test-client",
++        scopes=scopes or frozenset({"memory.read", "memory.write"}),
++        db_pool=pool,
++    )
++
++
++async def _lookup_roles(pg_pool: Any) -> dict[str, Any]:
++    """Return role_key → role_id for all 7 catalog roles (plugin_id IS NULL)."""
++    role_map: dict[str, Any] = {}
++    async with pg_pool.acquire() as conn:
++        for key in ("owner", "admin", "member", "viewer", "vendor", "customer", "service-bot"):
++            rid = await conn.fetchval(
++                "SELECT id FROM roles_catalog WHERE role_key=$1 AND plugin_id IS NULL",
++                key,
++            )
++            if rid is None:
++                pytest.skip(f"roles_catalog missing role '{key}'")
++            role_map[key] = rid
++    return role_map
++
++
++
+<email>
++async def team_env(pg_pool: Any) -> Any:
++    """Comprehensive team environment.
++
++    Layout:
++      * team_id     — a team created by ``owner_id``.
++      * owner_id    — tenant with role ``owner`` (has manage_members).
++      * admin_id    — tenant with role ``admin`` (has manage_members).
++      * member_id   — tenant with role ``member`` (NO manage_members).
++      * viewer_id   — tenant with role ``viewer`` (NO manage_members).
++      * vendor_id   — tenant with role ``vendor`` (NO manage_members).
++      * customer_id — tenant with role ``customer`` (NO manage_members).
++      * subject_id  — tenant with NO role on the team (target for add/remove).
++
++    All tenants have primary ``tenant_identities`` rows (needed for email-based
++    add_member lookups).  Data is committed so tools can see it via system_tx.
++    """
++    role_map = await _lookup_roles(pg_pool)
++
++    owner_id = uuid4()
++    admin_id = uuid4()
++    member_id = uuid4()
++    viewer_id = uuid4()
++    vendor_id = uuid4()
++    customer_id = uuid4()
++    subject_id = uuid4()
++    team_id = uuid4()
++
++    async with pg_pool.acquire() as conn:
++        for tid in (owner_id, admin_id, member_id, viewer_id, vendor_id, customer_id, subject_id):
++            await conn.execute(
++                "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++                tid, f"sec-{tid}@test.invalid",
++            )
++            await conn.execute(
++                """INSERT INTO tenant_identities
++                   (tenant_id, cognito_sub, provider, email, is_primary)
++                   VALUES ($1, $2, 'cognito', $3, true)""",
++                tid, f"sub-{tid}", f"sec-{tid}@test.invalid",
++            )
++
++        await conn.execute(
++            "INSERT INTO teams (id, name, created_by_tenant_id) VALUES ($1, $2, $3)",
++            team_id, f"sec-team-{str(team_id)[:8]}", owner_id,
++        )
++
++        for role_key, tenant in (
++            ("owner", owner_id),
++            ("admin", admin_id),
++            ("member", member_id),
++            ("viewer", viewer_id),
++            ("vendor", vendor_id),
++            ("customer", customer_id),
++        ):
++            await conn.execute(
++                """INSERT INTO team_role_assignments
++                   (parent_team_id, member_kind, member_id, role_id, assigned_by_user_id)
++                   VALUES ($1, 'user', $2, $3, $4)""",
++                team_id, tenant, role_map[role_key], owner_id,
++            )
++
++    yield {
++        "pool": pg_pool,
++        "team_id": team_id,
++        "owner_id": owner_id,
++        "admin_id": admin_id,
++        "member_id": member_id,
++        "viewer_id": viewer_id,
++        "vendor_id": vendor_id,
++        "customer_id": customer_id,
++        "subject_id": subject_id,
++        "role_map": role_map,
++    }
++
++    # Teardown — FK-safe order.
++    all_tenants = [owner_id, admin_id, member_id, viewer_id, vendor_id, customer_id, subject_id]
++    async with pg_pool.acquire() as conn:
++        await conn.execute(
++            "DELETE FROM user_effective_team_access WHERE resource_team_id=$1",
++            team_id,
++        )
++        await conn.execute(
++            "DELETE FROM team_role_assignments WHERE parent_team_id=$1",
++            team_id,
++        )
++        await conn.execute("DELETE FROM teams WHERE id=$1", team_id)
++        await conn.execute(
++            "DELETE FROM tenant_identities WHERE tenant_id = ANY($1::uuid[])",
++            all_tenants,
++        )
++        await conn.execute(
++            "DELETE FROM tenants WHERE id = ANY($1::uuid[])",
++            all_tenants,
++        )
++
++
+<email>
++async def no_role_env(pg_pool: Any) -> Any:
++    """Team where the creator/caller has NO active role on the team.
++
++    Layout:
++      * caller_id  — team creator (in teams.created_by) but no team_role_assignments entry.
++      * subject_id — a real member of the team (role='member').
++    """
++    role_map = await _lookup_roles(pg_pool)
++
++    caller_id = uuid4()
++    subject_id = uuid4()
++    team_id = uuid4()
++
++    async with pg_pool.acquire() as conn:
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            caller_id, f"no-role-{caller_id}@test.invalid",
++        )
++        await conn.execute(
++            "INSERT INTO tenant_identities (tenant_id, cognito_sub, provider, email, is_primary) "
++            "VALUES ($1, $2, 'cognito', $3, true)",
++            caller_id, f"sub-{caller_id}", f"no-role-{caller_id}@test.invalid",
++        )
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            subject_id, f"subject-{subject_id}@test.invalid",
++        )
++        await conn.execute(
++            "INSERT INTO tenant_identities (tenant_id, cognito_sub, provider, email, is_primary) "
++            "VALUES ($1, $2, 'cognito', $3, true)",
++            subject_id, f"sub-{subject_id}", f"subject-{subject_id}@test.invalid",
++        )
++
++        await conn.execute(
++            "INSERT INTO teams (id, name, created_by_tenant_id) VALUES ($1, $2, $3)",
++            team_id, f"no-role-team-{str(team_id)[:8]}", caller_id,
++        )
++
++        # Add subject (NOT caller) as a member.
++        await conn.execute(
++            """INSERT INTO team_role_assignments
++               (parent_team_id, member_kind, member_id, role_id, assigned_by_user_id)
++               VALUES ($1, 'user', $2, $3, $4)""",
++            team_id, subject_id, role_map["member"], caller_id,
++        )
++
++    yield {
++        "pool": pg_pool,
++        "team_id": team_id,
++        "caller_id": caller_id,
++        "subject_id": subject_id,
++    }
++
++    # Teardown — FK-safe order.
++    async with pg_pool.acquire() as conn:
++        await conn.execute("DELETE FROM user_effective_team_access WHERE resource_team_id=$1", team_id)
++        await conn.execute("DELETE FROM team_role_assignments WHERE parent_team_id=$1", team_id)
++        await conn.execute("DELETE FROM teams WHERE id=$1", team_id)
++        await conn.execute(
++            "DELETE FROM tenant_identities WHERE tenant_id = ANY($1::uuid[])",
++            [caller_id, subject_id],
++        )
++        await conn.execute(
++            "DELETE FROM tenants WHERE id = ANY($1::uuid[])",
++            [caller_id, subject_id],
++        )
++
++
++# ---------------------------------------------------------------------------
++# B.1 — Outsider takeover (the reported attack)
++# ---------------------------------------------------------------------------
++
++
+<email>
+<email>
++async def test_outsider_takeover_add_member_owner(team_env: Any) -> None:
++    """Outsider with no role calls add_team_member(member_id=<self>, role_key='owner').
++
++    Must be refused with -32603.  After the refusal, no team_role_assignments
++    row for the caller on that team AND no user_effective_team_access row.
++    """
++    data = team_env
++    outsider_id = uuid4()
++    async with data["pool"].acquire() as conn:
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            outsider_id, f"outsider-{outsider_id}@test.invalid",
++        )
++        await conn.execute(
++            "INSERT INTO tenant_identities (tenant_id, cognito_sub, provider, email, is_primary) "
++            "VALUES ($1, $2, 'cognito', $3, true)",
++            outsider_id, f"sub-{outsider_id}", f"outsider-{outsider_id}@test.invalid",
++        )
++
++    try:
++        ctx = _ctx(data["pool"], outsider_id)
++        tool = AddTeamMemberTool()
++
++        inp = AddTeamMemberInput(
++            team_id=data["team_id"],
++            member_kind="user",
++            member_id=outsider_id,
++            role_key="owner",
++        )
++
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, inp)
++
++        assert exc_info.value.code == -32603
++        assert exc_info.value.data == {"missing_permission": MANAGE_MEMBERS}
++
++        # Verify no assignment was created.
++        async with data["pool"].acquire() as conn:
++            row = await conn.fetchrow(
++                """SELECT 1 FROM team_role_assignments
++                   WHERE parent_team_id=$1 AND member_kind='user' AND member_id=$2""",
++                data["team_id"], outsider_id,
++            )
++            assert row is None, "Outsider should not have been added to team_role_assignments"
++
++            row = await conn.fetchrow(
++                """SELECT 1 FROM user_effective_team_access
++                   WHERE resource_team_id=$1 AND user_id=$2""",
++                data["team_id"], outsider_id,
++            )
++            assert row is None, "Outsider should not have a user_effective_team_access row"
++    finally:
++        async with data["pool"].acquire() as conn:
++            await conn.execute(
++                "DELETE FROM tenant_identities WHERE tenant_id=$1", outsider_id
++            )
++            await conn.execute("DELETE FROM tenants WHERE id=$1", outsider_id)
++
++
++# ---------------------------------------------------------------------------
++# B.2 — Outsider demotes the owner via assign_role
++# ---------------------------------------------------------------------------
++
++
+<email>
+<email>
++async def test_outsider_demotes_owner_via_assign_role(team_env: Any) -> None:
++    """Outsider calls assign_role to demote owner to viewer → refused; owner stays owner."""
++    data = team_env
++    outsider_id = uuid4()
++    async with data["pool"].acquire() as conn:
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            outsider_id, f"outsider2-{outsider_id}@test.invalid",
++        )
++
++    try:
++        ctx = _ctx(data["pool"], outsider_id)
++        tool = AssignRoleTool()
++
++        inp = AssignRoleInput(
++            team_id=data["team_id"],
++            member_kind="user",
++            member_id=data["owner_id"],
++            new_role_key="viewer",
++        )
++
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, inp)
++
++        assert exc_info.value.code == -32603
++        assert exc_info.value.data == {"missing_permission": MANAGE_MEMBERS}
++
++        # Verify owner's role is unchanged.
++        async with data["pool"].acquire() as conn:
++            row = await conn.fetchrow(
++                """SELECT rc.role_key FROM team_role_assignments tra
++                   JOIN roles_catalog rc ON rc.id = tra.role_id
++                   WHERE tra.parent_team_id=$1 AND tra.member_kind='user' AND tra.member_id=$2""",
++                data["team_id"], data["owner_id"],
++            )
++            assert row is not None
++            assert row["role_key"] == "owner"
++    finally:
++        async with data["pool"].acquire() as conn:
++            await conn.execute(
++                "DELETE FROM tenant_identities WHERE tenant_id=$1", outsider_id
++            )
++            await conn.execute("DELETE FROM tenants WHERE id=$1", outsider_id)
++
++
++# ---------------------------------------------------------------------------
++# B.3 — Outsider removes the owner
++# ---------------------------------------------------------------------------
++
++
+<email>
+<email>
++async def test_outsider_removes_owner(team_env: Any) -> None:
++    """Outsider calls remove_team_member to remove the owner → refused; owner row remains."""
++    data = team_env
++    outsider_id = uuid4()
++    async with data["pool"].acquire() as conn:
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            outsider_id, f"outsider3-{outsider_id}@test.invalid",
++        )
++        await conn.execute(
++            "INSERT INTO tenant_identities (tenant_id, cognito_sub, provider, email, is_primary) "
++            "VALUES ($1, $2, 'cognito', $3, true)",
++            outsider_id, f"sub-{outsider_id}", f"outsider3-{outsider_id}@test.invalid",
++        )
++
++    try:
++        ctx = _ctx(data["pool"], outsider_id)
++        tool = RemoveTeamMemberTool()
++
++        inp = RemoveTeamMemberInput(
++            team_id=data["team_id"],
++            member_kind="user",
++            member_id=data["owner_id"],
++        )
++
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, inp)
++
++        assert exc_info.value.code == -32603
++        assert exc_info.value.data == {"missing_permission": MANAGE_MEMBERS}
++
++        # Verify owner's row still present.
++        async with data["pool"].acquire() as conn:
++            row = await conn.fetchrow(
++                """SELECT 1 FROM team_role_assignments
++                   WHERE parent_team_id=$1 AND member_kind='user' AND member_id=$2""",
++                data["team_id"], data["owner_id"],
++            )
++            assert row is not None
++    finally:
++        async with data["pool"].acquire() as conn:
++            await conn.execute(
++                "DELETE FROM tenant_identities WHERE tenant_id=$1", outsider_id
++            )
++            await conn.execute("DELETE FROM tenants WHERE id=$1", outsider_id)
++
++
++# ---------------------------------------------------------------------------
++# B.4 — viewer / vendor / customer refused for add and assign
++# ---------------------------------------------------------------------------
++
++
+<email>
+<email>("role_key", ["viewer", "vendor", "customer"])
+<email>
++async def test_non_admin_roles_denied_add(team_env: Any, role_key: str) -> None:
++    """viewer, vendor, customer cannot add members → -32603."""
++    data = team_env
++    caller_id = data[f"{role_key}_id"]
++    ctx = _ctx(data["pool"], caller_id)
++    tool = AddTeamMemberTool()
++
++    inp = AddTeamMemberInput(
++        team_id=data["team_id"],
++        member_kind="user",
++        member_id=data["subject_id"],
++        role_key="member",
++    )
++
++    with pytest.raises(JsonRpcError) as exc_info:
++        await tool(ctx, inp)
++
++    assert exc_info.value.code == -32603
++    assert exc_info.value.data == {"missing_permission": MANAGE_MEMBERS}
++
++
+<email>
+<email>("role_key", ["viewer", "vendor", "customer"])
+<email>
++async def test_non_admin_roles_denied_assign(team_env: Any, role_key: str) -> None:
++    """viewer, vendor, customer cannot assign roles → -32603."""
++    data = team_env
++    caller_id = data[f"{role_key}_id"]
++    ctx = _ctx(data["pool"], caller_id)
++    tool = AssignRoleTool()
++
++    inp = AssignRoleInput(
++        team_id=data["team_id"],
++        member_kind="user",
++        member_id=data["subject_id"],
++        new_role_key="admin",
++    )
++
++    with pytest.raises(JsonRpcError) as exc_info:
++        await tool(ctx, inp)
++
++    assert exc_info.value.code == -32603
++    assert exc_info.value.data == {"missing_permission": MANAGE_MEMBERS}
++
++
++# ---------------------------------------------------------------------------
++# B.5 — Email oracle: identical error regardless of email/team existence
++# ---------------------------------------------------------------------------
++
++
+<email>
+<email>
++async def test_email_oracle_add_member(team_env: Any) -> None:
++    """Outsider calling add_team_member with any email or nonexistent team
++    gets the identical -32603 error — no information leakage about email or
++    team existence.
++    """
++    data = team_env
++    outsider_id = uuid4()
++    async with data["pool"].acquire() as conn:
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            outsider_id, f"oracle-{outsider_id}@test.invalid",
++        )
++
++    try:
++        ctx = _ctx(data["pool"], outsider_id)
++        tool = AddTeamMemberTool()
++
++        # Case A: existing email as member_email.
++        inp_a = AddTeamMemberInput(
++            team_id=data["team_id"],
++            member_kind="user",
++            member_email=f"sec-{data['subject_id']}@test.invalid",
++            role_key="member",
++        )
++        with pytest.raises(JsonRpcError) as exc_a:
++            await tool(ctx, inp_a)
++
++        # Case B: nonexistent email as member_email.
++        inp_b = AddTeamMemberInput(
++            team_id=data["team_id"],
++            member_kind="user",
++            member_email=f"nobody-{uuid4()}@test.invalid",
++            role_key="member",
++        )
++        with pytest.raises(JsonRpcError) as exc_b:
++            await tool(ctx, inp_b)
++
++        # Case C: nonexistent team_id with existing email.
++        inp_c = AddTeamMemberInput(
++            team_id=uuid4(),
++            member_kind="user",
++            member_email=f"sec-{data['subject_id']}@test.invalid",
++            role_key="member",
++        )
++        with pytest.raises(JsonRpcError) as exc_c:
++            await tool(ctx, inp_c)
++
++        # All three must produce the identical error envelope.
++        for exc in (exc_a, exc_b, exc_c):
++            assert exc.value.code == -32603
++            assert exc.value.data == {"missing_permission": MANAGE_MEMBERS}
++            assert exc.value.message == "caller lacks required permission: team.manage_members"
++    finally:
++        async with data["pool"].acquire() as conn:
++            await conn.execute("DELETE FROM tenant_identities WHERE tenant_id=$1", outsider_id)
++            await conn.execute("DELETE FROM tenants WHERE id=$1", outsider_id)
++
++
++# ---------------------------------------------------------------------------
++# B.6 — Removed member cannot re-add themselves
++# ---------------------------------------------------------------------------
++
++
+<email>
+<email>
++async def test_removed_member_cannot_re_add(team_env: Any) -> None:
++    """Owner removes a member; the ex-member then tries to add themselves back
++    (as 'member' and as 'owner') — both refused, no row created.
++    """
++    data = team_env
++    ctx_owner = _ctx(data["pool"], data["owner_id"])
++    tool_add = AddTeamMemberTool()
++
++    # Owner adds subject as member (should succeed).
++    inp_add = AddTeamMemberInput(
++        team_id=data["team_id"],
++        member_kind="user",
++        member_id=data["subject_id"],
++        role_key="member",
++    )
++    output = cast(AddTeamMemberOutput, await tool_add(ctx_owner, inp_add))
++    assert output.status == "active"
++
++    # Owner removes subject.
++    tool_remove = RemoveTeamMemberTool()
++    inp_remove = RemoveTeamMemberInput(
++        team_id=data["team_id"],
++        member_kind="user",
++        member_id=data["subject_id"],
++    )
++    output = cast(RemoveTeamMemberOutput, await tool_remove(ctx_owner, inp_remove))
++    assert output.removed is True
++
++    # Now subject (ex-member) tries to add themselves as 'member'.
++    ctx_subject = _ctx(data["pool"], data["subject_id"])
++    inp_self_add = AddTeamMemberInput(
++        team_id=data["team_id"],
++        member_kind="user",
++        member_id=data["subject_id"],
++        role_key="member",
++    )
++    with pytest.raises(JsonRpcError) as exc_info:
++        await tool_add(ctx_subject, inp_self_add)
++    assert exc_info.value.code == -32603
++    assert exc_info.value.data == {"missing_permission": MANAGE_MEMBERS}
++
++    # Ex-member tries to add themselves as 'owner' (the takeover variant).
++    inp_self_owner = AddTeamMemberInput(
++        team_id=data["team_id"],
++        member_kind="user",
++        member_id=data["subject_id"],
++        role_key="owner",
++    )
++    with pytest.raises(JsonRpcError) as exc_info:
++        await tool_add(ctx_subject, inp_self_owner)
++    assert exc_info.value.code == -32603
++    assert exc_info.value.data == {"missing_permission": MANAGE_MEMBERS}
++
++    # Verify no assignment row for subject on this team.
++    async with data["pool"].acquire() as conn:
++        row = await conn.fetchrow(
++            """SELECT 1 FROM team_role_assignments
++               WHERE parent_team_id=$1 AND member_kind='user' AND member_id=$2""",
++            data["team_id"], data["subject_id"],
++        )
++        assert row is None
++
++
++# ---------------------------------------------------------------------------
++# B.7 — Self-removal by a non-member
++# ---------------------------------------------------------------------------
++
++
+<email>
+<email>
++async def test_self_removal_by_non_member_denied(no_role_env: Any) -> None:
++    """A tenant with NO role on the team calls remove_team_member(self) → -32603.
++
++    caller_has_active_team_role() returns False, so the self-removal exception
++    does not apply and the permission check fires.  This is the correct
++    behavior: you can't leave a team you were never on.
++    """
++    data = no_role_env
++    ctx = _ctx(data["pool"], data["caller_id"])
++    tool = RemoveTeamMemberTool()
++
++    inp = RemoveTeamMemberInput(
++        team_id=data["team_id"],
++        member_kind="user",
++        member_id=data["caller_id"],
++    )
++
++    with pytest.raises(JsonRpcError) as exc_info:
++        await tool(ctx, inp)
++
++    assert exc_info.value.code == -32603
++    assert exc_info.value.data == {"missing_permission": MANAGE_MEMBERS}
++
++
++# ---------------------------------------------------------------------------
++# B.8 — Owner manages the full lifecycle
++# ---------------------------------------------------------------------------
++
++
+<email>
+<email>
++async def test_owner_manages_full_lifecycle(team_env: Any) -> None:
++    """Owner can: add a user by id, add a user by email, assign a role,
++    and remove a member — all succeed.
++    """
++    data = team_env
++    ctx = _ctx(data["pool"], data["owner_id"])
++
++    # Add subject by id.
++    tool_add = AddTeamMemberTool()
++    inp_add = AddTeamMemberInput(
++        team_id=data["team_id"],
++        member_kind="user",
++        member_id=data["subject_id"],
++        role_key="member",
++    )
++    output = cast(AddTeamMemberOutput, await tool_add(ctx, inp_add))
++    assert output.role_key == "member"
++
++    # Add a second user by email (uses subject_id's identity email).
++    second_user_id = uuid4()
++    async with data["pool"].acquire() as conn:
++        second_email = f"second-{second_user_id}@test.invalid"
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            second_user_id, second_email,
++        )
++        await conn.execute(
++            "INSERT INTO tenant_identities (tenant_id, cognito_sub, provider, email, is_primary) "
++            "VALUES ($1, $2, 'cognito', $3, true)",
++            second_user_id, f"sub-{second_user_id}", second_email,
++        )
++
++    try:
++        inp_add_email = AddTeamMemberInput(
++            team_id=data["team_id"],
++            member_kind="user",
++            member_email=second_email,
++            role_key="member",
++        )
++        output = cast(AddTeamMemberOutput, await tool_add(ctx, inp_add_email))
++        assert output.status == "active"
++
++        # Assign a role to subject (promote to admin).
++        tool_assign = AssignRoleTool()
++        inp_assign = AssignRoleInput(
++            team_id=data["team_id"],
++            member_kind="user",
++            member_id=data["subject_id"],
++            new_role_key="admin",
++        )
++        output = cast(AssignRoleOutput, await tool_assign(ctx, inp_assign))
++        assert output.role_key == "admin"
++
++        # Remove subject.
++        tool_remove = RemoveTeamMemberTool()
++        inp_remove = RemoveTeamMemberInput(
++            team_id=data["team_id"],
++            member_kind="user",
++            member_id=data["subject_id"],
++        )
++        output = cast(RemoveTeamMemberOutput, await tool_remove(ctx, inp_remove))
++        assert output.removed is True
++    finally:
++        async with data["pool"].acquire() as conn:
++            await conn.execute(
++                "DELETE FROM tenant_identities WHERE tenant_id=$1", second_user_id
++            )
++            await conn.execute("DELETE FROM tenants WHERE id=$1", second_user_id)
++
++
++# ---------------------------------------------------------------------------
++# B.9 — End-to-end with memsys_create_team
++# ---------------------------------------------------------------------------
++
++
+<email>
+<email>
++async def test_end_to_end_with_create_team(pg_pool: Any) -> None:
++    """Call memsys_create_team as a fresh tenant, then use that tenant to
++    add a member (by id and by email), assign a role, and remove them — all
++    succeed.  A second unrelated tenant is refused on the same team.
++    """
++    creator_id = uuid4()
++    member_id = uuid4()       # target user to be added
++    outsider_id = uuid4()     # unrelated tenant refused on the team
++    team_id_holder: dict[str, Any] = {}
++
++    async with pg_pool.acquire() as conn:
++        # Creator + primary identity (create_team uses tenant_tx).
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            creator_id, f"creator-{creator_id}@test.invalid",
++        )
++        await conn.execute(
++            "INSERT INTO tenant_identities (tenant_id, cognito_sub, provider, email, is_primary) "
++            "VALUES ($1, $2, 'cognito', $3, true)",
++            creator_id, f"sub-{creator_id}", f"creator-{creator_id}@test.invalid",
++        )
++
++        # Target member + identity (for email-based add).
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            member_id, f"member-{member_id}@test.invalid",
++        )
++        await conn.execute(
++            "INSERT INTO tenant_identities (tenant_id, cognito_sub, provider, email, is_primary) "
++            "VALUES ($1, $2, 'cognito', $3, true)",
++            member_id, f"sub-{member_id}", f"member-{member_id}@test.invalid",
++        )
++
++        # Outsider + identity.
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            outsider_id, f"outsider4-{outsider_id}@test.invalid",
++        )
++        await conn.execute(
++            "INSERT INTO tenant_identities (tenant_id, cognito_sub, provider, email, is_primary) "
++            "VALUES ($1, $2, 'cognito', $3, true)",
++            outsider_id, f"sub-{outsider_id}", f"outsider4-{outsider_id}@test.invalid",
++        )
++
++    try:
++        # Call create_team.
++        ctx_creator = _ctx(pg_pool, creator_id)
++        create_tool = CreateTeamTool()
++        inp = CreateTeamInput(name=f"e2e-team-{str(creator_id)[:8]}")
++        output = cast(CreateTeamOutput, await create_tool(ctx_creator, inp))
++        team_id = output.team.id
++
++        # Owner adds member by id.
++        ctx_owner = _ctx(pg_pool, creator_id)
++        tool_add = AddTeamMemberTool()
++        inp_add = AddTeamMemberInput(
++            team_id=team_id, member_kind="user", member_id=member_id, role_key="member",
++        )
++        output = cast(AddTeamMemberOutput, await tool_add(ctx_owner, inp_add))
++        assert output.role_key == "member"
++
++        # Owner adds another user by email.
++        second_member_id = uuid4()
++        second_email = f"second-{second_member_id}@test.invalid"
++        async with pg_pool.acquire() as conn:
++            await conn.execute(
++                "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++                second_member_id, second_email,
++            )
++            await conn.execute(
++                "INSERT INTO tenant_identities (tenant_id, cognito_sub, provider, email, is_primary) "
++                "VALUES ($1, $2, 'cognito', $3, true)",
++                second_member_id, f"sub-{second_member_id}", second_email,
++            )
++        try:
++            inp_add_email = AddTeamMemberInput(
++                team_id=team_id, member_kind="user", member_email=second_email, role_key="member",
++            )
++            output = cast(AddTeamMemberOutput, await tool_add(ctx_owner, inp_add_email))
++            assert output.status == "active"
++
++            # Owner assigns a role to member.
++            tool_assign = AssignRoleTool()
++            inp_assign = AssignRoleInput(
++                team_id=team_id, member_kind="user", member_id=member_id, new_role_key="admin",
++            )
++            output = cast(AssignRoleOutput, await tool_assign(ctx_owner, inp_assign))
++            assert output.role_key == "admin"
++
++            # Owner removes member.
++            tool_remove = RemoveTeamMemberTool()
++            inp_remove = RemoveTeamMemberInput(
++                team_id=team_id, member_kind="user", member_id=member_id,
++            )
++            output = cast(RemoveTeamMemberOutput, await tool_remove(ctx_owner, inp_remove))
++            assert output.removed is True
++
++            # Outsider is refused on add.
++            ctx_outsider = _ctx(pg_pool, outsider_id)
++            inp_outsider = AddTeamMemberInput(
++                team_id=team_id, member_kind="user", member_id=second_member_id, role_key="member",
++            )
++            with pytest.raises(JsonRpcError) as exc_info:
++                await tool_add(ctx_outsider, inp_outsider)
++            assert exc_info.value.code == -32603
++            assert exc_info.value.data == {"missing_permission": MANAGE_MEMBERS}
++
++            team_id_holder["team_id"] = team_id
++        finally:
++            async with pg_pool.acquire() as conn:
++                await conn.execute(
++                    "DELETE FROM tenant_identities WHERE tenant_id=$1", second_member_id
++                )
++                await conn.execute("DELETE FROM tenants WHERE id=$1", second_member_id)
++    finally:
++        # Cleanup the team created via the tool.
++        team_id_val = team_id_holder.get("team_id")
++        if team_id_val:
++            async with pg_pool.acquire() as conn:
++                await conn.execute(
++                    "DELETE FROM user_effective_team_access WHERE resource_team_id=$1",
++                    team_id_val,
++                )
++                await conn.execute(
++                    "DELETE FROM team_role_assignments WHERE parent_team_id=$1",
++                    team_id_val,
++                )
++                await conn.execute("DELETE FROM teams WHERE id=$1", team_id_val)
++        async with pg_pool.acquire() as conn:
++            await conn.execute(
++                "DELETE FROM tenant_identities WHERE tenant_id = ANY($1::uuid[])",
++                [creator_id, member_id, outsider_id],
++            )
++            await conn.execute(
++                "DELETE FROM tenants WHERE id = ANY($1::uuid[])",
++                [creator_id, member_id, outsider_id],
++            )
++
++
++# ---------------------------------------------------------------------------
++# B.10 — Self-removal with a co-owner
++# ---------------------------------------------------------------------------
++
++
+<email>
+<email>
++async def test_self_removal_with_co_owner(team_env: Any) -> None:
++    """Team has two owners; one owner removes themselves → succeeds (not sole owner)."""
++    data = team_env
++    owner2_id = uuid4()
++
++    async with data["pool"].acquire() as conn:
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            owner2_id, f"coowner-{owner2_id}@test.invalid",
++        )
++        await conn.execute(
++            "INSERT INTO tenant_identities (tenant_id, cognito_sub, provider, email, is_primary) "
++            "VALUES ($1, $2, 'cognito', $3, true)",
++            owner2_id, f"sub-{owner2_id}", f"coowner-{owner2_id}@test.invalid",
++        )
++
++    try:
++        # Add owner2 as a second owner of the team.
++        async with data["pool"].acquire() as conn:
++            await assign_role_fn(
++                conn,
++                parent_team_id=data["team_id"],
++                member_kind="user",
++                member_id=owner2_id,
++                role_key="owner",
++                assigned_by_user_id=data["owner_id"],
++            )
++
++        # owner2 self-removes → should succeed (there's another owner).
++        ctx = _ctx(data["pool"], owner2_id)
++        tool = RemoveTeamMemberTool()
++        inp = RemoveTeamMemberInput(
++            team_id=data["team_id"],
++            member_kind="user",
++            member_id=owner2_id,
++        )
++        output = cast(RemoveTeamMemberOutput, await tool(ctx, inp))
++        assert output.removed is True
++
++        # Verify owner2's row is gone.
++        async with data["pool"].acquire() as conn:
++            row = await conn.fetchrow(
++                """SELECT 1 FROM team_role_assignments
++                   WHERE parent_team_id=$1 AND member_kind='user' AND member_id=$2""",
++                data["team_id"], owner2_id,
++            )
++            assert row is None
++    finally:
++        async with data["pool"].acquire() as conn:
++            await conn.execute(
++                "DELETE FROM tenant_identities WHERE tenant_id=$1", owner2_id
++            )
++            await conn.execute("DELETE FROM tenants WHERE id=$1", owner2_id)
+diff --git a/tests/unit/test_team_role_permissions.py b/tests/unit/test_team_role_permissions.py
+new file mode 100644
+index 0000000..5e10e62
+--- /dev/null
++++ b/tests/unit/test_team_role_permissions.py
+@@ -0,0 +1,256 @@
++"""Tests for the expanded team-role permission matrix ([RUN]).
++
++Covers all 7 catalog roles (owner, admin, member, service-bot, viewer, vendor,
++customer) against the full set of team.* permissions declared in the
++Permission enum.  Verifies the mapping in ROLE_PERMISSIONS is complete and
++internally consistent.
++
++The DB-backed tests at the bottom require MEM_MCP_TEST_DSN and are skipped
++otherwise.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Any
++from uuid import uuid4
++
++import pytest
++
++from mem_mcp.auth.permissions import (
++    _TEAM_ADMIN_PERMS,
++    _TEAM_MEMBER_PERMS,
++    _TEAM_VIEWER_PERMS,
++    ROLE_PERMISSIONS,
++    Permission,
++)
++
++#: The 7 core catalog roles that must appear in ROLE_PERMISSIONS.
++TEAM_ROLES = [
++    "owner",
++    "admin",
++    "member",
++    "service-bot",
++    "viewer",
++    "vendor",
++    "customer",
++]
++
++#: System roles that live in Role enum, not in roles_catalog.
++_SYSTEM_ROLE_KEYS = {"system_admin", "system_support"}
++
++# Skip DB-backed tests when no test DB is configured.
++pytestmark_db = pytest.mark.skipif(
++    not os.getenv("MEM_MCP_TEST_DSN"),
++    reason="MEM_MCP_TEST_DSN not set",
++)
++
++
++def test_all_seven_catalog_roles_present() -> None:
++    """Every catalog role must have an entry in ROLE_PERMISSIONS."""
++    for role in TEAM_ROLES:
++        assert role in ROLE_PERMISSIONS, f"Missing role '{role}' in ROLE_PERMISSIONS"
++
++
++def test_owner_has_all_team_permissions() -> None:
++    """Owner is an admin-equivalent: holds every team.* permission."""
++    perms = ROLE_PERMISSIONS["owner"]
++    for p in Permission:
++        if p.value.startswith("team."):
++            assert p in perms, f"owner missing {p}"
++
++
++def test_admin_has_all_team_permissions() -> None:
++    """Admin holds every team.* permission."""
++    perms = ROLE_PERMISSIONS["admin"]
++    for p in Permission:
++        if p.value.startswith("team."):
++            assert p in perms, f"admin missing {p}"
++
++
++def test_member_has_read_write_but_not_manage() -> None:
++    """Member has view/write/read-memory but NOT manage/delete/settings."""
++    perms = ROLE_PERMISSIONS["member"]
++    assert Permission.TEAM_VIEW in perms
++    assert Permission.TEAM_WRITE_MEMORY in perms
++    assert Permission.TEAM_READ_MEMORY in perms
++    assert Permission.TEAM_MANAGE_MEMBERS not in perms
++    assert Permission.TEAM_MANAGE_SETTINGS not in perms
++    assert Permission.TEAM_DELETE not in perms
++
++
++def test_service_bot_matches_member_permissions() -> None:
++    """service-bot is an automated agent — same perms as 'member'."""
++    assert ROLE_PERMISSIONS["service-bot"] == ROLE_PERMISSIONS["member"]
++
++
++def test_service_bot_excludes_manage_permissions() -> None:
++    """service-bot must NOT have manage_members (no human oversight)."""
++    perms = ROLE_PERMISSIONS["service-bot"]
++    assert Permission.TEAM_MANAGE_MEMBERS not in perms
++    assert Permission.TEAM_MANAGE_SETTINGS not in perms
++    assert Permission.TEAM_DELETE not in perms
++
++
++def test_viewer_vendor_customer_share_same_permissions() -> None:
++    """viewer, vendor, and customer all get the same read-only set."""
++    viewer_perms = ROLE_PERMISSIONS["viewer"]
++    vendor_perms = ROLE_PERMISSIONS["vendor"]
++    customer_perms = ROLE_PERMISSIONS["customer"]
++    assert viewer_perms == vendor_perms
++    assert viewer_perms == customer_perms
++
++
++def test_viewer_permissions_are_read_only() -> None:
++    """viewer has view + read-memory but nothing else."""
++    perms = ROLE_PERMISSIONS["viewer"]
++    assert Permission.TEAM_VIEW in perms
++    assert Permission.TEAM_READ_MEMORY in perms
++    assert Permission.TEAM_WRITE_MEMORY not in perms
++    assert Permission.TEAM_MANAGE_MEMBERS not in perms
++    assert Permission.TEAM_MANAGE_SETTINGS not in perms
++    assert Permission.TEAM_DELETE not in perms
++
++
++def test_no_team_role_has_system_permissions() -> None:
++    """No team role should implicitly hold system.* permissions."""
++    for role in TEAM_ROLES:
++        perms = ROLE_PERMISSIONS[role]
++        for p in perms:
++            assert not p.value.startswith("system."), (
++                f"Team role '{role}' should not have system permission {p}"
++            )
++
++
++def test_admin_and_owner_sets_are_equal() -> None:
++    """owner and admin must have identical permission sets."""
++    assert ROLE_PERMISSIONS["owner"] == ROLE_PERMISSIONS["admin"]
++
++
++def test_member_and_service_bot_sets_are_equal() -> None:
++    """member and service-bot must have identical permission sets."""
++    assert ROLE_PERMISSIONS["member"] == ROLE_PERMISSIONS["service-bot"]
++
++
++def test_all_team_perms_accounted_for() -> None:
++    """The union of team-role permissions must cover all team.* permissions."""
++    all_team_perms: set[Permission] = set()
++    for role in TEAM_ROLES:
++        all_team_perms |= ROLE_PERMISSIONS[role]
++
++    expected_team_perms = {
++        p for p in Permission if p.value.startswith("team.")
++    }
++    assert all_team_perms == expected_team_perms, (
++        f"Missing permissions: {expected_team_perms - all_team_perms}"
++    )
++
++
++def test_internal_sets_are_consistent() -> None:
++    """The private _TEAM_*_PERMS sets must agree with public ROLE_PERMISSIONS entries."""
++    assert ROLE_PERMISSIONS["owner"] == _TEAM_ADMIN_PERMS
++    assert ROLE_PERMISSIONS["admin"] == _TEAM_ADMIN_PERMS
++    assert ROLE_PERMISSIONS["member"] == _TEAM_MEMBER_PERMS
++    assert ROLE_PERMISSIONS["service-bot"] == _TEAM_MEMBER_PERMS
++    assert ROLE_PERMISSIONS["viewer"] == _TEAM_VIEWER_PERMS
++    assert ROLE_PERMISSIONS["vendor"] == _TEAM_VIEWER_PERMS
++    assert ROLE_PERMISSIONS["customer"] == _TEAM_VIEWER_PERMS
++
++
++# ---------------------------------------------------------------------------
++# DB-backed matrix tests (require MEM_MCP_TEST_DSN)
++# ---------------------------------------------------------------------------
++
++
+<email>
+<email>(
++    not os.getenv("MEM_MCP_TEST_DSN"),
++    reason="MEM_MCP_TEST_DSN not set",
++)
++async def test_roles_catalog_matches_permission_matrix(pg_pool: Any) -> None:
++    """Every non-plugin role_key in roles_catalog has an entry in ROLE_PERMISSIONS,
++    and the set of team-role keys equals that catalog set exactly.
++    """
++    async with pg_pool.acquire() as conn:
++        catalog_roles = await conn.fetch(
++            "SELECT role_key FROM roles_catalog WHERE plugin_id IS NULL"
++        )
++    catalog_keys = {r["role_key"] for r in catalog_roles}
++
++    # Every catalog role must be in ROLE_PERMISSIONS.
++    for key in catalog_keys:
++        assert key in ROLE_PERMISSIONS, f"roles_catalog role '{key}' missing from ROLE_PERMISSIONS"
++
++    # Team-role keys in ROLE_PERMISSIONS (exclude system roles) must equal catalog set.
++    matrix_team_roles = set(ROLE_PERMISSIONS.keys()) - _SYSTEM_ROLE_KEYS
++    assert matrix_team_roles == catalog_keys, (
++        f"Matrix/team-catalog mismatch:\n"
++        f"  In matrix but not catalog: {matrix_team_roles - catalog_keys}\n"
++        f"  In catalog but not matrix: {catalog_keys - matrix_team_roles}"
++    )
++
++
+<email>
+<email>(
++    not os.getenv("MEM_MCP_TEST_DSN"),
++    reason="MEM_MCP_TEST_DSN not set",
++)
++async def test_has_permission_viewer_resolution(pg_pool: Any) -> None:
++    """has_permission with team_id correctly resolves via team_role_assignments:
++    a viewer can read_memory but cannot manage_members.
++    """
++    from mem_mcp.auth.rbac import has_permission
++
++    role_map: dict[str, Any] = {}
++    async with pg_pool.acquire() as conn:
++        for key in ("viewer", "owner"):
++            rid = await conn.fetchval(
++                "SELECT id FROM roles_catalog WHERE role_key=$1 AND plugin_id IS NULL",
++                key,
++            )
++            if rid is None:
++                pytest.skip(f"roles_catalog missing role '{key}'")
++            role_map[key] = rid
++
++    viewer_id = uuid4()
++    team_id = uuid4()
++    try:
++        async with pg_pool.acquire() as conn:
++            await conn.execute(
++                "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++                viewer_id, f"mat-viewer-{viewer_id}@test.invalid",
++            )
++            await conn.execute(
++                "INSERT INTO teams (id, name, created_by_tenant_id) VALUES ($1, $2, $3)",
++                team_id, f"mat-team-{str(team_id)[:8]}", viewer_id,
++            )
++            await conn.execute(
++                """INSERT INTO team_role_assignments
++                   (parent_team_id, member_kind, member_id, role_id, assigned_by_user_id)
++                   VALUES ($1, 'user', $2, $3, $4)""",
++                team_id, viewer_id, role_map["viewer"], viewer_id,
++            )
++
++        async with pg_pool.acquire() as conn:
++            # viewer can read_memory
++            result = await has_permission(
++                conn, viewer_id, Permission.TEAM_READ_MEMORY, team_id=team_id
++            )
++            assert result is True
++
++            # viewer cannot manage_members
++            result = await has_permission(
++                conn, viewer_id, Permission.TEAM_MANAGE_MEMBERS, team_id=team_id
++            )
++            assert result is False
++
++            # viewer cannot write_memory
++            result = await has_permission(
++                conn, viewer_id, Permission.TEAM_WRITE_MEMORY, team_id=team_id
++            )
++            assert result is False
++    finally:
++        async with pg_pool.acquire() as conn:
++            await conn.execute("DELETE FROM team_role_assignments WHERE parent_team_id=$1", team_id)
++            await conn.execute("DELETE FROM teams WHERE id=$1", team_id)
++            await conn.execute("DELETE FROM tenants WHERE id=$1", viewer_id)

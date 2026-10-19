@@ -1,0 +1,1742 @@
+diff --git a/src/mem_mcp/mindmap/workflow_reads.py b/src/mem_mcp/mindmap/workflow_reads.py
+new file mode 100644
+index 0000000..2bf4e01
+--- /dev/null
++++ b/src/mem_mcp/mindmap/workflow_reads.py
+@@ -0,0 +1,519 @@
++"""Team-workflow read-only queries: per-item allowed moves + pending sign-offs.
++
++Owns the *read* side of the workflow rule set: given a work item on a team
++workflow, compute the set of candidate destination stages together with the
++reason each one is (or is not) available right now, and surface the pending
++sign-off requests a given tenant can sign.
++
++Takes an ``asyncpg.Connection`` from ``tenant_tx``; never imports FastAPI or
++``JsonRpcError``. All SQL carries an explicit ``tenant_id = $n`` predicate in
++addition to RLS, matching the 0046/0048 convention.
++
++``tenant_id`` is the data / RLS scope (the tenant under whose data the item
++lives); ``viewing_tenant_id`` / ``signatory_tenant_id`` is the tenant whose
++sign-off eligibility we are computing — they differ when a team member views
++another member's item, and are equal in the common single-tenant case. This
++module reads the same tables ``workflow_moves.propose_move`` writes and reuses
++``work_items._resolve_workflow`` / ``work_items._load_map`` so the read path
++resolves a work item's governing workflow exactly as the write path does
++(custom ``workflow_id`` -> team active workflow -> lazily-materialised
++``_legacy`` workflow, the latter idempotent under concurrency).
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any
++from uuid import UUID
++
++from mem_mcp.auth.rbac import get_team_role
++from mem_mcp.mindmap import work_items
++
++# A move is "awaiting N sign-offs" once a proposal exists but has not gathered
++# enough distinct eligible signatories. N is the number still required.
++
++
++# ------------------------------------------------------------------------- #
++# Dataclasses                                                               #
++# ------------------------------------------------------------------------- #
++
++
++@dataclass(frozen=True)
++class AllowedMove:
++    """A candidate destination stage for a work item and its current state.
++
++    ``blocked_reason`` is one of:
++
++    * ``None``               — the move can be committed immediately.
++    * ``"reason_required"``  — the transition needs a reason before it commits.
++    * ``"awaiting N sign-offs"`` — a sign-off-gated move still needs N signatures
++      (``request_id`` is ``None`` when the proposal has not been created yet).
++    * ``"role_restricted"``  — the transition restricts sign-off to specific
++      roles and the viewer is not in any of them, so they cannot sign.
++    * ``"no_transition"``    — no rule allows a move from the current stage to
++      ``to_stage``.
++
++    ``signoff_min`` is ``0`` for non-signoff / ``no_transition`` moves and the
++    transition's configured minimum otherwise; ``remaining`` is
++    ``signoff_min - signatory_count`` (clamped at 0) for signoff moves and ``0``
++    otherwise. ``eligible_to_sign`` is viewer-specific: it is ``True`` only when
++    the viewer is a team member, is neither the item's owner (assignee) nor the
++    request's proposer, and (if the transition restricts roles) holds one of the
++    allowed roles.
++    """
++
++    to_stage: str
++    transition_id: UUID | None
++    blocked_reason: str | None
++    request_id: UUID | None
++    signatory_count: int
++    signoff_min: int
++    remaining: int
++    eligible_to_sign: bool
++
++
++@dataclass(frozen=True)
++class PendingSignoff:
++    """A pending sign-off request the calling tenant is eligible to sign.
++
++    ``role_restricted`` is ``True`` when the move's transition pins sign-off to a
++    set of roles (``signoff_roles`` non-empty) — a display hint, not a statement
++    about the caller: only requests the caller *can* sign are returned, so when
++    ``role_restricted`` is ``True`` the caller's role is among the allowed set.
++    """
++
++    request_id: UUID
++    memory_id: UUID
++    from_stage: str
++    to_stage: str
++    proposer_tenant_id: UUID
++    reason: str | None
++    signoff_min: int
++    signatory_count: int
++    remaining: int
++    role_restricted: bool
++
++
++# ------------------------------------------------------------------------- #
++# Internal helpers                                                          #
++# ------------------------------------------------------------------------- #
++
++
++async def _load_stage_names(conn: Any, tenant_id: UUID, workflow_id: UUID) -> list[str]:
++    """Ordered stage names for a workflow (candidates for ``to_stage``)."""
++    rows = await conn.fetch(
++        """
++        SELECT name
++        FROM workflow_stages
++        WHERE tenant_id = $1 AND workflow_id = $2
++        ORDER BY ordinal ASC, name ASC
++        """,
++        tenant_id,
++        workflow_id,
++    )
++    return [str(r["name"]) for r in rows]
++
++
++async def _load_transitions(conn: Any, tenant_id: UUID, workflow_id: UUID) -> list[dict[str, Any]]:
++    """Transition rules for a workflow as plain dicts.
++
++    Includes ``transition_id`` (which the shared ``workflow_crud`` loader omits)
++    and resolves stage *names* rather than ids; ``from_stage`` is ``None`` for
++    the "any entry" rule (``from_stage_id IS NULL``).
++    """
++    rows = await conn.fetch(
++        """
++        SELECT wt.transition_id,
++               wt.requires_reason,
++               wt.requires_signoff,
++               wt.signoff_min,
++               wt.signoff_roles,
++               wt.allowed_kinds,
++               ts.name  AS to_stage,
++               fs.name  AS from_stage
++        FROM workflow_transitions wt
++        JOIN workflow_stages ts ON ts.stage_id = wt.to_stage_id
++        LEFT JOIN workflow_stages fs ON fs.stage_id = wt.from_stage_id
++        WHERE wt.tenant_id = $1 AND wt.workflow_id = $2
++        ORDER BY wt.transition_id ASC
++        """,
++        tenant_id,
++        workflow_id,
++    )
++    transitions: list[dict[str, Any]] = []
++    for r in rows:
++        transitions.append(
++            {
++                "transition_id": UUID(str(r["transition_id"])),
++                "to_stage": str(r["to_stage"]),
++                "from_stage": str(r["from_stage"]) if r["from_stage"] is not None else None,
++                "requires_reason": bool(r["requires_reason"]),
++                "requires_signoff": bool(r["requires_signoff"]),
++                "signoff_min": int(r["signoff_min"]),
++                "signoff_roles": list(r["signoff_roles"]) if r["signoff_roles"] else None,
++                "allowed_kinds": list(r["allowed_kinds"]) if r["allowed_kinds"] else None,
++            }
++        )
++    return transitions
++
++
++def _match_transition(
++    transitions: list[dict[str, Any]], from_stage: str, to_stage: str
++) -> dict[str, Any] | None:
++    """Find the transition applicable to ``(from_stage, to_stage)``.
++
++    A specific ``from_stage`` rule wins over an "any entry" (``from_stage IS
++    NULL``) rule, matching :func:`workflow_moves._find_transition`.
++    """
++    for t in transitions:
++        if t["to_stage"] == to_stage and t["from_stage"] == from_stage:
++            return t
++    for t in transitions:
++        if t["to_stage"] == to_stage and t["from_stage"] is None:
++            return t
++    return None
++
++
++def _signoff_eligibility(
++    *,
++    viewer_role: str | None,
++    assignee_id: UUID | None,
++    proposer: UUID | None,
++    signoff_roles: list[str] | None,
++    viewer_tenant_id: UUID,
++) -> tuple[bool, bool]:
++    """Compute viewer sign-off eligibility for a request.
++
++    Returns ``(eligible_to_sign, role_restricted)``. ``role_restricted`` is True
++    when the transition restricts sign-off to certain roles and the viewer's role
++    is absent from them; owner/proposer exclusion never counts as a role
++    restriction — it is reflected only in ``eligible_to_sign``.
++    """
++    role_restricted = bool(signoff_roles) and (
++        viewer_role is None or viewer_role not in signoff_roles
++    )
++    owner_excluded = assignee_id is not None and viewer_tenant_id == assignee_id
++    proposer_excluded = proposer is not None and viewer_tenant_id == proposer
++    eligible = (
++        viewer_role is not None
++        and not role_restricted
++        and not owner_excluded
++        and not proposer_excluded
++    )
++    return eligible, role_restricted
++
++
++async def _signoff_counts_batch(
++    conn: Any, tenant_id: UUID, request_ids: list[UUID]
++) -> dict[UUID, int]:
++    """Map request_id -> distinct signatory count, for the given requests."""
++    if not request_ids:
++        return {}
++    rows = await conn.fetch(
++        """
++        SELECT request_id, COUNT(*) AS n
++        FROM workflow_signoffs
++        WHERE tenant_id = $1 AND request_id = ANY($2::uuid[])
++        GROUP BY request_id
++        """,
++        tenant_id,
++        request_ids,
++    )
++    return {UUID(str(r["request_id"])): int(r["n"]) for r in rows}
++
++
++async def _load_pending_requests(
++    conn: Any, tenant_id: UUID, memory_id: UUID
++) -> dict[tuple[str, str], dict[str, Any]]:
++    """Pending sign-off requests for one item, keyed by ``(from_stage, to_stage)``.
++
++    The most recent proposal wins when more than one exists for the same move
++    (rare: a cancelled proposal re-filed); older stale rows are ignored.
++    """
++    rows = await conn.fetch(
++        """
++        SELECT request_id, from_stage, to_stage, proposer_tenant_id
++        FROM workflow_signoff_requests
++        WHERE tenant_id = $1
++          AND work_item_memory_id = $2
++          AND status = 'pending'
++        ORDER BY created_at DESC, request_id DESC
++        """,
++        tenant_id,
++        memory_id,
++    )
++    by_move: dict[tuple[str, str], dict[str, Any]] = {}
++    for r in rows:
++        key = (str(r["from_stage"]), str(r["to_stage"]))
++        if key not in by_move:
++            by_move[key] = {
++                "request_id": UUID(str(r["request_id"])),
++                "proposer": UUID(str(r["proposer_tenant_id"])),
++            }
++    return by_move
++
++
++# ------------------------------------------------------------------------- #
++# compute_item_moves                                                        #
++# ------------------------------------------------------------------------- #
++
++
++async def compute_item_moves(
++    conn: Any,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    map_key: str,
++    node_id: UUID,
++    viewing_tenant_id: UUID,
++) -> list[AllowedMove]:
++    """Compute the candidate destination stages for a work item.
++
++    For every stage of the item's governing workflow other than the item's
++    current stage, returns an :class:`AllowedMove` describing whether the move is
++    available, blocked, or awaits sign-off — with the per-viewer sign-off
++    eligibility baked in so callers can render a single "waiting on me" filter.
++
++    The item's workflow is resolved exactly as the write path does (item's own
++    ``workflow_id``, else the team's active workflow, else the lazily
++    materialised ``_legacy`` workflow). For legacy items (``current_stage``
++    column NULL) the stage is read from ``status``.
++    """
++    # Access control: the viewer must be a team member and the map must exist.
++    root_memory_id, _map_row = await work_items._load_map(
++        conn, viewing_tenant_id, team_id, map_key
++    )
++
++    wi_row = await conn.fetchrow(
++        """
++        SELECT *
++        FROM work_items
++        WHERE memory_id = $1 AND tenant_id = $2 AND team_id = $3 AND root_memory_id = $4
++        """,
++        node_id,
++        tenant_id,
++        team_id,
++        root_memory_id,
++    )
++    if wi_row is None:
++        # Match get_work_item: if the node simply isn't a work item here, tell
++        # the caller which kind of failure it is (cross-map or not-a-work-item).
++        await work_items._check_node_membership(conn, node_id, root_memory_id, tenant_id)
++        raise work_items.NotAWorkItemError()
++
++    # Resolve the governing workflow (lazy _legacy materialisation is idempotent).
++    resolved_workflow_id = await work_items._resolve_workflow(
++        conn,
++        tenant_id=tenant_id,
++        team_id=team_id,
++        workflow_id=wi_row["workflow_id"],
++    )
++
++    current_stage: str = (
++        wi_row["current_stage"]
++        if wi_row["current_stage"] is not None
++        else wi_row["status"]
++    )
++    assignee_id = wi_row["assignee_id"]
++
++    stages = await _load_stage_names(conn, tenant_id, resolved_workflow_id)
++    transitions = await _load_transitions(conn, tenant_id, resolved_workflow_id)
++
++    pending = await _load_pending_requests(conn, tenant_id, node_id)
++    request_ids = [req["request_id"] for req in pending.values()]
++    signoff_counts = await _signoff_counts_batch(conn, tenant_id, request_ids)
++
++    viewer_role = await get_team_role(conn, viewing_tenant_id, team_id)
++
++    moves: list[AllowedMove] = []
++    for to_stage in stages:
++        if to_stage == current_stage:
++            # You cannot move to the stage you are already on.
++            continue
++
++        transition = _match_transition(transitions, current_stage, to_stage)
++        if transition is None:
++            moves.append(
++                AllowedMove(
++                    to_stage=to_stage,
++                    transition_id=None,
++                    blocked_reason="no_transition",
++                    request_id=None,
++                    signatory_count=0,
++                    signoff_min=0,
++                    remaining=0,
++                    eligible_to_sign=False,
++                )
++            )
++            continue
++
++        requires_signoff = transition["requires_signoff"]
++        if requires_signoff:
++            signoff_min = transition["signoff_min"]
++            req = pending.get((current_stage, to_stage))
++            if req is not None:
++                request_id = req["request_id"]
++                proposer = req["proposer"]
++                signatory_count = signoff_counts.get(request_id, 0)
++            else:
++                request_id = None
++                proposer = None
++                signatory_count = 0
++            remaining = max(0, signoff_min - signatory_count)
++
++            eligible, role_restricted = _signoff_eligibility(
++                viewer_role=viewer_role,
++                assignee_id=assignee_id,
++                proposer=proposer,
++                signoff_roles=transition["signoff_roles"],
++                viewer_tenant_id=viewing_tenant_id,
++            )
++
++            if remaining <= 0:
++                # Enough signatories already: the move is ready to commit, there
++                # is nothing for the viewer to sign.
++                blocked_reason: str | None = None
++                eligible = False
++            elif role_restricted:
++                blocked_reason = "role_restricted"
++            else:
++                blocked_reason = f"awaiting {remaining} sign-offs"
++        else:
++            # Not a signoff-gated move: nothing is pending and there is no
++            # signatory state to report.
++            signoff_min = 0
++            request_id = None
++            signatory_count = 0
++            remaining = 0
++            eligible = False
++            blocked_reason = "reason_required" if transition["requires_reason"] else None
++
++        moves.append(
++            AllowedMove(
++                to_stage=to_stage,
++                transition_id=transition["transition_id"],
++                blocked_reason=blocked_reason,
++                request_id=request_id,
++                signatory_count=signatory_count,
++                signoff_min=signoff_min,
++                remaining=remaining,
++                eligible_to_sign=eligible,
++            )
++        )
++
++    return moves
++
++
++# ------------------------------------------------------------------------- #
++# list_pending_signoffs_for_user                                            #
++# ------------------------------------------------------------------------- #
++
++
++async def list_pending_signoffs_for_user(
++    conn: Any,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    signatory_tenant_id: UUID,
++) -> list[PendingSignoff]:
++    """Return the pending sign-off requests the calling tenant can sign.
++
++    A request is returned only when the caller is an eligible signatory: a team
++    member who is neither the item's owner (``work_items.assignee_id``) nor the
++    request's proposer, and — if the transition restricts roles via
++    ``signoff_roles`` — whose role is among the allowed set. Requests whose
++    matching transition no longer exists (the team's workflow was changed after
++    the proposal) are skipped: a sign-off can no longer land on it.
++    """
++    # The caller must be a team member at all. team_role_assignments carries no
++    # tenant_id RLS, so this resolves under the tenant_tx scope (tenant_id).
++    viewer_role = await get_team_role(conn, signatory_tenant_id, team_id)
++    if viewer_role is None:
++        return []
++
++    rows = await conn.fetch(
++        """
++        SELECT r.request_id,
++               r.work_item_memory_id        AS memory_id,
++               r.from_stage,
++               r.to_stage,
++               r.proposer_tenant_id,
++               r.reason,
++               wi.assignee_id               AS assignee_id,
++               wi.workflow_id               AS workflow_id
++        FROM workflow_signoff_requests r
++        JOIN work_items wi
++          ON wi.memory_id = r.work_item_memory_id
++         AND wi.tenant_id = r.tenant_id
++        WHERE r.tenant_id = $1
++          AND wi.team_id = $2
++          AND r.status = 'pending'
++        ORDER BY r.created_at ASC, r.request_id ASC
++        """,
++        tenant_id,
++        team_id,
++    )
++
++    request_ids = [UUID(str(r["request_id"])) for r in rows]
++    signoff_counts = await _signoff_counts_batch(conn, tenant_id, request_ids)
++
++    # Cache workflow resolution + transitions: many requests may share a workflow.
++    wf_cache: dict[UUID | None, UUID] = {}
++    trans_cache: dict[UUID, list[dict[str, Any]]] = {}
++
++    results: list[PendingSignoff] = []
++    for r in rows:
++        request_id = UUID(str(r["request_id"]))
++        item_wf_id = r["workflow_id"]
++
++        if item_wf_id not in wf_cache:
++            resolved = await work_items._resolve_workflow(
++                conn,
++                tenant_id=tenant_id,
++                team_id=team_id,
++                workflow_id=item_wf_id,
++            )
++            wf_cache[item_wf_id] = resolved
++        resolved_wf = wf_cache[item_wf_id]
++
++        if resolved_wf not in trans_cache:
++            trans_cache[resolved_wf] = await _load_transitions(conn, tenant_id, resolved_wf)
++        transition = _match_transition(
++            trans_cache[resolved_wf], str(r["from_stage"]), str(r["to_stage"])
++        )
++        if transition is None:
++            # Workflow changed after the proposal: the move can no longer be
++            # signed on this request. Skip it rather than fabricate a sign-off.
++            continue
++
++        signoff_min = transition["signoff_min"]
++        signatory_count = signoff_counts.get(request_id, 0)
++        remaining = max(0, signoff_min - signatory_count)
++
++        assignee_id = r["assignee_id"]
++        proposer = UUID(str(r["proposer_tenant_id"]))
++        owner_excluded = assignee_id is not None and signatory_tenant_id == assignee_id
++        proposer_excluded = signatory_tenant_id == proposer
++        signoff_roles = transition["signoff_roles"]
++        role_restricted = bool(signoff_roles) and (viewer_role not in (signoff_roles or []))
++        eligible = (
++            not owner_excluded and not proposer_excluded and not role_restricted
++        )
++        if not eligible:
++            continue
++
++        results.append(
++            PendingSignoff(
++                request_id=request_id,
++                memory_id=UUID(str(r["memory_id"])),
++                from_stage=str(r["from_stage"]),
++                to_stage=str(r["to_stage"]),
++                proposer_tenant_id=proposer,
++                reason=r["reason"],
++                signoff_min=signoff_min,
++                signatory_count=signatory_count,
++                remaining=remaining,
++                role_restricted=bool(signoff_roles),
++            )
++        )
++    return results
+diff --git a/tests/unit/mindmap/test_workflow_reads.py b/tests/unit/mindmap/test_workflow_reads.py
+new file mode 100644
+index 0000000..c51dabc
+--- /dev/null
++++ b/tests/unit/mindmap/test_workflow_reads.py
+@@ -0,0 +1,1211 @@
++"""DB-backed tests for the workflow read-only module (WP1-T4).
++
++Covers ``compute_item_moves`` and ``list_pending_signoffs_for_user``:
++blocked-reason matrix, pending sign-off state, per-viewer eligibility
++(owner/proposer exclusion + ``signoff_roles``), and the pending-signoffs
++for-user list with the same exclusion rules.
++
++Mirrors the fixture style of ``test_workflow_moves.py``.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++from uuid import UUID, uuid4
++
++import pytest
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mindmap import work_items, workflow_reads
++from mem_mcp.mindmap.workflow_crud import (
++    StageSpec,
++    TransitionSpec,
++    create_team_workflow,
++)
++from mem_mcp.mindmap.workflow_moves import propose_move, sign_workflow_move
++from mem_mcp.teams.assignments import assign_role
++from mem_mcp.mindmap.workflow_errors import WorkItemMapNotFoundError
++
++pytestmark = pytest.mark.asyncio
++
++
++# ------------------------------------------------------------------------- #
++# Fixtures                                                                  #
++# ------------------------------------------------------------------------- #
++
++
+<email>
++async def tenant_a(pg_pool: Any) -> UUID:
++    """Team owner."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"tenant-a-{uuid4()}@example.test",
++            )
++            return UUID(str(tid))
++
++
+<email>
++async def team_a(pg_pool: Any, tenant_a: UUID) -> UUID:
++    """Team owned by tenant_a."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++                f"team-a-{uuid4().hex[:8]}",
++                tenant_a,
++            )
++            await assign_role(
++                conn,
++                parent_team_id=tid,
++                member_kind="user",
++                member_id=tenant_a,
++                role_key="owner",
++                assigned_by_user_id=tenant_a,
++            )
++            return UUID(str(tid))
++
++
+<email>
++async def member1(pg_pool: Any, team_a: UUID) -> UUID:
++    """First member tenant (member role)."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"member1-{uuid4()}@example.test",
++            )
++            await assign_role(
++                conn,
++                parent_team_id=team_a,
++                member_kind="user",
++                member_id=tid,
++                role_key="member",
++                assigned_by_user_id=tid,
++            )
++            return UUID(str(tid))
++
++
+<email>
++async def member2(pg_pool: Any, team_a: UUID) -> UUID:
++    """Second member tenant (member role)."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"member2-{uuid4()}@example.test",
++            )
++            await assign_role(
++                conn,
++                member_kind="user",
++                member_id=tid,
++                parent_team_id=team_a,
++                role_key="member",
++                assigned_by_user_id=tid,
++            )
++            return UUID(str(tid))
++
++
+<email>
++async def admin_tenant(pg_pool: Any, team_a: UUID) -> UUID:
++    """Admin tenant on team_a."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"admin-{uuid4()}@example.test",
++            )
++            await assign_role(
++                conn,
++                member_kind="user",
++                member_id=tid,
++                parent_team_id=team_a,
++                role_key="admin",
++                assigned_by_user_id=tid,
++            )
++            return UUID(str(tid))
++
++
+<email>
++async def viewer_tenant(pg_pool: Any, team_a: UUID) -> UUID:
++    """Viewer tenant on team_a (read-only)."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"viewer-{uuid4()}@example.test",
++            )
++            await assign_role(
++                conn,
++                member_kind="user",
++                member_id=tid,
++                parent_team_id=team_a,
++                role_key="viewer",
++                assigned_by_user_id=tid,
++            )
++            return UUID(str(tid))
++
++
+<email>
++async def tenant_b(pg_pool: Any) -> UUID:
++    """Tenant with no membership on team_a."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"tenant-b-{uuid4()}@example.test",
++            )
++            return UUID(str(tid))
++
++
+<email>
++async def map_setup(
++    pg_pool: Any, tenant_a: UUID, team_a: UUID
++) -> tuple[UUID, UUID, str]:
++    """Live mind-map with root memory + child node + slug + membership."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            root_mem_id = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash,
++                                     embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'Root node content', $3,
++                        array_fill(0::real, ARRAY[1024])::vector, 'api', 'question', 'team')
++                RETURNING id
++                """,
++                tenant_a,
++                team_a,
++                f"hash-root-{uuid4().hex}",
++            )
++            node_mem_id = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash,
++                                     embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'Child node content', $3,
++                        array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++                RETURNING id
++                """,
++                tenant_a,
++                team_a,
++                f"hash-child-{uuid4().hex}",
++            )
++            await conn.execute(
++                """
++                INSERT INTO memory_maps
++                    (root_memory_id, tenant_id, team_id, title, state)
++                VALUES ($1, $2, $3, $4, $5)
++                """,
++                root_mem_id,
++                tenant_a,
++                team_a,
++                "Test Map",
++                "live",
++            )
++            await conn.execute(
++                """
++                INSERT INTO memory_map_membership
++                    (memory_id, root_memory_id, tenant_id, node_role, turn, authored_by)
++                VALUES ($1, $2, $3, 'position', 'owner', 'owner')
++                """,
++                node_mem_id,
++                root_mem_id,
++                tenant_a,
++            )
++            map_key = f"map-{uuid4().hex[:8]}"
++            await conn.execute(
++                """
++                INSERT INTO slugs
++                    (memory_id, team_id, resource_type, slug, title)
++                VALUES ($1, $2, 'map', $3, $4)
++                """,
++                root_mem_id,
++                team_a,
++                map_key,
++                "Test Map",
++            )
++            return UUID(str(root_mem_id)), UUID(str(node_mem_id)), map_key
++
++
++# ------------------------------------------------------------------------- #
++# Spec helpers                                                              #
++# ------------------------------------------------------------------------- #
++
++
++def _signoff_stages() -> list[StageSpec]:
++    """Stages matching the legacy WORK_STATUSES subset used in tests."""
++    return [
++        StageSpec(name="todo", ordinal=0, is_initial=True),
++        StageSpec(name="in_progress", ordinal=1),
++        StageSpec(name="blocked", ordinal=2),
++        StageSpec(name="done", ordinal=3, is_terminal=True),
++    ]
++
++
++def _signoff_transitions() -> list[TransitionSpec]:
++    """Transitions with signoff on in_progress->done (min=2, any role)."""
++    return [
++        TransitionSpec(from_stage=None, to_stage="todo"),
++        TransitionSpec(from_stage="todo", to_stage="in_progress"),
++        TransitionSpec(
++            from_stage="in_progress",
++            to_stage="done",
++            requires_signoff=True,
++            signoff_min=2,
++        ),
++        TransitionSpec(
++            from_stage="in_progress",
++            to_stage="blocked",
++            requires_reason=True,
++        ),
++    ]
++
++
++def _restricted_signoff_transitions() -> list[TransitionSpec]:
++    """Like _signoff_transitions but in_progress->done requires admin signoff."""
++    return [
++        TransitionSpec(from_stage=None, to_stage="todo"),
++        TransitionSpec(from_stage="todo", to_stage="in_progress"),
++        TransitionSpec(
++            from_stage="in_progress",
++            to_stage="done",
++            requires_signoff=True,
++            signoff_min=1,
++            signoff_roles=("admin",),
++        ),
++        TransitionSpec(
++            from_stage="in_progress",
++            to_stage="blocked",
++            requires_reason=True,
++        ),
++    ]
++
++
++async def _setup_workflow(
++    conn: Any,
++    tenant_id: UUID,
++    team_id: UUID,
++    stages: list[StageSpec],
++    transitions: list[TransitionSpec],
++    name: str,
++    activate: bool = True,
++) -> UUID:
++    """Create a team workflow, optionally activate it. Returns workflow_id."""
++    from mem_mcp.mindmap.workflow_crud import activate_workflow
++
++    wf = await create_team_workflow(
++        conn,
++        tenant_id=tenant_id,
++        team_id=team_id,
++        name=name,
++        stages=stages,
++        transitions=transitions,
++        created_by=tenant_id,
++    )
++    if activate:
++        await activate_workflow(
++            conn,
++            tenant_id=tenant_id,
++            team_id=team_id,
++            workflow_id=wf.workflow_id,
++            actor_tenant_id=tenant_id,
++        )
++    return wf.workflow_id
++
++
++async def _setup_work_item(
++    conn: Any,
++    tenant_id: UUID,
++    team_id: UUID,
++    root_mem_id: UUID,
++    node_id: UUID,
++    map_key: str,
++    kind: str = "story",
++    assignee_id: UUID | None = None,
++    set_workflow_id: UUID | None = None,
++    set_current_stage: str | None = None,
++) -> work_items.WorkItem:
++    """Create a work item via mark_work_item, optionally tagging workflow_id
++    and/or current_stage directly on the row."""
++    from mem_mcp.teams.assignments import assign_role
++
++    item = await work_items.mark_work_item(
++        conn,
++        tenant_id=tenant_id,
++        team_id=team_id,
++        map_key=map_key,
++        node_id=node_id,
++        kind=kind,
++        assignee_id=assignee_id,
++    )
++    if set_workflow_id is not None or set_current_stage is not None:
++        await conn.execute(
++            """
++            UPDATE work_items
++            SET workflow_id = $1, current_stage = $2
++            WHERE memory_id = $3 AND tenant_id = $4 AND team_id = $5
++            """,
++            set_workflow_id,
++            set_current_stage,
++            node_id,
++            tenant_id,
++            team_id,
++        )
++        # Re-read so the returned item reflects the updated columns.
++        item = await work_items.get_work_item(
++            conn,
++            tenant_id=tenant_id,
++            team_id=team_id,
++            map_key=map_key,
++            node_id=node_id,
++        )
++    return item
++
++
++async def _setup_signoff_item(
++    conn: Any,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    root_mem_id: UUID,
++    node_id: UUID,
++    map_key: str,
++    transitions: list[TransitionSpec] | None = None,
++    current_stage: str = "in_progress",
++    assignee_id: UUID | None = None,
++) -> UUID:
++    """Create a workflow + work item at ``current_stage`` via the active workflow.
++
++    Returns the workflow_id. The item resolves its workflow through the team's
++    active workflow (workflow_id NULL on the row → _resolve_workflow picks it up).
++    """
++    wf_id = await _setup_workflow(
++        conn, tenant_id, team_id,
++        _signoff_stages(),
++        transitions or _signoff_transitions(),
++        f"ReadWf-{uuid4().hex[:6]}",
++        activate=True,
++    )
++    await _setup_work_item(
++        conn, tenant_id, team_id, root_mem_id, node_id, map_key,
++        assignee_id=assignee_id,
++        set_current_stage=current_stage,
++    )
++    return wf_id
++
++
++# ------------------------------------------------------------------------- #
++# compute_item_moves — blocked_reason matrix                                #
++# ------------------------------------------------------------------------- #
++
++
++async def test_moves_at_todo_stages(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Item at 'todo': todo->in_progress is open, others are no_transition."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="todo",
++        )
++        moves = await workflow_reads.compute_item_moves(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            viewing_tenant_id=tenant_a,
++        )
++    by_stage = {m.to_stage: m for m in moves}
++    assert "todo" not in by_stage  # current stage excluded
++
++    # todo -> in_progress: no signoff, no reason → open.
++    assert by_stage["in_progress"].blocked_reason is None
++    assert by_stage["in_progress"].transition_id is not None
++    assert by_stage["in_progress"].request_id is None
++    assert by_stage["in_progress"].signoff_min == 0
++    assert by_stage["in_progress"].eligible_to_sign is False  # not a signoff move
++
++    # todo -> blocked: no transition rule → no_transition.
++    assert by_stage["blocked"].blocked_reason == "no_transition"
++    assert by_stage["blocked"].transition_id is None
++
++    # todo -> done: no transition rule → no_transition.
++    assert by_stage["done"].blocked_reason == "no_transition"
++    assert by_stage["done"].transition_id is None
++
++
++async def test_moves_at_in_progress_reason_required(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Item at 'in_progress': in_progress->blocked is reason_required."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++        )
++        moves = await workflow_reads.compute_item_moves(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            viewing_tenant_id=tenant_a,
++        )
++    by_stage = {m.to_stage: m for m in moves}
++
++    # in_progress -> blocked: requires_reason, no signoff → reason_required.
++    assert by_stage["blocked"].blocked_reason == "reason_required"
++    assert by_stage["blocked"].signoff_min == 0
++
++    # in_progress -> done: requires_signoff min=2, no proposal yet.
++    assert by_stage["done"].blocked_reason == "awaiting 2 sign-offs"
++    assert by_stage["done"].request_id is None
++    assert by_stage["done"].signatory_count == 0
++    assert by_stage["done"].remaining == 2
++    assert by_stage["done"].signoff_min == 2
++
++    # in_progress -> todo: no transition rule → no_transition.
++    assert by_stage["todo"].blocked_reason == "no_transition"
++
++
++async def test_moves_signoff_pending_no_proposal(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++) -> None:
++    """Signoff move with no proposal: awaiting 2, eligible when viewer is member."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++        )
++        # viewer_tenant_id = member1 (a member, not owner, no proposal yet)
++        moves = await workflow_reads.compute_item_moves(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            viewing_tenant_id=member1,
++        )
++    done_move = next(m for m in moves if m.to_stage == "done")
++    assert done_move.blocked_reason == "awaiting 2 sign-offs"
++    assert done_move.request_id is None
++    assert done_move.signatory_count == 0
++    assert done_move.remaining == 2
++    assert done_move.eligible_to_sign is True
++
++
++async def test_moves_signoff_with_proposal(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++) -> None:
++    """Signoff move with a pending proposal: request_id + counts carried."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++        )
++        # tenant_a proposes the move to done (tenant_a is proposer).
++        req = await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            to_stage="done",
++            reason="finishing up",
++            proposer_tenant_id=tenant_a,
++        )
++        assert req is not None  # type: ignore[arg-type]
++
++        # member1 views: eligible (not owner, not proposer, no role restriction).
++        moves = await workflow_reads.compute_item_moves(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            viewing_tenant_id=member1,
++        )
++    done_move = next(m for m in moves if m.to_stage == "done")
++    assert done_move.blocked_reason == "awaiting 2 sign-offs"
++    assert done_move.request_id is not None
++    assert done_move.signatory_count == 0
++    assert done_move.remaining == 2
++    assert done_move.eligible_to_sign is True
++
++
++async def test_moves_owner_excluded_from_signoff(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++) -> None:
++    """When the viewer is the assignee (owner), eligible_to_sign is False."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++            assignee_id=member1,
++        )
++        # member1 is the assignee AND the viewer → excluded.
++        moves = await workflow_reads.compute_item_moves(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            viewing_tenant_id=member1,
++        )
++    done_move = next(m for m in moves if m.to_stage == "done")
++    assert done_move.blocked_reason == "awaiting 2 sign-offs"
++    assert done_move.eligible_to_sign is False
++
++
++async def test_moves_proposer_excluded_from_signoff(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++) -> None:
++    """When the viewer is the proposer, eligible_to_sign is False."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++        )
++        # tenant_a proposes (proposer = tenant_a), then views.
++        await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            to_stage="done",
++            reason="finishing up",
++            proposer_tenant_id=tenant_a,
++        )
++        moves = await workflow_reads.compute_item_moves(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            viewing_tenant_id=tenant_a,
++        )
++    done_move = next(m for m in moves if m.to_stage == "done")
++    assert done_move.blocked_reason == "awaiting 2 sign-offs"
++    assert done_move.eligible_to_sign is False  # proposer excluded
++
++
++async def test_moves_role_restricted_viewer_ineligible(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++) -> None:
++    """Transition with signoff_roles=('admin',): member viewer gets role_restricted."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++            transitions=_restricted_signoff_transitions(),
++        )
++        await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            to_stage="done",
++            reason="finishing up",
++            proposer_tenant_id=tenant_a,
++        )
++        # member1 (role 'member') views.
++        moves = await workflow_reads.compute_item_moves(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            viewing_tenant_id=member1,
++        )
++    done_move = next(m for m in moves if m.to_stage == "done")
++    assert done_move.blocked_reason == "role_restricted"
++    assert done_move.eligible_to_sign is False
++
++
++async def test_moves_role_restricted_admin_eligible(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    admin_tenant: UUID,
++) -> None:
++    """Transition with signoff_roles=('admin',): admin viewer is eligible."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++            transitions=_restricted_signoff_transitions(),
++        )
++        await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            to_stage="done",
++            reason="finishing up",
++            proposer_tenant_id=tenant_a,
++        )
++        moves = await workflow_reads.compute_item_moves(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            viewing_tenant_id=admin_tenant,
++        )
++    done_move = next(m for m in moves if m.to_stage == "done")
++    assert done_move.blocked_reason == "awaiting 1 sign-offs"
++    assert done_move.signoff_min == 1
++    assert done_move.eligible_to_sign is True
++
++
++async def test_moves_signoff_reached_ready(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++    member2: UUID,
++) -> None:
++    """After min signatories sign, the move is ready (blocked_reason=None)."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++        )
++        req = await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            to_stage="done",
++            reason="finishing up",
++            proposer_tenant_id=tenant_a,
++        )
++        # Two eligible signatories reach min=2 and commit.
++        await sign_workflow_move(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            request_id=req.request_id, signatory_tenant_id=member1,
++        )
++        second = await sign_workflow_move(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            request_id=req.request_id, signatory_tenant_id=member2,
++        )
++        assert isinstance(second, work_items.WorkItem)
++        assert second.current_stage == "done"
++
++        # The item is now at 'done'; moves from done are all no_transition
++        # (no rules originate from done in this workflow).
++        moves = await workflow_reads.compute_item_moves(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            viewing_tenant_id=member1,
++        )
++    # All moves from 'done' should be no_transition — no transition rules
++    # originate from 'done'.
++    for m in moves:
++        assert m.blocked_reason == "no_transition"
++
++
++async def test_moves_non_member_raises(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    tenant_b: UUID,
++) -> None:
++    """A tenant with no team membership gets WorkItemMapNotFoundError."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="todo",
++        )
++    with pytest.raises(WorkItemMapNotFoundError):
++        async with tenant_tx(pg_pool, tenant_b) as conn:
++            await workflow_reads.compute_item_moves(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                viewing_tenant_id=tenant_b,
++            )
++
++
++async def test_moves_not_a_work_item_raises(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """A map node that is not a work item → NotAWorkItemError."""
++    root_mem_id, _node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=_node_id, map_key=map_key,
++            current_stage="todo",
++        )
++    # Use the root memory as the node_id — it's in the map but not a work item.
++    from mem_mcp.mindmap.workflow_errors import NotAWorkItemError
++
++    with pytest.raises(NotAWorkItemError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await workflow_reads.compute_item_moves(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=root_mem_id,
++                viewing_tenant_id=tenant_a,
++            )
++
++
++# ------------------------------------------------------------------------- #
++# compute_item_moves — direct (no-signoff) move                              #
++# ------------------------------------------------------------------------- #
++
++
++async def test_moves_direct_commit_available(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """A no-signoff transition (todo->in_progress) is open for the owner too."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="todo",
++        )
++        moves = await workflow_reads.compute_item_moves(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            viewing_tenant_id=tenant_a,
++        )
++    ip_move = next(m for m in moves if m.to_stage == "in_progress")
++    assert ip_move.blocked_reason is None
++    assert ip_move.transition_id is not None
++    assert ip_move.request_id is None
++    assert ip_move.signoff_min == 0
++    assert ip_move.remaining == 0
++    # Not a signoff-required move, so even the owner isn't "eligible to sign".
++    assert ip_move.eligible_to_sign is False
++
++
++# ------------------------------------------------------------------------- #
++# list_pending_signoffs_for_user                                            #
++# ------------------------------------------------------------------------- #
++
++
++async def test_pending_signoffs_returns_eligible(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++    member2: UUID,
++) -> None:
++    """member1 is eligible for a pending signoff request."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++        )
++        req = await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            to_stage="done",
++            reason="finishing up",
++            proposer_tenant_id=tenant_a,
++        )
++    # After the tx commits, query as member1.
++    async with tenant_tx(pg_pool, member1) as conn:
++        signoffs = await workflow_reads.list_pending_signoffs_for_user(
++            conn,
++            tenant_id=member1,
++            team_id=team_a,
++            signatory_tenant_id=member1,
++        )
++    assert len(signoffs) == 1
++    s = signoffs[0]
++    assert s.request_id == req.request_id
++    assert s.memory_id == node_id
++    assert s.from_stage == "in_progress"
++    assert s.to_stage == "done"
++    assert s.proposer_tenant_id == tenant_a
++    assert s.reason == "finishing up"
++    assert s.signoff_min == 2
++    assert s.signatory_count == 0
++    assert s.remaining == 2
++    assert s.role_restricted is False
++
++
++async def test_pending_signoffs_excludes_owner(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++) -> None:
++    """The item's assignee (owner) is excluded from the pending list."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++            assignee_id=member1,
++        )
++        await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            to_stage="done",
++            reason="finishing up",
++            proposer_tenant_id=tenant_a,
++        )
++    # member1 is the assignee → excluded.
++    async with tenant_tx(pg_pool, member1) as conn:
++        signoffs = await workflow_reads.list_pending_signoffs_for_user(
++            conn,
++            tenant_id=member1,
++            team_id=team_a,
++            signatory_tenant_id=member1,
++        )
++    assert len(signoffs) == 0
++
++
++async def test_pending_signoffs_excludes_proposer(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++) -> None:
++    """The proposer is excluded from the pending list."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++        )
++        # member1 proposes the move.
++        await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            to_stage="done",
++            reason="finishing up",
++            proposer_tenant_id=member1,
++        )
++    # member1 is the proposer → excluded.
++    async with tenant_tx(pg_pool, member1) as conn:
++        signoffs = await workflow_reads.list_pending_signoffs_for_user(
++            conn,
++            tenant_id=member1,
++            team_id=team_a,
++            signatory_tenant_id=member1,
++        )
++    assert len(signoffs) == 0
++
++
++async def test_pending_signoffs_role_restricted_excludes(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++    admin_tenant: UUID,
++) -> None:
++    """Role-restricted signoff: member excluded, admin included."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++            transitions=_restricted_signoff_transitions(),
++        )
++        await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            to_stage="done",
++            reason="finishing up",
++            proposer_tenant_id=tenant_a,
++        )
++    # member1 (role 'member') is excluded by the admin-only restriction.
++    async with tenant_tx(pg_pool, member1) as conn:
++        signoffs = await workflow_reads.list_pending_signoffs_for_user(
++            conn,
++            tenant_id=member1,
++            team_id=team_a,
++            signatory_tenant_id=member1,
++        )
++    assert len(signoffs) == 0
++
++    # admin_tenant is eligible.
++    async with tenant_tx(pg_pool, admin_tenant) as conn:
++        signoffs = await workflow_reads.list_pending_signoffs_for_user(
++            conn,
++            tenant_id=admin_tenant,
++            team_id=team_a,
++            signatory_tenant_id=admin_tenant,
++        )
++    assert len(signoffs) == 1
++    assert signoffs[0].role_restricted is True
++    assert signoffs[0].signoff_min == 1
++    assert signoffs[0].remaining == 1
++
++
++async def test_pending_signoffs_non_member_empty(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++    tenant_b: UUID,
++) -> None:
++    """A tenant with no team membership gets an empty list (not an error)."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++        )
++        await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            to_stage="done",
++            reason="finishing up",
++            proposer_tenant_id=tenant_a,
++        )
++    async with tenant_tx(pg_pool, tenant_b) as conn:
++        signoffs = await workflow_reads.list_pending_signoffs_for_user(
++            conn,
++            tenant_id=tenant_b,
++            team_id=team_a,
++            signatory_tenant_id=tenant_b,
++        )
++    assert signoffs == []
++
++
++async def test_pending_signoffs_after_signing(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++    member2: UUID,
++) -> None:
++    """After signing, the request no longer appears as pending."""
++    root_mem_id, node_id, map_key = map_setup
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++        )
++        req = await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            to_stage="done",
++            reason="finishing up",
++            proposer_tenant_id=tenant_a,
++        )
++        # member1 signs — request still pending (min=2).
++        await sign_workflow_move(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            request_id=req.request_id, signatory_tenant_id=member1,
++        )
++    # member1 should no longer see it (already signed).
++    async with tenant_tx(pg_pool, member1) as conn:
++        signoffs = await workflow_reads.list_pending_signoffs_for_user(
++            conn,
++            tenant_id=member1,
++            team_id=team_a,
++            signatory_tenant_id=member1,
++        )
++    assert len(signoffs) == 0
++
++    # member2 still sees it, with updated counts.
++    async with tenant_tx(pg_pool, member2) as conn:
++        signoffs = await workflow_reads.list_pending_signoffs_for_user(
++            conn,
++            tenant_id=tenant2,
++            team_id=team_a,
++            signatory_tenant_id=member2,
++        )
++    assert len(signoffs) == 1
++    assert signoffs[0].signatory_count == 1
++    assert signoffs[0].remaining == 1
++
++
++async def test_pending_signoffs_multiple_requests(
++    pg_pool: Any,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    member1: UUID,
++) -> None:
++    """Two items, each with a pending signoff → both appear, ordered by creation."""
++    root_mem_id, node_id, map_key = map_setup
++    # Second node for a second work item.
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            node2 = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash,
++                                     embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'Second node', $3,
++                        array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++                RETURNING id
++                """,
++                tenant_a,
++                team_a,
++                f"hash-child2-{uuid4().hex}",
++            )
++            await conn.execute(
++                """
++                INSERT INTO memory_map_membership
++                    (memory_id, root_memory_id, tenant_id, node_role, turn, authored_by)
++                VALUES ($1, $2, $3, 'position', 'owner', 'owner')
++                """,
++                node2,
++                root_mem_id,
++                tenant_a,
++            )
++            node2 = UUID(str(node2))
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await _setup_signoff_item(
++            conn, tenant_id=tenant_a, team_id=team_a,
++            root_mem_id=root_mem_id, node_id=node_id, map_key=map_key,
++            current_stage="in_progress",
++        )
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node2,
++            kind="story",
++        )
++        # Set current_stage for the second item.
++        await conn.execute(
++            "UPDATE work_items SET current_stage = $1 WHERE memory_id = $2",
++            "in_progress",
++            node2,
++        )
++        await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            to_stage="done",
++            reason="first",
++            proposer_tenant_id=tenant_a,
++        )
++        await propose_move(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node2,
++            to_stage="done",
++            reason="second",
++            proposer_tenant_id=tenant_a,
++        )
++    async with tenant_tx(pg_pool, member1) as conn:
++        signoffs = await workflow_reads.list_pending_signoffs_for_user(
++            conn,
++            tenant_id=member1,
++            team_id=team_a,
++            signatory_tenant_id=member1,
++        )
++    assert len(signoffs) == 2
++    # Ordered by created_at ASC — first proposal first.
++    assert signoffs[0].reason == "first"
++    assert signoffs[1].reason == "second"
++    assert signoffs[0].memory_id == node_id
++    assert signoffs[1].memory_id == node2

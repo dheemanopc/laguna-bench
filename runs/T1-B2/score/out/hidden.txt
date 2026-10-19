@@ -1,0 +1,156 @@
+NOTICE:  database "sc_t1_h_989011" does not exist, skipping
+.....FF.............F..............                                      [100%]
+=================================== FAILURES ===================================
+__________ TestAuditTrail.test_denial_records_the_missing_permission ___________
+
+self = <tests.integration.test_admin_tools.TestAuditTrail object at 0x7e60dc21cf20>
+plain_ctx = ToolContext(request_id='1f7565ae-4d81-4d01-ae38-1d27686a4c01', tenant_id=UUID('f9b6789b-ea6a-45d3-bbff-36ed38980103'),...uotas object at 0x7e60dc284d40>, nli=<mem_mcp.memory.contradiction.NoopContradictionChecker object at 0x7e60dc2852e0>))
+pg_pool = <asyncpg.pool.Pool object at 0x7e60dc3ab280>
+
+    async def test_denial_records_the_missing_permission(
+        self, plain_ctx: ToolContext, pg_pool: Any
+    ) -> None:
+        import json
+    
+        with pytest.raises(JsonRpcError):
+            await AdminGetUserTool()(plain_ctx, AdminGetUserInput(tenant_id=uuid4()))
+    
+        rows = await _audit_rows(pg_pool, plain_ctx.tenant_id)
+        details = rows[0]["details"]
+        if isinstance(details, str):
+            details = json.loads(details)
+>       assert details["via"] == "mcp"
+               ^^^^^^^^^^^^^^
+E       KeyError: 'via'
+
+tests/integration/test_admin_tools.py:188: KeyError
+_____________ TestFindUsers.test_matches_email_case_insensitively ______________
+
+self = <tests.integration.test_admin_tools.TestFindUsers object at 0x7e60dc1f3b90>
+admin_ctx = ToolContext(request_id='19b35f9d-689f-44ee-908f-ed05b3f295b8', tenant_id=UUID('619fe590-8f9a-449f-b5ea-a4c3329f7c25'),...uotas object at 0x7e60dc287650>, nli=<mem_mcp.memory.contradiction.NoopContradictionChecker object at 0x7e60dc284e90>))
+pg_pool = <asyncpg.pool.Pool object at 0x7e60dc3aac80>
+
+    async def test_matches_email_case_insensitively(
+        self, admin_ctx: ToolContext, pg_pool: Any
+    ) -> None:
+        async with system_tx(pg_pool) as conn:
+            rows = await find_users(conn, query="ADMIN-")
+>       assert any(r.tenant_id == str(admin_ctx.tenant_id) for r in rows)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/integration/test_admin_tools.py:198: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/integration/test_admin_tools.py:198: in <genexpr>
+    assert any(r.tenant_id == str(admin_ctx.tenant_id) for r in rows)
+               ^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = AdminUserSummary(id='619fe590-8f9a-449f-b5ea-a4c3329f7c25', email='<email>(2026, 10, 15, 20, 52, 33, 525949, tzinfo=datetime.timezone.utc), workspace_domain=None, is_primary=True)
+item = 'tenant_id'
+
+    def __getattr__(self, item: str) -> Any:
+        private_attributes = object.__getattribute__(self, '__private_attributes__')
+        if item in private_attributes:
+            attribute = private_attributes[item]
+            if hasattr(attribute, '__get__'):
+                return attribute.__get__(self, type(self))  # type: ignore
+    
+            try:
+                # Note: self.__pydantic_private__ cannot be None if self.__private_attributes__ has items
+                return self.__pydantic_private__[item]  # type: ignore
+            except KeyError as exc:
+                raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}') from exc
+        else:
+            # `__pydantic_extra__` can fail to be set if the model is not yet fully initialized.
+            # See `BaseModel.__repr_args__` for more details
+            try:
+                pydantic_extra = object.__getattribute__(self, '__pydantic_extra__')
+            except AttributeError:
+                pydantic_extra = None
+    
+            if pydantic_extra and item in pydantic_extra:
+                return pydantic_extra[item]
+            else:
+                if hasattr(self.__class__, item):
+                    return super().__getattribute__(item)  # Raises AttributeError if appropriate
+                else:
+                    # this is the current error
+>                   raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
+E                   AttributeError: 'AdminUserSummary' object has no attribute 'tenant_id'
+
+../../../../../wt/lead/.venv/lib/python3.12/site-packages/pydantic/main.py:1042: AttributeError
+_____ TestTeamAdminIsNotSystemAdmin.test_team_owner_cannot_enumerate_users _____
+
+self = <tests.security.test_admin_isolation.TestTeamAdminIsNotSystemAdmin object at 0x7e60dc240920>
+pg_pool = <asyncpg.pool.Pool object at 0x7e60dc3a8f40>
+
+    async def test_team_owner_cannot_enumerate_users(self, pg_pool: Any) -> None:
+        """Owning a team does not let you list the instance's users.
+    
+        The caller here is the creator/owner of a team — the strongest
+        team-scoped role available — and must still be refused.
+        """
+        from mem_mcp.teams.assignments import assign_role
+    
+        tenant_id = uuid4()
+        identity_id = uuid4()
+        team_id = uuid4()
+        email = f"teamowner-{tenant_id}@sec-admin.invalid"
+    
+        async with system_tx(pg_pool) as conn:
+            await conn.execute(
+                "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
+                tenant_id,
+                email,
+            )
+            await conn.execute(
+                """
+                INSERT INTO tenant_identities
+                    (id, tenant_id, cognito_sub, provider, email, is_primary)
+                VALUES ($1, $2, $3, 'cognito', $4, true)
+                """,
+                identity_id,
+                tenant_id,
+                f"sub-{tenant_id}",
+                email,
+            )
+            await conn.execute(
+                """
+                INSERT INTO teams (id, name, workspace_domain, created_by_tenant_id)
+                VALUES ($1, 'sec-probe', NULL, $2)
+                """,
+                team_id,
+                tenant_id,
+            )
+            await assign_role(
+                conn,
+                parent_team_id=team_id,
+                member_kind="user",
+                member_id=tenant_id,
+                role_key="owner",
+                assigned_by_user_id=tenant_id,
+            )
+    
+        ctx = ToolContext(
+            request_id=str(uuid4()),
+            tenant_id=tenant_id,
+            identity_id=identity_id,
+            client_id="sec-admin",
+            scopes=frozenset({"memory.read", "memory.write"}),
+            db_pool=pg_pool,
+        )
+    
+        tool = AdminFindUserTool()
+        with pytest.raises(JsonRpcError) as exc:
+            await tool(ctx, AdminFindUserInput(query="teamowner-"))
+>       assert exc.value.data is not None
+E       AssertionError: assert None is not None
+E        +  where None = JsonRpcError('tool deps not wired').data
+E        +    where JsonRpcError('tool deps not wired') = <ExceptionInfo JsonRpcError('tool deps not wired') tblen=2>.value
+
+tests/security/test_admin_isolation.py:98: AssertionError
+=========================== short test summary info ============================
+FAILED tests/integration/test_admin_tools.py::TestAuditTrail::test_denial_records_the_missing_permission
+FAILED tests/integration/test_admin_tools.py::TestFindUsers::test_matches_email_case_insensitively
+FAILED tests/security/test_admin_isolation.py::TestTeamAdminIsNotSystemAdmin::test_team_owner_cannot_enumerate_users
+3 failed, 32 passed in 0.85s

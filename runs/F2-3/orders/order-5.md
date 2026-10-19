@@ -1,0 +1,12 @@
+The architect reviewed your design and asked for revisions:
+
+VERDICT: REVISE
+
+1. The schema in §1 won't migrate as written. §1.3 RLS uses `team_id = ANY(...)` on `workflow_statuses`, `workflow_transitions`, `workflow_transition_approver_roles` and `work_item_signoff_approvals`, but §1.1 gives none of them a `team_id` column. `from_status` is nullable yet sits in a PRIMARY KEY (§1.1:54,61), and Postgres forbids NULL in PK columns, which breaks the initial-status model (E5). `UNIQUE(team_id, schema_version)` with `DEFAULT 1` (§1.1:32-37) makes the insert of version 2 fail.
+2. Terminal rules contradict the default workflow. §2.5 says terminal means no outgoing moves and marks done/cancelled terminal, but today's `TRANSITIONS` has `done→in_progress` and `cancelled→todo` (work_items.py:45-46). That breaks §5's "byte-for-byte identity" (Risk 2). The E3 cycle rule ("exit within one more hop") would also reject the todo↔in_progress↔blocked cycles in the default workflow.
+3. E7/§3 "reject + write `transition_blocked` history" can't work: the tool raises `map_work_item_error` inside `tenant_tx` (mindmap_work_set_status.py:44-60), so the rollback discards the history row and the audit. The design needs to say how the blocked attempt gets persisted, or drop it.
+4. History for workflow changes (R5 covering the new metadata) is still undecided. §5 and §8 R-A defer `memory_id NULL` vs `team_workflow_event_log` "to Stage 2", but this document is Stage 2. Pick one.
+5. R8/R3 gaps. §7 maps R8 to `GET …/waiting`, but §4 never defines that endpoint. §2.4 defines an eligible approver as "a tenant", while approvals are keyed by identity and teams span tenants. §2.6 `rebase_existing_items` (a bulk rebase at edit time) overlaps with §2.7 per-item rebase and its semantics aren't defined.
+
+
+Revise docs/feature/02-design.md accordingly (no code). When done, end your turn with a 3-line summary of what you changed.

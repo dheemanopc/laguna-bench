@@ -1,0 +1,11 @@
+{
+  "key": "wp2-t5-peer",
+  "status": "ok",
+  "compactions": 0,
+  "rc": 0,
+  "session_id": "eed9db2f-a723-4581-9536-ef3a538903db",
+  "wall_s": 20,
+  "ctx_max": 30093,
+  "result": "VERDICT: ISSUES\n1. `src/mem_mcp/mcp/tools/mindmap_workflow_propose_move.py:62`: The tool never discriminates `WorkItem | WorkflowSignoffRequest`, which the plan (wp2.md:49-52) and the acceptance require. `move_work_item` still returns only `WorkItem` (`work_items.py:968`), and no WP1 widening is in the diff. The tool guesses `awaiting_signoff` from `item.current_stage == inp.to_stage`. If an item is already in `to_stage`, or the stage changes concurrently, the guess can be wrong.\n2. `src/mem_mcp/mcp/tools/mindmap_workflow_propose_move.py:67-85`: After the move, the tool re-queries `workflow_signoff_requests` for the latest pending row matching `to_stage`. It can therefore return the `request_id` of an older pending request instead of the one this call created. It also calls the private `workflow_moves._find_transition` and reads the table directly, which bypasses the service layer that `CONVENTIONS.md` requires. Both are workarounds for the missing union return.\n3. `tests/integration/test_mindmap_workflow_propose_move_e2e.py:232-248`: The signoff test checks `signoff_min` but not `signoff_roles` or `from_stage`. It builds its SQL by f-string interpolation. Nothing tests a sequence that would expose finding 2, such as a second propose or an existing pending request.\n4. `tests/integration/test_mindmap_workflow_propose_move_e2e.py:251-258`: `test_move_blocked_maps` moves `review` → `review` with no stated reason that `MoveBlockedError` is the result. I couldn't run it (the sandbox blocked pytest), so I can't confirm it is blocked rather than `invalid_transition`. The plan also lists `reason_required`, `invalid_transition`, `signoff_required` and `role_restricted` (-32000) errors, and `expected_stage` race handling. None of these has a test.",
+  "stderr_tail": ""
+}

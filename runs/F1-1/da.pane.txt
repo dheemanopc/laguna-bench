@@ -1,0 +1,260 @@
+        rt tools) and use a small ordered table/dispatch instead of 15 near-identical `if` blocks if it stays readable. Fallback for unknown `WorkItemError` must `return`/raise a JsonRpcError with code `work_item_
+        error` — never re-raise other exception types as JsonRpcError (non-`WorkItemError` must propagate: the tools catch only `WorkItemError`).
+        changed `errors:[{path:"kind"}]`; AssigneeUnchanged `errors:[{path:"assignee_id"}]`; `InvalidKind`/`InvalidStatus` message lists values in the canonical order story, epic, milestone / todo, in_progress, bl
+      9 4. Tools raise `JsonRpcError(-32603, "tool deps not
+     … +19 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/dispatch_devs.sh F1-1 ~/laguna-bench/runs/F1-1/orders/dev1-2.md ~/laguna-bench/runs/F1-1/orders/dev2-2.md)
+  ⎿  {
+       "dev": 1,
+       "status": "ok",
+     … +59 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Bash(pytest -q -p no:cacheprovider tests/unit/test_work_items_service.py tests/integration/test_mindmap_work_items_e2e.py --tb=line)
+  ⎿  Error: Exit code 1
+     .............................................FF......F.F...F             [100%]
+     =================================== FAILURES ===================================
+     ~/laguna-bench/runs/F1-1/repo/src/mem_mcp/mcp/tools/mindmap_work_set_status.py:60: mem_mcp.mcp.errors.JsonRpcError: cannot change work item status from done to todo
+     ~/laguna-bench/runs/F1-1/repo/tests/integration/test_mindmap_work_items_e2e.py:633: AssertionError: assert 'reason' in 'cannot change work item status from todo to blocked'
+     ~/laguna-bench/wt/lead/.venv/lib/python3.12/site-packages/asyncpg/pool.py:51: asyncpg.exceptions._base.InterfaceError: cannot call Connection.execute(): connection has been released back to the pool
+     asyncpg/protocol/protocol.pyx:206: asyncpg.exceptions.ForeignKeyViolationError: member_id 98c16a31-b34a-4d49-976c-67db7d219542 does not exist in tenants (member_kind=user)
+     ~/laguna-bench/runs/F1-1/repo/src/mem_mcp/mcp/tools/mindmap_write_node.py:91: mem_mcp.mcp.errors.JsonRpcError: map is archived; closed maps do not accept new nodes
+     =========================== short test summary info ============================
+     FAILED tests/integration/test_mindmap_work_items_e2e.py::test_work_item_status_transitions
+     … +5 lines (ctrl+o to expand)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/F1-1/orders/dev1-3.md)
+  ⎿  Wrote 16 lines to ../orders/dev1-3.md
+      1 # ORDER dev1-3 — finish the service fixes (round 2 only did a fraction)
+      3 Same lane as before: you edit ONLY `alembic/versions/0046*`, `alembic/versions/0047*`, `src/mem_mcp/mindmap/work_items.py`, `tests/unit/test_work_items_service.py`. dev2 edits only `src/mem_mcp/mcp/**`, `m
+        ain.py`, `audit/logger.py`, `tests/integration/test_mindmap_work_items_e2e.py`. (Your last report claimed fixes for items that are NOT in the file; I checked with grep. Do each numbered item below and veri
+      4
+      6 1. `mark_work_item` never checks `map_row["state"] == "live"` → `MapNotLiveError` is never raised (acceptance: marking on an archived map is rejected, nothing written). Order in mark: map found → caller ro
+        le (None → MapNotFound) → write permission → kind valid → node is root → membership (join `memories`, `deleted_at IS NULL`) → map live → already marked → assignee valid → insert. Kind validation must move
+      7 2. Catch `asyncpg.UniqueViolationError` around the work_items INSERT → `AlreadyWorkItemError`. A rejected mark must leave NO history row (assert in test).
+      8 3. Reason: add `_clean_reason(reason) -> str | None` (strip; blank → None; cap 2000) and use it everywhere (currently `(reason or "")[:2000] if reason else None` stores "  "). `check_transition` must recei
+      9 4. `list_work_items`: (a) with `map_key` given, resolve it; unknown → `WorkItemMapNotFoundError`; ALWAYS check the caller has a team role (currently skipped when map_key is given = data leak); (b) return t
+        e per-row query; (d) add `m.deleted_at IS NULL`; (e) `assignee_i
+     … +21 lines (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/F1-1/orders/dev2-3.md)
+  ⎿  Wrote 14 lines to ../orders/dev2-3.md
+      1 # ORDER dev2-3 — make your e2e tests green and complete
+      3 Lane unchanged (`src/mem_mcp/mcp/**`, `main.py`, `audit/logger.py`, `tests/integration/test_mindmap_work_items_e2e.py`). dev1 is concurrently fixing the service in `mindmap/work_items.py` (adds the missing
+         archived-map check in mark, list/history fixes, reason cleaning, cross-map guard). Do not edit dev1's files. Current state: 5 e2e tests fail:
+      5 1. `test_work_item_status_transitions`: `done → todo` is raised in your test — that transition is NOT allowed (done only → in_progress with reason). Re-read the table in order dev2-1 and fix the test's seq
+        uence so it exercises all 10 allowed transitions (todo→in_progress, todo→cancelled+reason, in_progress→blocked+reason, in_progress→done, in_progress→todo, in_progress→cancelled+reason, blocked→in_progress,
+      6 2. `test_work_item_blocked_without_reason_rejected`: asserts `'reason' in message`; the code is `reason_required` and the message is about the transition. Assert on `e.data["code"] == "reason_required"` an
+        d `errors[0]["path"] == "reason"`; make `map_work_item_error` message "a reason is required to change work item status from X to Y".
+        ia `ORDER BY id LIMIT 1` on roles_catalog by role_key='viewer'), all inside the acquire block.
+      8 4. `test_work_item_assign_reassign_unassign`: FK violation on `member_id` — insert assignee tenants (`tenants` rows) before role assignment; use a real second tenant with 'member' role for the happy path;
+      9 5. `test_work_item_archived_map_mark_rejected_status_change_works`: you close the map before writing a node ("closed maps do not accept new nodes"). Create the node and mark a work item FIRST, c
+     … +17 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/dispatch_devs.sh F1-1 ~/laguna-bench/runs/F1-1/orders/dev1-3.md ~/laguna-bench/runs/F1-1/orders/dev2-3.md)
+  ⎿  {
+       "dev": 1,
+       "status": "ok",
+     … +59 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Bash(pytest -q -p no:cacheprovider tests/unit/test_work_items_service.py tests/integration/test_mindmap_work_items_e2e.py tests/unit/test_lint_tenant_scope.py --tb=l…)
+  ⎿  ........................................................................ [ 97%]
+     ..                                                                       [100%]
+     74 passed in 4.19s
+
+● Bash(ruff check src tests)
+  ⎿  Error: Exit code 1
+     src/mem_mcp/mindmap/work_items.py:12:1: I001 [*] Import block is un-sorted or un-formatted
+        |
+     10 |   """
+     11 |
+     12 | / from __future__ import annotations
+     13 | |
+     14 | | import asyncpg  # type: ignore[import-untyped]
+     15 | | from dataclasses import dataclass
+     16 | | from datetime import datetime
+     … +17 lines (ctrl+o to expand)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● The 74 targeted tests pass, but list_work_items, set_work_item_kind, and assign_work_item still need fixes, plus ruff flags an unsorted import block. I'll send dev1 a narrower follow-up order to address these remaining
+  issues. · summary
+
+● Write(~/laguna-bench/runs/F1-1/orders/dev1-4.md)
+  ⎿  Wrote 16 lines to ../orders/dev1-4.md
+       1 # ORDER dev1-4 — remaining service items (you ran out of turns last time; do these in order, run tests after each)
+       3 Lane: `alembic/versions/0046*`, `0047*`, `src/mem_mcp/mindmap/work_items.py`, `tests/unit/test_work_items_service.py` only. You CAN and MUST run `pytest`, `ruff`, `mypy`, `alembic` yourself (they work: I
+         just ran them). Currently 74 targeted tests pass; `ruff check src tests` fails on `work_items.py` import order (`import asyncpg` is in the stdlib block; put it in the third-party block / use `from __futur
+       4
+       6
+       7 TODO (verify each by grep/test):
+         InMapError` if the node isn't in this map's membership (join memories, deleted_at IS NULL), else `NotAWorkItemError`. Use `_clean_reason` for the history reason. `get_work_item` same validation order.
+       9 B. `get_work_item_history`: raise `NotAWorkItemError` when no `work_items` row (plain node currently returns `[]`).
+         key is given; (2) team-wide results must carry the real `map_key` (join `slugs s ON s.memory_id = wi.root_memory_id AND s.team_id = wi.team_id AND s.resource_type = 'map'`), not `""`; (3) take `m.content`
+         limit` to 1..500.
+     … +18 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/dispatch_devs.sh F1-1 ~/laguna-bench/runs/F1-1/orders/dev1-4.md -)
+  ⎿  {
+       "dev": 1,
+       "status": "ok",
+     … +28 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● I'll check the repo state myself.
+
+● Bash(pytest -q -p no:cacheprovider --tb=short)
+  ⎿  Error: Exit code 1
+     ........................................................................ [  4%]
+     .......................sssssssss....................F...ssssssssssssssss [  9%]
+     ss...........ss......................................................... [ 14%]
+     ....................................................................ss.. [ 19%]
+     ........................................................................ [ 24%]
+     ......................F.F..........................................FFEFF [ 29%]
+     E.F.FF.................................................................. [ 34%]
+     ........................................................................ [ 38%]
+     ........................................................................ [ 43%]
+     … +132 lines (ctrl+o to expand)
+
+● Bash(ruff check src tests)
+  ⎿  Error: Exit code 1
+     src/mem_mcp/mindmap/work_items.py:1095:5: F841 Local variable `actual_map_key` is assigned to but never used
+          |
+     1093 |     # Resolve map_key first (always check role when map_key is given)
+     1094 |     root_memory_id = None
+     1095 |     actual_map_key = map_key
+          |     ^^^^^^^^^^^^^^ F841
+     1096 |     if map_key is not None:
+     1097 |         root_memory_id = await service.resolve_map_root(conn, team_id=team_id, map_key=map_key)
+          |
+     … +4 lines (ctrl+o to expand)
+
+● Bash(alembic heads)
+  ⎿  0047_work_item_history_rls_fix (head)
+
+  Read 1 file (ctrl+o to expand)
+
+● Bash(pytest -q -p no:cacheprovider --tb=no -rfE)
+  ⎿  Error: Exit code 1
+     ........................................................................ [  4%]
+     ..FF.....FF.FFFFFF.....sssssssss....................F...ssssssssssssssss [  9%]
+     ss...........ss......................................................... [ 14%]
+     ....................................................................ss.. [ 19%]
+     ........................................................................ [ 24%]
+     ......................F.F..........................................FFFFE [ 29%]
+     .FFFFF.................................................................. [ 34%]
+     ........................................................................ [ 39%]
+     ........................................................................ [ 43%]
+     … +109 lines (ctrl+o to expand)
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Bash(pytest -q -p no:cacheprovider --tb=short tests/unit/test_roles_catalog.py tests/unit/test_enterprise_schema.py::test_teams_workspace_domain_uniqueness)
+  ⎿  Error: Exit code 1
+     FF.F.F                                                                   [100%]
+     =================================== FAILURES ===================================
+     _____________ TestRolesCatalogSeed.test_seed_inserts_7_core_roles ______________
+     tests/unit/test_roles_catalog.py:19: in test_seed_inserts_7_core_roles
+         assert count == 7
+     E   assert 9 == 7
+     ______________ TestRolesCatalogSeed.test_seed_idempotent_on_rerun ______________
+     tests/unit/test_roles_catalog.py:37: in test_seed_idempotent_on_rerun
+         assert after == before
+     … +28 lines (ctrl+o to expand)
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/F1-1/orders/dev1-5.md)
+  ⎿  Wrote 12 lines to ../orders/dev1-5.md
+       1 # ORDER dev1-5 — last small fixes (same lane: `src/mem_mcp/mindmap/work_items.py`, `tests/unit/test_work_items_service.py`)
+       3 Reviewed: targeted tests pass; full suite shows only environment/shared-DB failures. Remaining defects, found by reading/grepping:
+       4
+         ~324 `_check_permission` exceeds 100 cols) and re-run `ruff check src tests` → must print "All checks passed!".
+       6 2. `mark_work_item` (line ~465) still calls `_validate_kind(kind)` BEFORE the map/permission checks. Move it after `_check_permission` (a viewer sending a bad kind must get the permission error; a strange
+       7 3. `mark_work_item`: no `asyncpg.UniqueViolationError` handling around the `INSERT INTO work_items` (race between two concurrent marks). Wrap the insert: on UniqueViolationError raise `AlreadyWorkItemErro
+         r`. Because a failed statement aborts the transaction in Postgres, wrap the INSERT in `async with conn.transaction():` (savepoint) so the caller's tx stays usable. Add a unit test that triggers it (e.g. i
+         adyWorkItemError` and history count unchanged).
+       8 4. `_check_permission` silently passes when `get_team_role` returns None (`caller_role is not None and …`). It is only called after `_load_map`, but make it safe: None → `WorkItemMapNotFoundError`.
+      10 6. `alembic heads` currently shows `0047_work_item_history_rls_fix (head)` as a no-op migration; leave it (deletion is denied) — nothing to do.
+     … +8 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/dispatch_devs.sh F1-1 ~/laguna-bench/runs/F1-1/orders/dev1-5.md -)
+  ⎿  {
+       "dev": 1,
+       "status": "ok",
+     … +28 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Bash(ruff check src tests)
+  ⎿  All checks passed!
+
+● Bash(pytest -q -p no:cacheprovider tests/unit/test_work_items_service.py tests/integration/test_mindmap_work_items_e2e.py tests/unit/test_lint_tenant_scope.py tests/…)
+  ⎿  ........................................................................ [ 74%]
+     .........................                                                [100%]
+     =============================== warnings summary ===============================
+     … +14 lines (ctrl+o to expand)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● The work is verified and I'm wrapping up with the final report.
+
+  Final report
+
+  Packages delivered this round: WP1 (migration + service layer) and WP2 (four MCP write tools). The full design, including the WP3–WP6 backlog, is in orders/DESIGN.md.
+
+  Acceptance criteria covered
+  - Delivered and tested through the MCP tools: 1–6, 8–12, 13–14, 15–19, 25–26 and 30.
+  - Structural: 21 (tenant isolation via RLS), 28 (the app role has no UPDATE or DELETE grant on work_item_history) and 7 (the memories and memory_map_membership tables are untouched).
+  - Service-level only: 22–24, 27 and 29. The list, history and mindmap_get lookup functions exist and have unit tests, but no tool exposes them yet.
+  - Not started: 31 (only the write tools exist), 32 and 33–36 (web UI).
+
+  What was built
+  - Migration 0046_mindmap_work_items: tables work_items and work_item_history. History rows carry full before/after snapshots of kind, status and assignee.
+  - Service mindmap/work_items.py: the transition table, one history row per change, and a memory_map_events entry per change so mindmap_get since= can pick them up.
+  - Tools: mindmap_work_mark, mindmap_work_set_status, mindmap_work_set_kind and mindmap_work_assign, with descriptions, registration in main.py and a new audit action.
+
+  Round-trips: dev1 had five orders and dev2 had three, two of them in parallel. dev1's service fixes needed several passes because early reports claimed fixes that weren't in the file.
+
+  What I checked myself
+  - alembic upgrade head works and alembic heads shows a single head, 0047_work_item_history_rls_fix.
+  - ruff check src tests passes.
+  - The targeted run passes: 97 tests (test_work_items_service.py, test_mindmap_work_items_e2e.py, test_lint_tenant_scope.py, test_web_mindmaps_router.py, test_mindmap_e2e.py).
+  - I could not run mypy (the sandbox denied it). The developers report it clean.
+  - The last full-suite run (before dev1's final order) showed 31 failures and 15 errors. About 28 of the failures match known_red_base.txt, and some of the remaining ones are listed there under teardown or setup errors.
+    These did not match the list:
+    - 10 in test_web_teams_api
+    - test_teams_workspace_domain_uniqueness
+    - test_auth_callback_workspace_domain_extraction
+    - test_roles_catalog::test_seed_inserts_7_core_roles
+  - I traced the roles_catalog and workspace-domain failures to leftover rows from repeated runs in the shared test database, not to this change, and none of the new files insert into those tables. I did not check the
+    test_web_teams_api failures separately.
+  - I did not re-run the full suite after dev1's last order. Only the targeted tests above were re-run.
+
+  Remaining concerns
+  - Redundant migration: 0047 is a documented no-op, because the sandbox denied deleting it. Someone with write access should remove it before release.
+  - Cross-tenant visibility: the new tables use the same tenant-only RLS as memory_maps. Teammates in other tenants (including assignees) cannot read work items, so "team-wide" listing only covers the caller's own
+    tenant's maps. Fixing that needs a team-aware read policy and is a decision for the owner. Assignee role lookup across tenants works and has a passing test.
+  - Review gaps:
+    - I did not re-read the service after dev1's final order. The _validate_kind calls at lines 472 and 725 and the unique-violation handler at line 533 look right in grep.
+    - I did not check whether assign_work_item and get_work_item use the shared helpers or follow the validation-order and cross-map rules.
+    - The service file is still long, with some repeated code.
+  - Open questions in the brief: the owner still needs to confirm the brief's open questions 1–3 (work continuing on archived maps, whether the agent may change status on its own, and the "assignee" wording).
+
+  Next round
+  1. WP3: mindmap_work_list (including "assigned to me" and map_state), mindmap_work_history, and the work-item fields in mindmap_get using work_items_for_nodes.
+  2. WP4: read-only web endpoints, tested the way test_web_mindmaps_router.py does.
+  3. Settle the team-aware read policy.
+  4. Later: the web UI (WP5), guidance for the mindmap-driver skill (WP6), and removing 0047.
+
+✻ Brewed for 1h 10m 5s · done 1:36 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+
+

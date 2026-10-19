@@ -1,0 +1,5632 @@
+diff --git a/alembic/versions/0046_2026_10_16_mindmap_work_items.py b/alembic/versions/0046_2026_10_16_mindmap_work_items.py
+new file mode 100644
+index 0000000..f343c20
+--- /dev/null
++++ b/alembic/versions/0046_2026_10_16_mindmap_work_items.py
+@@ -0,0 +1,164 @@
++"""mindmap work items — task tracking on nodes.
++
++A mind-map node can be marked as a "work item" (kind story|epic|milestone;
++status todo|in_progress|blocked|done|cancelled; optional assignee = a team member)
++with an append-only history.
++
++- `work_items`: tracks the current state of a work item on a node.
++- `work_item_history`: append-only audit of all state changes (created, status,
++  owner, kind transitions).
++
++RLS follows the canonical `safe_current_tenant_id()` pattern (migration 0034).
++
++assignee_id deliberately has NO FK to tenants.id. This allows a removed member
++to remain visible as assignee for historical context — their identity stays
++referenced even after their role is revoked.
++
++work_item_history is append-only by design: UPDATE/DELETE are disallowed
++to maintain an immutable audit trail. We do not grant UPDATE/DELETE on this
++table to prevent accidental corruption of the history.
++
++Revision ID: 0046_mindmap_work_items
++Revises: 0045_fix_turn_backfill
++Create Date: 2026-10-16
++"""
++
++from __future__ import annotations
++
++import sqlalchemy as sa
++
++from alembic import op
++
++revision = "0046_mindmap_work_items"
++down_revision = "0045_fix_turn_backfill"
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    # ---- work_items ---------------------------------------------------------
++    op.execute(
++        sa.text("""
++        CREATE TABLE work_items (
++            memory_id           UUID PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
++            root_memory_id      UUID NOT NULL REFERENCES memory_maps(root_memory_id) ON DELETE CASCADE,
++            tenant_id           UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
++            team_id             UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
++            kind                TEXT NOT NULL CHECK (kind IN ('story','epic','milestone')),
++            status              TEXT NOT NULL DEFAULT 'todo'
++                              CHECK (status IN ('todo','in_progress','blocked','done','cancelled')),
++            assignee_id         UUID NULL,
++            created_by          UUID NOT NULL,
++            created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
++            updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
++            status_changed_at   TIMESTAMPTZ NOT NULL DEFAULT now()
++        )
++    """)
++    )
++
++    # Index on (tenant_id, team_id, status) for filtering work items
++    op.execute(
++        sa.text(
++            "CREATE INDEX work_items_tenant_team_status_idx "
++            "ON work_items (tenant_id, team_id, status)"
++        )
++    )
++
++    # Index on root_memory_id for map-wide queries
++    op.execute(sa.text("CREATE INDEX work_items_root_memory_idx " "ON work_items (root_memory_id)"))
++
++    # Partial index for unassigned work items
++    op.execute(
++        sa.text(
++            "CREATE INDEX work_items_assignee_idx "
++            "ON work_items (assignee_id) "
++            "WHERE assignee_id IS NOT NULL"
++        )
++    )
++
++    # ---- work_item_history (append-only) ------------------------------------
++    op.execute(
++        sa.text("""
++        CREATE TABLE work_item_history (
++            id                  BIGSERIAL PRIMARY KEY,
++            memory_id           UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
++            root_memory_id      UUID NOT NULL,
++            tenant_id           UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
++            team_id             UUID NOT NULL,
++            change_type         TEXT NOT NULL CHECK (change_type IN ('created','status','owner','kind')),
++            -- Before/after snapshot (for 'created', all *_before are NULL)
++            kind_before         TEXT NULL,
++            kind_after          TEXT NOT NULL,
++            status_before       TEXT NULL,
++            status_after        TEXT NOT NULL,
++            assignee_before     UUID NULL,
++            assignee_after      UUID NULL,
++            actor_id            UUID NOT NULL,
++            channel             TEXT NOT NULL CHECK (channel IN ('mcp','web')),
++            reason              TEXT NULL,
++            created_at          TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
++        )
++    """)
++    )
++
++    # Index on (memory_id, id) for history lookup
++    op.execute(
++        sa.text("CREATE INDEX work_item_history_memory_idx " "ON work_item_history (memory_id, id)")
++    )
++
++    # Index on (tenant_id, actor_id, created_at) for tenant-scoped audit queries
++    op.execute(
++        sa.text(
++            "CREATE INDEX work_item_history_tenant_actor_idx "
++            "ON work_item_history (tenant_id, actor_id, created_at)"
++        )
++    )
++
++    # ---- RLS policies --------------------------------------------------------
++    for table in ("work_items", "work_item_history"):
++        op.execute(sa.text(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"))
++        op.execute(
++            sa.text(
++                f"CREATE POLICY {table}_select ON {table} FOR SELECT TO mem_app "
++                "USING (tenant_id = safe_current_tenant_id())"
++            )
++        )
++        op.execute(
++            sa.text(
++                f"CREATE POLICY {table}_insert ON {table} FOR INSERT TO mem_app "
++                "WITH CHECK (tenant_id = safe_current_tenant_id())"
++            )
++        )
++
++    # work_items needs UPDATE policy for status/kind changes
++    op.execute(
++        sa.text(
++            "CREATE POLICY work_items_update ON work_items FOR UPDATE TO mem_app "
++            "USING (tenant_id = safe_current_tenant_id()) "
++            "WITH CHECK (tenant_id = safe_current_tenant_id())"
++        )
++    )
++    op.execute(sa.text("GRANT SELECT, INSERT, UPDATE ON work_items TO mem_app"))
++
++    # work_item_history is append-only: SELECT + INSERT only
++    # Deny all UPDATE and DELETE to enforce append-only
++    op.execute(
++        sa.text(
++            "CREATE POLICY work_item_history_update_deny ON work_item_history "
++            "FOR UPDATE TO mem_app USING (false)"
++        )
++    )
++    op.execute(
++        sa.text(
++            "CREATE POLICY work_item_history_delete_deny ON work_item_history "
++            "FOR DELETE TO mem_app USING (false)"
++        )
++    )
++    op.execute(sa.text("GRANT SELECT, INSERT ON work_item_history TO mem_app"))
++    op.execute(sa.text("GRANT USAGE, SELECT ON SEQUENCE work_item_history_id_seq TO mem_app"))
++
++
++def downgrade() -> None:
++    # Drop in reverse order of creation
++    op.execute(sa.text("DROP TABLE IF EXISTS work_item_history"))
++    op.execute(sa.text("DROP TABLE IF EXISTS work_items"))
+diff --git a/alembic/versions/0047_2026_10_16_work_item_history_rls_fix.py b/alembic/versions/0047_2026_10_16_work_item_history_rls_fix.py
+new file mode 100644
+index 0000000..2679009
+--- /dev/null
++++ b/alembic/versions/0047_2026_10_16_work_item_history_rls_fix.py
+@@ -0,0 +1,30 @@
++"""work_item_history RLS policies - superseded migration.
++
++This migration is now a no-op because the RLS policies for work_item_history
++already exist in migration 0046_mindmap_work_items. This file is kept only
++because it has already been applied in development databases.
++
++Revision ID: 0047_work_item_history_rls_fix
++Revises: 0046_mindmap_work_items
++Create Date: 2026-10-16
++"""
++
++from __future__ import annotations
++
++from alembic import op
++
++
++revision = "0047_work_item_history_rls_fix"
++down_revision = "0046_mindmap_work_items"
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    """No-op: policies live in 0046_mindmap_work_items."""
++    pass
++
++
++def downgrade() -> None:
++    """No-op: policies live in 0046_mindmap_work_items."""
++    pass
+\ No newline at end of file
+diff --git a/src/mem_mcp/audit/logger.py b/src/mem_mcp/audit/logger.py
+index 557139e..5186a84 100644
+--- a/src/mem_mcp/audit/logger.py
++++ b/src/mem_mcp/audit/logger.py
+@@ -87,6 +87,8 @@ AUDIT_ACTIONS: tuple[str, ...] = (
+     "skill.kite.intent_confirmed",
+     "skill.kite.intent_cancelled",
+     "skill.kite.intent_smoke_failed",
++    # mindmap work items
++    "mindmap.work_item_changed",
+     # admin tools (memsys_admin_*) — recorded on allow AND deny, see
+     # mcp/tools/_admin_base.py
+     "admin.find_user",
+@@ -140,6 +142,8 @@ AuditAction = Literal[
+     "skill.kite.intent_confirmed",
+     "skill.kite.intent_cancelled",
+     "skill.kite.intent_smoke_failed",
++    # mindmap work items
++    "mindmap.work_item_changed",
+     "admin.find_user",
+     "admin.get_user",
+ ]
+diff --git a/src/mem_mcp/main.py b/src/mem_mcp/main.py
+index b78eb48..e0afa76 100644
+--- a/src/mem_mcp/main.py
++++ b/src/mem_mcp/main.py
+@@ -75,6 +75,10 @@ from mem_mcp.mcp.tools.mindmap_open import MindmapOpenTool
+ from mem_mcp.mcp.tools.mindmap_queue import MindmapListTool, MindmapQueueTool
+ from mem_mcp.mcp.tools.mindmap_resolve import MindmapResolveTool
+ from mem_mcp.mcp.tools.mindmap_review import MindmapReviewTool
++from mem_mcp.mcp.tools.mindmap_work_assign import MindmapWorkAssignTool
++from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++from mem_mcp.mcp.tools.mindmap_work_set_kind import MindmapWorkSetKindTool
++from mem_mcp.mcp.tools.mindmap_work_set_status import MindmapWorkSetStatusTool
+ from mem_mcp.mcp.tools.mindmap_write_node import MindmapWriteNodeTool
+ from mem_mcp.mcp.tools.refs_in import RefsInTool
+ from mem_mcp.mcp.tools.refs_out import RefsOutTool
+@@ -517,6 +521,11 @@ def _wire_routers(app: FastAPI) -> None:
+         MindmapAnswerTool,
+         MindmapListTool,
+         MindmapQueueTool,
++        # Mindmap work item tools — task tracking on map nodes
++        MindmapWorkMarkTool,
++        MindmapWorkSetStatusTool,
++        MindmapWorkSetKindTool,
++        MindmapWorkAssignTool,
+         # Admin tool family — gated on system.* permissions via AdminTool,
+         # NOT reachable by an ordinary caller. See mcp/tools/_admin_base.py.
+         AdminFindUserTool,
+diff --git a/src/mem_mcp/mcp/tool_descriptions.py b/src/mem_mcp/mcp/tool_descriptions.py
+index 7c495ce..20535da 100644
+--- a/src/mem_mcp/mcp/tool_descriptions.py
++++ b/src/mem_mcp/mcp/tool_descriptions.py
+@@ -480,6 +480,44 @@ After close the map is archived: it no longer surfaces in mindmap_open similarit
+ Do not call until the user has confirmed the decisions. Required scope: memory.write.
+ 
+ Example: mindmap_close(map_key="caching-strategy", confirmed_decisions=[{content:"Adopt Redis for the hot read path", slug_clue:"redis-hot-path", from_node_id:"<position>", ratification_strength:"survived-challenge"}]).""",
++    "mindmap_work_mark": """Mark a map node as a work item (story|epic|milestone) — call this when the user wants to turn a position, challenge, or note into a tracked task.
++
++Call when: user says "make this a task", "track this work", "this is a story for implementation"; a node needs to be systematically tracked like a user story or epic; assigning work to a team member.
++
++Do not call for: brainstorming nodes that won't be shipped; general notes or positions that don't represent work; nodes that aren't clearly tasks.
++
++Work item status is independent of mindmap_resolve (branch status) and mindmap_close (map archive). Status transitions: todo→in_progress|cancelled; in_progress→blocked|done|todo|cancelled; blocked→in_progress|cancelled; done→in_progress; cancelled→todo. Reasons are required for: leaving done/cancelled, and for status→blocked.
++
++The expected_status parameter guards against race conditions (actual status must match, else error). Archived maps: cannot mark new work items, but existing work items can still have status/kind/assignee changes.
++
++Examples: "Mark this as a story" → mindmap_work_mark(map_key="...", node_id="...", kind="story"). "This is blocked by a dependency" → mindmap_work_set_status(node_id="...", status="blocked", reason="waiting on API"). "Assign to Alice" → mindmap_work_assign(node_id="...", assignee_id="<alice-uuid>").""",
++    "mindmap_work_set_status": """Change a work item's status (todo|in_progress|blocked|done|cancelled) — call this when work progress needs to be recorded.
++
++Call when: user says "this is in progress", "blocked on something", "done!", "cancelled"; updating the tracking state of a work item; recording blockers or completions.
++
++Do not call for: marking work items as completed without actually completing them; setting status on non-work-item nodes.
++
++Status transitions: todo→in_progress|cancelled; in_progress→blocked|done|todo|cancelled; blocked→in_progress|cancelled; done→in_progress; cancelled→todo. Reasons are required for: →blocked, →cancelled, and leaving done/cancelled.
++
++The expected_status parameter guards against race conditions. Archived maps: can still change status.
++
++Examples: "Mark as done" → mindmap_work_set_status(node_id="...", status="done", reason="implemented feature X"). "Blocked waiting on API" → mindmap_work_set_status(status="blocked", reason="external dependency").""",
++    "mindmap_work_set_kind": """Change a work item's kind (story|epic|milestone) — call this when the work item needs a different classification.
++
++Call when: user says "actually this is an epic", "this is a milestone", "split into stories"; refining the categorization of tracked work.
++
++Do not call for: changing a node that isn't a work item; changing kind when already set to the requested value.
++
++Examples: "This epic covers multiple stories" → mindmap_work_set_kind(node_id="...", kind="epic"). "That story needs its own work item" → mindmap_work_set_kind(node_id="...", kind="story").""",
++    "mindmap_work_assign": """Assign a work item to a team member, or unassign (pass null) — call this when ownership of a task changes.
++
++Call when: user says "Alice should do this", "I'm assigning to Bob", "unassigned, I'll do it"; changing who owns a work item; removing assignment.
++
++Do not call for: assigning to someone not on the map's team; assigning a non-work-item node.
++
++Assignees must be current owners, admins, or members of the map's team. Archived maps: can still change assignee.
++
++Examples: "Assign to Carol" → mindmap_work_assign(node_id="...", assignee_id="<carol-uuid>"). "Unassign this" → mindmap_work_assign(node_id="...", assignee_id=null).""",
+     "memsys_admin_find_user": """Search every user on the instance by partial email address or display name. Operator tool — requires the system.manage_tenants permission, which only a system_admin holds.
+ 
+ Call when: the user needs a tenant_id they do not have ("what's Manasi's user id?"); you are about to add someone to a team and need to confirm which account is theirs; the user asks who signed up recently, or how many accounts exist matching some name or domain.
+diff --git a/src/mem_mcp/mcp/tools/_work_item_common.py b/src/mem_mcp/mcp/tools/_work_item_common.py
+new file mode 100644
+index 0000000..eef348d
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/_work_item_common.py
+@@ -0,0 +1,195 @@
++"""Shared orchestration and models for mindmap work item tools.
++
++Work items allow marking map nodes as tasks with kind, status, and assignee.
++"""
++
++from __future__ import annotations
++
++from datetime import datetime
++from uuid import UUID
++
++from pydantic import BaseModel
++
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mindmap.work_items import (
++    AlreadyWorkItemError,
++    AssigneeUnchangedError,
++    InvalidAssigneeError,
++    InvalidKindError,
++    InvalidStatusError,
++    InvalidTransitionError,
++    KindUnchangedError,
++    MapNotLiveError,
++    NodeNotInMapError,
++    NotAWorkItemError,
++    ReasonRequiredError,
++    RootNodeNotAllowedError,
++    StatusConflictError,
++    StatusUnchangedError,
++    WorkItemError,
++    WorkItemMapNotFoundError,
++    WorkItemPermissionDeniedError,
++)
++
++# Canonical order for error messages
++KIND_ORDER = ("story", "epic", "milestone")
++STATUS_ORDER = ("todo", "in_progress", "blocked", "done", "cancelled")
++
++
++class WorkItemOutput(BaseModel):
++    """Output model for work item tools."""
++
++    node_id: UUID
++    map_key: str
++    map_state: str
++    kind: str
++    status: str
++    assignee_id: UUID | None
++    title: str
++    created_by: UUID
++    created_at: datetime  # asyncpg returns datetime, Pydantic serializes to ISO 8601
++    updated_at: datetime
++    status_changed_at: datetime
++    request_id: str
++
++
++def map_work_item_error(e: Exception) -> JsonRpcError:
++    """Map a work item service exception to JsonRpcError.
++
++    Non-WorkItemError exceptions propagate unchanged (re-raised).
++    """
++    if not isinstance(e, WorkItemError):
++        raise e
++
++    # Dispatch: map each exception type to its handler
++    if isinstance(e, WorkItemMapNotFoundError):
++        return JsonRpcError(-32602, "map not found", data={"errors": [{"path": "map_key"}]})
++    if isinstance(e, WorkItemPermissionDeniedError):
++        return JsonRpcError(
++            -32603,
++            "permission denied",
++            data={"missing_permission": e.permission.value},
++        )
++    if isinstance(e, NodeNotInMapError):
++        return JsonRpcError(
++            -32602,
++            "node is not a member of this map",
++            data={"errors": [{"path": "node_id"}]},
++        )
++    if isinstance(e, NotAWorkItemError):
++        return JsonRpcError(
++            -32602,
++            "not a work item",
++            data={"code": "not_a_work_item", "errors": [{"path": "node_id"}]},
++        )
++    if isinstance(e, RootNodeNotAllowedError):
++        return JsonRpcError(
++            -32602,
++            "cannot mark the root question node as a work item",
++            data={"code": "root_node_not_allowed", "errors": [{"path": "node_id"}]},
++        )
++    if isinstance(e, AlreadyWorkItemError):
++        return JsonRpcError(
++            -32602,
++            "node is already a work item",
++            data={"code": "already_work_item", "errors": [{"path": "node_id"}]},
++        )
++    if isinstance(e, MapNotLiveError):
++        return JsonRpcError(
++            -32602,
++            "map is archived; archived maps are no-reopen",
++            data={"code": "map_not_live", "errors": [{"path": "map_key"}]},
++        )
++    if isinstance(e, InvalidKindError):
++        allowed = [k for k in KIND_ORDER if k in e.allowed]
++        return JsonRpcError(
++            -32602,
++            f"kind must be one of: {', '.join(allowed)}",
++            data={
++                "code": "invalid_work_item_kind",
++                "errors": [{"path": "kind", "message": f"kind must be one of: {', '.join(allowed)}"}],
++                "allowed": allowed,
++            },
++        )
++    if isinstance(e, InvalidStatusError):
++        allowed = [s for s in STATUS_ORDER if s in e.allowed]
++        return JsonRpcError(
++            -32602,
++            f"status must be one of: {', '.join(allowed)}",
++            data={
++                "code": "invalid_work_item_status",
++                "errors": [{"path": "status", "message": f"status must be one of: {', '.join(allowed)}"}],
++                "allowed": allowed,
++            },
++        )
++    if isinstance(e, InvalidTransitionError):
++        return JsonRpcError(
++            -32602,
++            f"cannot change work item status from {e.current} to {e.requested}",
++            data={
++                "code": "invalid_transition",
++                "current_status": e.current,
++                "requested_status": e.requested,
++                "errors": [{"path": "status"}],
++            },
++        )
++    if isinstance(e, ReasonRequiredError):
++        return JsonRpcError(
++            -32602,
++            f"a reason is required to change work item status from {e.current} to {e.requested}",
++            data={
++                "code": "reason_required",
++                "errors": [{"path": "reason"}],
++                "current_status": e.current,
++                "requested_status": e.requested,
++            },
++        )
++    if isinstance(e, StatusUnchangedError):
++        return JsonRpcError(
++            -32602,
++            "status is already set to the requested value",
++            data={
++                "code": "status_unchanged",
++                "current_status": e.current,
++                "errors": [{"path": "status"}],
++            },
++        )
++    if isinstance(e, StatusConflictError):
++        return JsonRpcError(
++            -32602,
++            f"status conflict: expected {e.expected} but actual is {e.actual}",
++            data={
++                "code": "status_conflict",
++                "current_status": e.actual,
++                "expected_status": e.expected,
++                "errors": [{"path": "expected_status"}],
++            },
++        )
++    if isinstance(e, KindUnchangedError):
++        return JsonRpcError(
++            -32602,
++            "kind is already set to the requested value",
++            data={"code": "kind_unchanged", "errors": [{"path": "kind"}]},
++        )
++    if isinstance(e, AssigneeUnchangedError):
++        return JsonRpcError(
++            -32602,
++            "assignee is already set to the requested value",
++            data={"code": "assignee_unchanged", "errors": [{"path": "assignee_id"}]},
++        )
++    if isinstance(e, InvalidAssigneeError):
++        return JsonRpcError(
++            -32602,
++            "assignee must be a current owner, admin or member of the map's team",
++            data={
++                "code": "invalid_assignee",
++                "errors": [{"path": "assignee_id"}],
++            },
++        )
++
++    # Fallback for unknown WorkItemError
++    raise JsonRpcError(
++        -32602,
++        "work item error",
++        data={"code": "work_item_error"},
++    )
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_assign.py b/src/mem_mcp/mcp/tools/mindmap_work_assign.py
+new file mode 100644
+index 0000000..a68ef6e
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_work_assign.py
+@@ -0,0 +1,92 @@
++"""mindmap_work_assign — assign a work item to a team member (or unassign)."""
++
++from __future__ import annotations
++
++from typing import ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import (
++    WorkItemOutput,
++    map_work_item_error,
++)
++from mem_mcp.mindmap import work_items as work_item_service
++
++
++class MindmapWorkAssignInput(BaseModel):
++    """Input for assigning a work item (or unassigning with null)."""
++
++    map_key: str = Field(..., min_length=1, max_length=64)
++    node_id: UUID
++    assignee_id: UUID | None = Field(
++        ..., description="Assignee UUID; pass null to unassign (field required, no default)"
++    )
++    reason: str | None = Field(default=None, max_length=2000)
++    team_id: UUID | None = Field(default=None)
++
++
++class MindmapWorkAssignTool(BaseTool):
++    """Assign a work item to a team member, or unassign (pass null)."""
++
++    name: ClassVar[str] = "mindmap_work_assign"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_work_assign"]
++    required_scope: ClassVar[str] = "memory.write"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkAssignInput
++    OutputModel: ClassVar[type[BaseModel]] = WorkItemOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkAssignInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            try:
++                result = await work_item_service.assign_work_item(
++                    conn,
++                    tenant_id=ctx.tenant_id,
++                    team_id=team_id,
++                    map_key=inp.map_key,
++                    node_id=inp.node_id,
++                    assignee_id=inp.assignee_id,
++                    reason=inp.reason,
++                    channel="mcp",
++                )
++            except work_item_service.WorkItemError as e:
++                raise map_work_item_error(e) from e
++
++            # Audit the assignee change
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="mindmap.work_item_changed",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "node_id": str(result.memory_id),
++                        "change": "owner",  # "assignee" in user-facing terms, but "owner" in model
++                        "map_key": inp.map_key,
++                    },
++                )
++
++            return WorkItemOutput(
++                node_id=result.memory_id,
++                map_key=inp.map_key,
++                map_state=result.map_state,
++                kind=result.kind,
++                status=result.status,
++                assignee_id=result.assignee_id,
++                title=result.title,
++                created_by=result.created_by,
++                created_at=result.created_at,
++                updated_at=result.updated_at,
++                status_changed_at=result.status_changed_at,
++                request_id=ctx.request_id,
++            )
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_mark.py b/src/mem_mcp/mcp/tools/mindmap_work_mark.py
+new file mode 100644
+index 0000000..bac7f46
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_work_mark.py
+@@ -0,0 +1,92 @@
++"""mindmap_work_mark — mark a node as a work item (story|epic|milestone)."""
++
++from __future__ import annotations
++
++from typing import ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import (
++    WorkItemOutput,
++    map_work_item_error,
++)
++from mem_mcp.mindmap import work_items as work_item_service
++
++
++class MindmapWorkMarkInput(BaseModel):
++    """Input for marking a node as a work item."""
++
++    map_key: str = Field(..., min_length=1, max_length=64)
++    node_id: UUID
++    kind: str = Field(..., max_length=64)  # str, not Literal, so error can name allowed values
++    assignee_id: UUID | None = Field(default=None)
++    reason: str | None = Field(default=None, max_length=2000)
++    team_id: UUID | None = Field(default=None)
++
++
++class MindmapWorkMarkTool(BaseTool):
++    """Mark a map node as a work item."""
++
++    name: ClassVar[str] = "mindmap_work_mark"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_work_mark"]
++    required_scope: ClassVar[str] = "memory.write"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkMarkInput
++    OutputModel: ClassVar[type[BaseModel]] = WorkItemOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkMarkInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            try:
++                result = await work_item_service.mark_work_item(
++                    conn,
++                    tenant_id=ctx.tenant_id,
++                    team_id=team_id,
++                    map_key=inp.map_key,
++                    node_id=inp.node_id,
++                    kind=inp.kind,
++                    assignee_id=inp.assignee_id,
++                    reason=inp.reason,
++                    channel="mcp",
++                )
++            except work_item_service.WorkItemError as e:
++                raise map_work_item_error(e) from e
++
++            # Audit the work item creation
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="mindmap.work_item_changed",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "node_id": str(result.memory_id),
++                        "change": "created",
++                        "map_key": inp.map_key,
++                    },
++                )
++
++            return WorkItemOutput(
++                node_id=result.memory_id,
++                map_key=inp.map_key,
++                map_state=result.map_state,
++                kind=result.kind,
++                status=result.status,
++                assignee_id=result.assignee_id,
++                title=result.title,
++                created_by=result.created_by,
++                created_at=result.created_at,
++                updated_at=result.updated_at,
++                status_changed_at=result.status_changed_at,
++                request_id=ctx.request_id,
++            )
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_set_kind.py b/src/mem_mcp/mcp/tools/mindmap_work_set_kind.py
+new file mode 100644
+index 0000000..a09f673
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_work_set_kind.py
+@@ -0,0 +1,90 @@
++"""mindmap_work_set_kind — change a work item's kind."""
++
++from __future__ import annotations
++
++from typing import ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import (
++    WorkItemOutput,
++    map_work_item_error,
++)
++from mem_mcp.mindmap import work_items as work_item_service
++
++
++class MindmapWorkSetKindInput(BaseModel):
++    """Input for setting a work item's kind."""
++
++    map_key: str = Field(..., min_length=1, max_length=64)
++    node_id: UUID
++    kind: str = Field(..., max_length=64)  # str, not Literal, so error can name allowed values
++    reason: str | None = Field(default=None, max_length=2000)
++    team_id: UUID | None = Field(default=None)
++
++
++class MindmapWorkSetKindTool(BaseTool):
++    """Change a work item's kind (story|epic|milestone)."""
++
++    name: ClassVar[str] = "mindmap_work_set_kind"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_work_set_kind"]
++    required_scope: ClassVar[str] = "memory.write"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkSetKindInput
++    OutputModel: ClassVar[type[BaseModel]] = WorkItemOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkSetKindInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            try:
++                result = await work_item_service.set_work_item_kind(
++                    conn,
++                    tenant_id=ctx.tenant_id,
++                    team_id=team_id,
++                    map_key=inp.map_key,
++                    node_id=inp.node_id,
++                    kind=inp.kind,
++                    reason=inp.reason,
++                    channel="mcp",
++                )
++            except work_item_service.WorkItemError as e:
++                raise map_work_item_error(e) from e
++
++            # Audit the kind change
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="mindmap.work_item_changed",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "node_id": str(result.memory_id),
++                        "change": "kind",
++                        "map_key": inp.map_key,
++                    },
++                )
++
++            return WorkItemOutput(
++                node_id=result.memory_id,
++                map_key=inp.map_key,
++                map_state=result.map_state,
++                kind=result.kind,
++                status=result.status,
++                assignee_id=result.assignee_id,
++                title=result.title,
++                created_by=result.created_by,
++                created_at=result.created_at,
++                updated_at=result.updated_at,
++                status_changed_at=result.status_changed_at,
++                request_id=ctx.request_id,
++            )
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_set_status.py b/src/mem_mcp/mcp/tools/mindmap_work_set_status.py
+new file mode 100644
+index 0000000..fd33bd1
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_work_set_status.py
+@@ -0,0 +1,92 @@
++"""mindmap_work_set_status — change a work item's status."""
++
++from __future__ import annotations
++
++from typing import ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import (
++    WorkItemOutput,
++    map_work_item_error,
++)
++from mem_mcp.mindmap import work_items as work_item_service
++
++
++class MindmapWorkSetStatusInput(BaseModel):
++    """Input for setting a work item's status."""
++
++    map_key: str = Field(..., min_length=1, max_length=64)
++    node_id: UUID
++    status: str = Field(..., max_length=64)  # str, not Literal, so error can name allowed values
++    reason: str | None = Field(default=None, max_length=2000)
++    expected_status: str | None = Field(default=None, description="Guard against race conditions; actual status must match.")
++    team_id: UUID | None = Field(default=None)
++
++
++class MindmapWorkSetStatusTool(BaseTool):
++    """Change a work item's status (todo→in_progress|cancelled, etc.)."""
++
++    name: ClassVar[str] = "mindmap_work_set_status"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_work_set_status"]
++    required_scope: ClassVar[str] = "memory.write"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkSetStatusInput
++    OutputModel: ClassVar[type[BaseModel]] = WorkItemOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkSetStatusInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            try:
++                result = await work_item_service.set_work_item_status(
++                    conn,
++                    tenant_id=ctx.tenant_id,
++                    team_id=team_id,
++                    map_key=inp.map_key,
++                    node_id=inp.node_id,
++                    status=inp.status,
++                    reason=inp.reason,
++                    expected_status=inp.expected_status,
++                    channel="mcp",
++                )
++            except work_item_service.WorkItemError as e:
++                raise map_work_item_error(e) from e
++
++            # Audit the status change
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="mindmap.work_item_changed",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "node_id": str(result.memory_id),
++                        "change": "status",
++                        "map_key": inp.map_key,
++                    },
++                )
++
++            return WorkItemOutput(
++                node_id=result.memory_id,
++                map_key=inp.map_key,
++                map_state=result.map_state,
++                kind=result.kind,
++                status=result.status,
++                assignee_id=result.assignee_id,
++                title=result.title,
++                created_by=result.created_by,
++                created_at=result.created_at,
++                updated_at=result.updated_at,
++                status_changed_at=result.status_changed_at,
++                request_id=ctx.request_id,
++            )
+diff --git a/src/mem_mcp/mindmap/work_items.py b/src/mem_mcp/mindmap/work_items.py
+new file mode 100644
+index 0000000..750a06b
+--- /dev/null
++++ b/src/mem_mcp/mindmap/work_items.py
+@@ -0,0 +1,1272 @@
++"""Work item service layer — task tracking on mind-map nodes.
++
++A mind-map node can be marked as a "work item" with kind (story|epic|milestone),
++status (todo|in_progress|blocked|done|cancelled), and optional assignee.
++All changes are append-only to work_item_history for auditability.
++
++Takes `asyncpg.Connection` from `tenant_tx`; never imports FastAPI or JsonRpcError.
++All SQL has explicit `tenant_id = $n` plus RLS (run `tools/lint_tenant_scope.py` via
++its unit test).
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import datetime
++from typing import Any, Literal
++from uuid import UUID
++
++import asyncpg  # type: ignore[import-untyped]
++
++from mem_mcp.auth.permissions import ROLE_PERMISSIONS, Permission
++from mem_mcp.auth.rbac import get_team_role
++from mem_mcp.mindmap import service
++
++# -------------------------------------------------------------------------
++# Constants
++# -------------------------------------------------------------------------
++
++WORK_KINDS = ("story", "epic", "milestone")
++WORK_STATUSES = ("todo", "in_progress", "blocked", "done", "cancelled")
++ASSIGNABLE_ROLES = frozenset({"owner", "admin", "member"})
++Channel = Literal["mcp", "web"]
++
++# Transition rules: (current, requested) -> reason_required
++# reason_required = True means a reason must be provided; False means not required
++TRANSITIONS: dict[tuple[str, str], bool] = {
++    ("todo", "in_progress"): False,
++    ("todo", "cancelled"): True,
++    ("in_progress", "blocked"): True,
++    ("in_progress", "done"): False,
++    ("in_progress", "todo"): False,
++    ("in_progress", "cancelled"): True,
++    ("blocked", "in_progress"): False,
++    ("blocked", "cancelled"): True,
++    ("done", "in_progress"): True,
++    ("cancelled", "todo"): True,
++}
++
++
++# -------------------------------------------------------------------------
++# Exceptions
++# -------------------------------------------------------------------------
++
++
++class WorkItemError(Exception):
++    """Base exception for work item operations."""
++
++    def __str__(self) -> str:
++        return self.args[0] if self.args else self.__class__.__name__
++
++
++class WorkItemMapNotFoundError(WorkItemError):
++    """Map key unknown OR caller has no role on the map's team."""
++
++    def __init__(self) -> None:
++        super().__init__("map not found or access denied")
++
++
++class WorkItemPermissionDeniedError(WorkItemError):
++    """Caller has a role but lacks TEAM_WRITE_MEMORY permission."""
++
++    def __init__(self, permission: Permission, team_id: UUID) -> None:
++        super().__init__(f"permission denied: {permission.value} required for team {team_id}")
++        self.permission = permission
++        self.team_id = team_id
++
++
++class NodeNotInMapError(WorkItemError):
++    """Node not a member of that map or deleted."""
++
++    def __init__(self) -> None:
++        super().__init__("node not in map or deleted")
++
++
++class NotAWorkItemError(WorkItemError):
++    """Node in map but not marked as a work item."""
++
++    def __init__(self) -> None:
++        super().__init__("node is not a work item")
++
++
++class InvalidKindError(WorkItemError):
++    """Invalid kind value."""
++
++    def __init__(self, kind: str, allowed: tuple[str, ...]) -> None:
++        super().__init__(f"invalid kind {kind!r}; allowed: {allowed}")
++        self.kind = kind
++        self.allowed = allowed
++
++
++class InvalidStatusError(WorkItemError):
++    """Invalid status value."""
++
++    def __init__(self, status: str, allowed: tuple[str, ...]) -> None:
++        super().__init__(f"invalid status {status!r}; allowed: {allowed}")
++        self.status = status
++        self.allowed = allowed
++
++
++class RootNodeNotAllowedError(WorkItemError):
++    """Cannot mark the root node as a work item."""
++
++    def __init__(self) -> None:
++        super().__init__("root node cannot be a work item")
++
++
++class AlreadyWorkItemError(WorkItemError):
++    """Node is already marked as a work item."""
++
++    def __init__(self) -> None:
++        super().__init__("node is already a work item")
++
++
++class MapNotLiveError(WorkItemError):
++    """Cannot mark on archived map."""
++
++    def __init__(self) -> None:
++        super().__init__("map is archived; cannot create work item")
++
++
++class InvalidTransitionError(WorkItemError):
++    """Status transition not allowed."""
++
++    def __init__(self, current: str, requested: str) -> None:
++        super().__init__(f"cannot transition from {current} to {requested}")
++        self.current = current
++        self.requested = requested
++
++
++class ReasonRequiredError(WorkItemError):
++    """Transition requires a reason."""
++
++    def __init__(self, current: str, requested: str) -> None:
++        super().__init__(f"transition from {current} to {requested} requires a reason")
++        self.current = current
++        self.requested = requested
++
++
++class StatusUnchangedError(WorkItemError):
++    """Status already matches requested value."""
++
++    def __init__(self, current: str) -> None:
++        super().__init__(f"status already {current}")
++        self.current = current
++
++
++class StatusConflictError(WorkItemError):
++    """Expected status differs from actual."""
++
++    def __init__(self, expected: str, actual: str) -> None:
++        super().__init__(f"status conflict: expected {expected}, actual {actual}")
++        self.expected = expected
++        self.actual = actual
++
++
++class KindUnchangedError(WorkItemError):
++    """Kind already matches requested value."""
++
++    def __init__(self, kind: str) -> None:
++        super().__init__(f"kind already {kind}")
++        self.kind = kind
++
++
++class AssigneeUnchangedError(WorkItemError):
++    """Assignee already matches requested value."""
++
++    def __init__(self, assignee_id: UUID | None) -> None:
++        super().__init__(f"assignee already {assignee_id or 'unassigned'}")
++        self.assignee_id = assignee_id
++
++
++class InvalidAssigneeError(WorkItemError):
++    """Assignee is not a valid team member or role."""
++
++    def __init__(self, assignee_id: UUID) -> None:
++        super().__init__(f"invalid assignee {assignee_id}")
++        self.assignee_id = assignee_id
++
++
++# -------------------------------------------------------------------------
++# Dataclasses
++# -------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class WorkItem:
++    """A work item on a mind-map node."""
++
++    memory_id: UUID
++    root_memory_id: UUID
++    map_key: str
++    map_state: str
++    team_id: UUID
++    kind: str
++    status: str
++    assignee_id: UUID | None
++    title: str
++    created_by: UUID
++    created_at: datetime
++    updated_at: datetime
++    status_changed_at: datetime
++
++
++@dataclass(frozen=True)
++class WorkItemHistoryEntry:
++    """A single history entry for a work item change."""
++
++    id: int
++    memory_id: UUID
++    change_type: str
++    kind_before: str | None
++    kind_after: str
++    status_before: str | None
++    status_after: str
++    assignee_before: UUID | None
++    assignee_after: UUID | None
++    actor_id: UUID
++    channel: str
++    reason: str | None
++    created_at: datetime
++
++
++# -------------------------------------------------------------------------
++# Validation helpers
++# -------------------------------------------------------------------------
++
++
++def _validate_kind(kind: str) -> None:
++    """Validate kind is one of the allowed values."""
++    if kind not in WORK_KINDS:
++        raise InvalidKindError(kind, WORK_KINDS)
++
++
++def _validate_status(status: str) -> None:
++    """Validate status is one of the allowed values."""
++    if status not in WORK_STATUSES:
++        raise InvalidStatusError(status, WORK_STATUSES)
++
++
++def check_transition(current: str, requested: str, reason: str | None) -> None:
++    """Validate a status transition is allowed.
++
++    Raises InvalidTransitionError if not allowed, ReasonRequiredError if
++    a reason is required but not provided.
++    """
++    if (current, requested) not in TRANSITIONS:
++        raise InvalidTransitionError(current, requested)
++
++    # Reason should be pre-cleaned
++    if TRANSITIONS[(current, requested)] and not reason:
++        raise ReasonRequiredError(current, requested)
++
++
++def _extract_title(content: str) -> str:
++    """Extract title from node content (first line, max 120 chars)."""
++    first_line = content.split("\n")[0] if content else ""
++    if len(first_line) > 120:
++        return first_line[:119] + "…"
++    return first_line
++
++
++def _clean_reason(reason: str | None) -> str | None:
++    """Clean reason: strip, blank→None, cap 2000 chars."""
++    if reason is None:
++        return None
++    cleaned = reason.strip()
++    return cleaned[:2000] if cleaned else None
++
++
++# -------------------------------------------------------------------------
++# Internal helper functions for code reuse
++# -------------------------------------------------------------------------
++
++
++async def _load_map(
++    conn: asyncpg.Connection,
++    tenant_id: UUID,
++    team_id: UUID,
++    map_key: str,
++) -> tuple[UUID, dict[str, Any]]:
++    """Resolve map and verify access.
++
++    Returns (root_memory_id, map_row).
++    Raises WorkItemMapNotFoundError if map doesn't exist or caller has no role on team.
++    """
++    root_memory_id = await service.resolve_map_root(conn, team_id=team_id, map_key=map_key)
++    if root_memory_id is None:
++        raise WorkItemMapNotFoundError()
++
++    map_row = await service.get_map_row(conn, root_memory_id=root_memory_id)
++    if map_row is None:
++        raise WorkItemMapNotFoundError()
++
++    # Check caller has role on team (non-member gets map not found)
++    caller_role = await get_team_role(conn, tenant_id, team_id)
++    if caller_role is None:
++        raise WorkItemMapNotFoundError()
++
++    return root_memory_id, map_row
++
++
++async def _check_permission(
++    conn: asyncpg.Connection,
++    tenant_id: UUID,
++    team_id: UUID,
++) -> None:
++    """Check caller has write permission on team.
++
++    Raises WorkItemMapNotFoundError if caller has no role on team.
++    Raises WorkItemPermissionDeniedError if role lacks TEAM_WRITE_MEMORY.
++    """
++    caller_role = await get_team_role(conn, tenant_id, team_id)
++    if caller_role is None:
++        raise WorkItemMapNotFoundError()
++    if Permission.TEAM_WRITE_MEMORY not in ROLE_PERMISSIONS.get(caller_role, set()):
++        raise WorkItemPermissionDeniedError(Permission.TEAM_WRITE_MEMORY, team_id)
++
++
++async def _check_node_membership(
++    conn: asyncpg.Connection,
++    node_id: UUID,
++    root_memory_id: UUID,
++    tenant_id: UUID,
++) -> None:
++    """Verify node is a member of the map and not deleted."""
++    membership = await conn.fetchrow(
++        """
++        SELECT 1 FROM memory_map_membership mm
++        JOIN memories m ON m.id = mm.memory_id AND m.tenant_id = mm.tenant_id
++        WHERE mm.memory_id = $1 AND mm.root_memory_id = $2 AND mm.tenant_id = $3
++        AND m.deleted_at IS NULL
++        """,
++        node_id,
++        root_memory_id,
++        tenant_id,
++    )
++    if membership is None:
++        raise NodeNotInMapError()
++
++
++async def _load_work_item_for_update(
++    conn: asyncpg.Connection,
++    node_id: UUID,
++    tenant_id: UUID,
++    team_id: UUID,
++    root_memory_id: UUID,
++) -> asyncpg.Record:
++    """Load work item FOR UPDATE with cross-map access prevention."""
++    wi_row = await conn.fetchrow(
++        """
++        SELECT * FROM work_items
++        WHERE memory_id = $1 AND tenant_id = $2 AND team_id = $3 AND root_memory_id = $4
++        FOR UPDATE
++        """,
++        node_id,
++        tenant_id,
++        team_id,
++        root_memory_id,
++    )
++    if wi_row is None:
++        # Check if node exists in this map's membership (with deleted_at filter)
++        await _check_node_membership(conn, node_id, root_memory_id, tenant_id)
++        raise NotAWorkItemError()
++    return wi_row
++
++
++async def _append_history(
++    conn: asyncpg.Connection,
++    node_id: UUID,
++    root_memory_id: UUID,
++    tenant_id: UUID,
++    team_id: UUID,
++    change_type: str,
++    kind_before: str | None,
++    kind_after: str,
++    status_before: str | None,
++    status_after: str,
++    assignee_before: UUID | None,
++    assignee_after: UUID | None,
++    actor_id: UUID,
++    channel: str,
++    reason: str | None,
++) -> None:
++    """Append a history entry for a work item change."""
++    await conn.execute(
++        """
++        INSERT INTO work_item_history
++            (memory_id, root_memory_id, tenant_id, team_id, change_type,
++             kind_before, kind_after, status_before, status_after,
++             assignee_before, assignee_after, actor_id, channel, reason, created_at)
++        VALUES ($1, $2, $3, $4, $5,
++                $6, $7, $8, $9,
++                $10, $11, $12, $13, $14, clock_timestamp())
++        """,
++        node_id,
++        root_memory_id,
++        tenant_id,
++        team_id,
++        change_type,
++        kind_before,
++        kind_after,
++        status_before,
++        status_after,
++        assignee_before,
++        assignee_after,
++        actor_id,
++        channel,
++        reason,
++    )
++
++
++async def _record_change(
++    conn: asyncpg.Connection,
++    root_memory_id: UUID,
++    tenant_id: UUID,
++    event: str,
++    actor: str,
++    memory_id: UUID,
++    payload: dict[str, Any],
++) -> None:
++    """Record a work item change event."""
++    await service.log_event(
++        conn,
++        root_memory_id=root_memory_id,
++        tenant_id=tenant_id,
++        event=event,
++        actor=actor,
++        memory_id=memory_id,
++        payload=payload,
++    )
++
++
++# -------------------------------------------------------------------------
++# Core operations
++# -------------------------------------------------------------------------
++
++
++async def mark_work_item(
++    conn: asyncpg.Connection,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    map_key: str,
++    node_id: UUID,
++    kind: str,
++    assignee_id: UUID | None = None,
++    reason: str | None = None,
++    channel: str = "mcp",
++) -> WorkItem:
++    """Mark a node as a work item.
++
++    Validates the node is in the map, not the root, not already marked,
++    and the map is live. Inserts work_items row and history entry.
++    """
++    # Load and validate map (includes permission check)
++    root_memory_id, map_row = await _load_map(conn, tenant_id, team_id, map_key)
++
++    # Check permission (owner, admin, or member)
++    await _check_permission(conn, tenant_id, team_id)
++
++    # Validate kind after permission checks
++    _validate_kind(kind)
++
++    # Root node not allowed
++    if node_id == root_memory_id:
++        raise RootNodeNotAllowedError()
++
++    # Check node is in membership table (not deleted)
++    await _check_node_membership(conn, node_id, root_memory_id, tenant_id)
++
++    # Check map is live
++    if map_row["state"] != "live":
++        raise MapNotLiveError()
++
++    # Check not already a work item with root_memory_id filter
++    existing = await conn.fetchrow(
++        "SELECT memory_id FROM work_items WHERE memory_id = $1 AND tenant_id = $2 "
++        "AND root_memory_id = $3",
++        node_id,
++        tenant_id,
++        root_memory_id,
++    )
++    if existing is not None:
++        raise AlreadyWorkItemError()
++
++    # Get node content for title extraction
++    node_row = await conn.fetchrow(
++        "SELECT content FROM memories WHERE id = $1 AND tenant_id = $2",
++        node_id,
++        tenant_id,
++    )
++    if node_row is None:
++        raise NodeNotInMapError()
++
++    title = _extract_title(node_row["content"])
++
++    # Validate assignee if provided
++    if assignee_id is not None:
++        assignee_role = await get_team_role(conn, assignee_id, team_id)
++        if assignee_role is None or assignee_role not in ASSIGNABLE_ROLES:
++            raise InvalidAssigneeError(assignee_id)
++
++    # Insert work_items row (wrap in savepoint to handle race conditions)
++    try:
++        async with conn.transaction():
++            result = await conn.fetchrow(
++                """
++                INSERT INTO work_items
++                    (memory_id, root_memory_id, tenant_id, team_id, kind, assignee_id,
++                     created_by, status, status_changed_at)
++                VALUES ($1, $2, $3, $4, $5, $6, $7, 'todo', now())
++                RETURNING memory_id, root_memory_id, tenant_id, team_id, kind, status,
++                          assignee_id, created_by, created_at, updated_at, status_changed_at
++                """,
++                node_id,
++                root_memory_id,
++                tenant_id,
++                team_id,
++                kind,
++                assignee_id,
++                tenant_id,  # created_by is the caller
++            )
++    except asyncpg.UniqueViolationError:
++        raise AlreadyWorkItemError() from None
++
++    assert result is not None
++
++    # Insert history entry using helper
++    cleaned_reason = _clean_reason(reason)
++    await _append_history(
++        conn,
++        node_id,
++        root_memory_id,
++        tenant_id,
++        team_id,
++        "created",
++        None,  # kind_before
++        kind,
++        None,  # status_before
++        "todo",
++        None,  # assignee_before
++        assignee_id,
++        tenant_id,  # actor_id
++        channel,
++        cleaned_reason,
++    )
++
++    # Record change event using helper
++    await _record_change(
++        conn,
++        root_memory_id=root_memory_id,
++        tenant_id=tenant_id,
++        event="work_item",
++        actor="model" if channel == "mcp" else "owner",
++        memory_id=node_id,
++        payload={
++            "change": "created",
++            "from": None,
++            "to": {
++                "kind": kind,
++                "status": "todo",
++                "assignee": str(assignee_id) if assignee_id else None,
++            },
++        },
++    )
++
++    return WorkItem(
++        memory_id=result["memory_id"],
++        root_memory_id=result["root_memory_id"],
++        map_key=map_key,
++        map_state=map_row["state"],
++        team_id=result["team_id"],
++        kind=result["kind"],
++        status=result["status"],
++        assignee_id=result["assignee_id"],
++        title=title,
++        created_by=result["created_by"],
++        created_at=result["created_at"],
++        updated_at=result["updated_at"],
++        status_changed_at=result["status_changed_at"],
++    )
++
++
++async def set_work_item_status(
++    conn: asyncpg.Connection,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    map_key: str,
++    node_id: UUID,
++    status: str,
++    reason: str | None = None,
++    expected_status: str | None = None,
++    channel: str = "mcp",
++) -> WorkItem:
++    """Set the status of a work item."""
++    # Load and validate map (includes permission check)
++    root_memory_id, map_row = await _load_map(conn, tenant_id, team_id, map_key)
++
++    # Check permission (owner, admin, or member)
++    await _check_permission(conn, tenant_id, team_id)
++
++    # Validate status after permission check
++    _validate_status(status)
++
++    # Load work item for update using helper
++    wi_row = await _load_work_item_for_update(conn, node_id, tenant_id, team_id, root_memory_id)
++
++    current_status = wi_row["status"]
++
++    # Check expected status if provided
++    if expected_status is not None and current_status != expected_status:
++        raise StatusConflictError(expected_status, current_status)
++
++    # Check status unchanged
++    if current_status == status:
++        raise StatusUnchangedError(current_status)
++
++    # Validate transition with cleaned reason
++    check_transition(current_status, status, _clean_reason(reason))
++
++    # Get node content for title
++    node_row = await conn.fetchrow(
++        "SELECT content FROM memories WHERE id = $1 AND tenant_id = $2",
++        node_id,
++        tenant_id,
++    )
++    title = _extract_title(node_row["content"]) if node_row else ""
++
++    # Get current kind and assignee for history
++    current_kind = wi_row["kind"]
++    current_assignee = wi_row["assignee_id"]
++
++    # Update status (includes root_memory_id to prevent cross-map access)
++    await conn.execute(
++        """
++        UPDATE work_items
++        SET status = $1, updated_at = now(), status_changed_at = now()
++        WHERE memory_id = $2 AND tenant_id = $3 AND team_id = $4 AND root_memory_id = $5
++        """,
++        status,
++        node_id,
++        tenant_id,
++        team_id,
++        root_memory_id,
++    )
++
++    # Append history using helper
++    cleaned_reason = _clean_reason(reason)
++    await _append_history(
++        conn,
++        node_id,
++        root_memory_id,
++        tenant_id,
++        team_id,
++        "status",
++        current_kind,
++        current_kind,
++        current_status,
++        status,
++        current_assignee,
++        current_assignee,
++        tenant_id,
++        channel,
++        cleaned_reason,
++    )
++
++    # Record change using helper
++    await _record_change(
++        conn,
++        root_memory_id=root_memory_id,
++        tenant_id=tenant_id,
++        event="work_item",
++        actor="model" if channel == "mcp" else "owner",
++        memory_id=node_id,
++        payload={"change": "status", "from": current_status, "to": status},
++    )
++
++    return WorkItem(
++        memory_id=wi_row["memory_id"],
++        root_memory_id=wi_row["root_memory_id"],
++        map_key=map_key,
++        map_state=map_row["state"],
++        team_id=wi_row["team_id"],
++        kind=wi_row["kind"],
++        status=status,
++        assignee_id=wi_row["assignee_id"],
++        title=title,
++        created_by=wi_row["created_by"],
++        created_at=wi_row["created_at"],
++        updated_at=wi_row["updated_at"],
++        status_changed_at=wi_row["status_changed_at"],
++    )
++
++
++async def set_work_item_kind(
++    conn: asyncpg.Connection,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    map_key: str,
++    node_id: UUID,
++    kind: str,
++    reason: str | None = None,
++    channel: str = "mcp",
++) -> WorkItem:
++    """Set the kind of a work item."""
++    # Load and validate map (includes permission check)
++    root_memory_id, map_row = await _load_map(conn, tenant_id, team_id, map_key)
++
++    # Check permission (owner, admin, or member)
++    await _check_permission(conn, tenant_id, team_id)
++
++    # Sort: kind validation after permission checks
++    _validate_kind(kind)
++
++    # Load work item for update using helper
++    wi_row = await _load_work_item_for_update(conn, node_id, tenant_id, team_id, root_memory_id)
++
++    current_kind = wi_row["kind"]
++
++    # Check kind unchanged
++    if current_kind == kind:
++        raise KindUnchangedError(current_kind)
++
++    # Get node content for title
++    node_row = await conn.fetchrow(
++        "SELECT content FROM memories WHERE id = $1 AND tenant_id = $2",
++        node_id,
++        tenant_id,
++    )
++    title = _extract_title(node_row["content"]) if node_row else ""
++
++    # Get current status and assignee for history
++    current_status = wi_row["status"]
++    current_assignee = wi_row["assignee_id"]
++
++    # Update kind
++    await conn.execute(
++        """
++        UPDATE work_items
++        SET kind = $1, updated_at = now()
++        WHERE memory_id = $2 AND tenant_id = $3 AND team_id = $4 AND root_memory_id = $5
++        """,
++        kind,
++        node_id,
++        tenant_id,
++        team_id,
++        root_memory_id,
++    )
++
++    # Append history using helper
++    cleaned_reason = _clean_reason(reason)
++    await _append_history(
++        conn,
++        node_id,
++        root_memory_id,
++        tenant_id,
++        team_id,
++        "kind",
++        current_kind,
++        kind,
++        current_status,
++        current_status,
++        current_assignee,
++        current_assignee,
++        tenant_id,
++        channel,
++        cleaned_reason,
++    )
++
++    # Record change using helper
++    await _record_change(
++        conn,
++        root_memory_id=root_memory_id,
++        tenant_id=tenant_id,
++        event="work_item",
++        actor="model" if channel == "mcp" else "owner",
++        memory_id=node_id,
++        payload={"change": "kind", "from": current_kind, "to": kind},
++    )
++
++    return WorkItem(
++        memory_id=wi_row["memory_id"],
++        root_memory_id=wi_row["root_memory_id"],
++        map_key=map_key,
++        map_state=map_row["state"],
++        team_id=wi_row["team_id"],
++        kind=kind,
++        status=wi_row["status"],
++        assignee_id=wi_row["assignee_id"],
++        title=title,
++        created_by=wi_row["created_by"],
++        created_at=wi_row["created_at"],
++        updated_at=wi_row["updated_at"],
++        status_changed_at=wi_row["status_changed_at"],
++    )
++
++
++async def assign_work_item(
++    conn: asyncpg.Connection,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    map_key: str,
++    node_id: UUID,
++    assignee_id: UUID | None,
++    reason: str | None = None,
++    channel: str = "mcp",
++) -> WorkItem:
++    """Assign or unassign a work item."""
++    # Load and validate map (includes permission check)
++    root_memory_id, map_row = await _load_map(conn, tenant_id, team_id, map_key)
++
++    # Check permission (owner, admin, or member)
++    await _check_permission(conn, tenant_id, team_id)
++
++    # Load work item for update using helper
++    wi_row = await _load_work_item_for_update(conn, node_id, tenant_id, team_id, root_memory_id)
++
++    current_kind = wi_row["kind"]
++    current_status = wi_row["status"]
++    current_assignee = wi_row["assignee_id"]
++    cleaned_reason = _clean_reason(reason)
++
++    # If unassigning (assignee_id is None)
++    if assignee_id is None:
++        if current_assignee is None:
++            raise AssigneeUnchangedError(current_assignee)
++
++        # Unassign
++        await conn.execute(
++            """
++            UPDATE work_items
++            SET assignee_id = NULL, updated_at = now()
++            WHERE memory_id = $1 AND tenant_id = $2 AND team_id = $3 AND root_memory_id = $4
++            """,
++            node_id,
++            tenant_id,
++            team_id,
++            root_memory_id,
++        )
++
++        # Append history using helper
++        await _append_history(
++            conn,
++            node_id,
++            root_memory_id,
++            tenant_id,
++            team_id,
++            "owner",
++            current_kind,
++            current_kind,
++            current_status,
++            current_status,
++            current_assignee,
++            None,  # assignee_after
++            tenant_id,
++            channel,
++            cleaned_reason,
++        )
++
++        # Record change using helper
++        await _record_change(
++            conn,
++            root_memory_id=root_memory_id,
++            tenant_id=tenant_id,
++            event="work_item",
++            actor="model" if channel == "mcp" else "owner",
++            memory_id=node_id,
++            payload={
++                "change": "owner",
++                "from": str(current_assignee) if current_assignee else None,
++                "to": None,
++            },
++        )
++
++    else:
++        # Check assignee unchanged
++        if current_assignee == assignee_id:
++            raise AssigneeUnchangedError(assignee_id)
++
++        # Validate assignee has an active role
++        assignee_role = await get_team_role(conn, assignee_id, team_id)
++        if assignee_role is None or assignee_role not in ASSIGNABLE_ROLES:
++            raise InvalidAssigneeError(assignee_id)
++
++        # Update assignee
++        await conn.execute(
++            """
++            UPDATE work_items
++            SET assignee_id = $1, updated_at = now()
++            WHERE memory_id = $2 AND tenant_id = $3 AND team_id = $4 AND root_memory_id = $5
++            """,
++            assignee_id,
++            node_id,
++            tenant_id,
++            team_id,
++            root_memory_id,
++        )
++
++        # Append history using helper
++        await _append_history(
++            conn,
++            node_id,
++            root_memory_id,
++            tenant_id,
++            team_id,
++            "owner",
++            current_kind,
++            current_kind,
++            current_status,
++            current_status,
++            current_assignee,
++            assignee_id,
++            tenant_id,
++            channel,
++            cleaned_reason,
++        )
++
++        # Record change using helper
++        await _record_change(
++            conn,
++            root_memory_id=root_memory_id,
++            tenant_id=tenant_id,
++            event="work_item",
++            actor="model" if channel == "mcp" else "owner",
++            memory_id=node_id,
++            payload={
++                "change": "owner",
++                "from": str(current_assignee) if current_assignee else None,
++                "to": str(assignee_id),
++            },
++        )
++
++    # Get node content for title
++    node_row = await conn.fetchrow(
++        "SELECT content FROM memories WHERE id = $1 AND tenant_id = $2",
++        node_id,
++        tenant_id,
++    )
++    title = _extract_title(node_row["content"]) if node_row else ""
++
++    # Return updated work item
++    updated = await conn.fetchrow(
++        "SELECT * FROM work_items WHERE memory_id = $1 AND tenant_id = $2 AND team_id = $3 AND root_memory_id = $4",
++        node_id,
++        tenant_id,
++        team_id,
++        root_memory_id,
++    )
++    assert updated is not None
++
++    return WorkItem(
++        memory_id=updated["memory_id"],
++        root_memory_id=updated["root_memory_id"],
++        map_key=map_key,
++        map_state=map_row["state"],
++        team_id=updated["team_id"],
++        kind=updated["kind"],
++        status=updated["status"],
++        assignee_id=updated["assignee_id"],
++        title=title,
++        created_by=updated["created_by"],
++        created_at=updated["created_at"],
++        updated_at=updated["updated_at"],
++        status_changed_at=updated["status_changed_at"],
++    )
++
++
++async def get_work_item(
++    conn: asyncpg.Connection,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    map_key: str,
++    node_id: UUID,
++) -> WorkItem:
++    """Get a work item by node ID. Any role can read."""
++    # Resolve map (any role can view)
++    root_memory_id = await service.resolve_map_root(conn, team_id=team_id, map_key=map_key)
++    if root_memory_id is None:
++        raise WorkItemMapNotFoundError()
++
++    map_row = await service.get_map_row(conn, root_memory_id=root_memory_id)
++    if map_row is None:
++        raise WorkItemMapNotFoundError()
++
++    # Check caller has role on team
++    caller_role = await get_team_role(conn, tenant_id, team_id)
++    if caller_role is None:
++        raise WorkItemMapNotFoundError()
++
++    # Get work item (includes root_memory_id to prevent cross-map access)
++    wi_row = await conn.fetchrow(
++        """
++        SELECT * FROM work_items
++        WHERE memory_id = $1 AND tenant_id = $2 AND team_id = $3 AND root_memory_id = $4
++        """,
++        node_id,
++        tenant_id,
++        team_id,
++        root_memory_id,
++    )
++    if wi_row is None:
++        # Check if node exists in this map's membership (with deleted_at filter)
++        membership = await conn.fetchrow(
++            """
++            SELECT 1 FROM memory_map_membership mm
++            JOIN memories m ON m.id = mm.memory_id AND m.tenant_id = mm.tenant_id
++            WHERE mm.memory_id = $1 AND mm.root_memory_id = $2 AND mm.tenant_id = $3
++            AND m.deleted_at IS NULL
++            """,
++            node_id,
++            root_memory_id,
++            tenant_id,
++        )
++        if membership is None:
++            raise NodeNotInMapError()
++        raise NotAWorkItemError()
++
++    # Get node content for title
++    node_row = await conn.fetchrow(
++        "SELECT content FROM memories WHERE id = $1 AND tenant_id = $2",
++        node_id,
++        tenant_id,
++    )
++    title = _extract_title(node_row["content"]) if node_row else ""
++
++    return WorkItem(
++        memory_id=wi_row["memory_id"],
++        root_memory_id=wi_row["root_memory_id"],
++        map_key=map_key,
++        map_state=map_row["state"],
++        team_id=wi_row["team_id"],
++        kind=wi_row["kind"],
++        status=wi_row["status"],
++        assignee_id=wi_row["assignee_id"],
++        title=title,
++        created_by=wi_row["created_by"],
++        created_at=wi_row["created_at"],
++        updated_at=wi_row["updated_at"],
++        status_changed_at=wi_row["status_changed_at"],
++    )
++
++
++async def list_work_items(
++    conn: asyncpg.Connection,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    map_key: str | None = None,
++    status: str | None = None,
++    kind: str | None = None,
++    assignee_id: UUID | None = None,
++    unassigned: bool = False,
++    map_state: str | None = None,
++    limit: int = 100,
++) -> list[WorkItem]:
++    """List work items for a team or map.
++
++    If map_key is None, lists work items for the whole team.
++    Caller must have a role on the team.
++    Ordered by updated_at DESC, memory_id.
++    Excludes deleted nodes.
++    """
++    # Validate filter values
++    if status is not None and status not in WORK_STATUSES:
++        raise InvalidStatusError(status, WORK_STATUSES)
++    if kind is not None and kind not in WORK_KINDS:
++        raise InvalidKindError(kind, WORK_KINDS)
++    if map_state is not None and map_state not in ("live", "archived"):
++        raise ValueError(f"map_state must be 'live' or 'archived', got {map_state!r}")
++
++    # Mutually exclusive: assignee_id and unassigned
++    if assignee_id is not None and unassigned:
++        raise ValueError("assignee_id and unassigned are mutually exclusive")
++
++    # Clamp limit to 1..500
++    limit = max(1, min(limit, 500))
++
++    # Resolve map_key first (always check role when map_key is given)
++    root_memory_id = None
++    if map_key is not None:
++        root_memory_id = await service.resolve_map_root(conn, team_id=team_id, map_key=map_key)
++        if root_memory_id is None:
++            raise WorkItemMapNotFoundError()
++
++    # ALWAYS check caller has role on team
++    caller_role = await get_team_role(conn, tenant_id, team_id)
++    if caller_role is None:
++        raise WorkItemMapNotFoundError()
++
++    # Build query
++    clauses = ["wi.tenant_id = $1", "wi.team_id = $2"]
++    args: list[Any] = [tenant_id, team_id]
++
++    if root_memory_id is not None:
++        args.append(root_memory_id)
++        clauses.append(f"wi.root_memory_id = ${len(args)}")
++
++    if status is not None:
++        args.append(status)
++        clauses.append(f"wi.status = ${len(args)}")
++
++    if kind is not None:
++        args.append(kind)
++        clauses.append(f"wi.kind = ${len(args)}")
++
++    if assignee_id is not None:
++        args.append(assignee_id)
++        clauses.append(f"wi.assignee_id = ${len(args)}")
++
++    if unassigned:
++        clauses.append("wi.assignee_id IS NULL")
++
++    if map_state is not None:
++        args.append(map_state)
++        clauses.append(f"mp.state = ${len(args)}")
++
++    sql = f"""
++    SELECT wi.*, mp.state as map_state, s.slug as map_key, m.content
++    FROM work_items wi
++    JOIN memory_map_membership mm ON mm.memory_id = wi.memory_id AND mm.root_memory_id = wi.root_memory_id
++    JOIN memory_maps mp ON mp.root_memory_id = mm.root_memory_id
++    JOIN memories m ON m.id = wi.memory_id AND m.tenant_id = wi.tenant_id
++    LEFT JOIN slugs s ON s.memory_id = wi.root_memory_id AND s.team_id = wi.team_id AND s.resource_type = 'map'
++    WHERE {" AND ".join(clauses)}
++    ORDER BY wi.updated_at DESC NULLS LAST, wi.memory_id
++    LIMIT ${len(args) + 1}
++    """
++
++    rows = await conn.fetch(sql, *args, limit)
++
++    return [
++        WorkItem(
++            memory_id=r["memory_id"],
++            root_memory_id=r["root_memory_id"],
++            map_key=r["map_key"] or map_key or "",
++            map_state=r["map_state"],
++            team_id=r["team_id"],
++            kind=r["kind"],
++            status=r["status"],
++            assignee_id=r["assignee_id"],
++            title=_extract_title(r["content"]) if r["content"] else "",
++            created_by=r["created_by"],
++            created_at=r["created_at"],
++            updated_at=r["updated_at"],
++            status_changed_at=r["status_changed_at"],
++        )
++        for r in rows
++    ]
++
++
++async def get_work_item_history(
++    conn: asyncpg.Connection,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    map_key: str,
++    node_id: UUID,
++) -> list[WorkItemHistoryEntry]:
++    """Get the history of a work item (oldest first by id)."""
++    # Resolve map
++    root_memory_id = await service.resolve_map_root(conn, team_id=team_id, map_key=map_key)
++    if root_memory_id is None:
++        raise WorkItemMapNotFoundError()
++
++    map_row = await service.get_map_row(conn, root_memory_id=root_memory_id)
++    if map_row is None:
++        raise WorkItemMapNotFoundError()
++
++    # Check permission
++    caller_role = await get_team_role(conn, tenant_id, team_id)
++    if caller_role is None:
++        raise WorkItemMapNotFoundError()
++
++    # Ensure the node is in this map
++    membership = await conn.fetchrow(
++        """
++        SELECT 1 FROM memory_map_membership
++        WHERE memory_id = $1 AND root_memory_id = $2 AND tenant_id = $3
++        """,
++        node_id,
++        root_memory_id,
++        tenant_id,
++    )
++    if membership is None:
++        raise NodeNotInMapError()
++
++    # Check if the node is a work item (root_memory_id filter to prevent cross-map access)
++    wi_row = await conn.fetchrow(
++        "SELECT memory_id FROM work_items WHERE memory_id = $1 AND tenant_id = $2 AND root_memory_id = $3",
++        node_id,
++        tenant_id,
++        root_memory_id,
++    )
++    if wi_row is None:
++        raise NotAWorkItemError()
++
++    # Get history (ordered by id ascending for oldest-first)
++    rows = await conn.fetch(
++        """
++        SELECT id, memory_id, change_type, kind_before, kind_after,
++               status_before, status_after,
++               assignee_before, assignee_after, actor_id, channel, reason, created_at
++        FROM work_item_history
++        WHERE memory_id = $1 AND tenant_id = $2 AND root_memory_id = $3
++        ORDER BY id ASC
++        """,
++        node_id,
++        tenant_id,
++        root_memory_id,
++    )
++
++    # Return empty list if no history (not an error)
++    return [
++        WorkItemHistoryEntry(
++            id=r["id"],
++            memory_id=r["memory_id"],
++            change_type=r["change_type"],
++            kind_before=r["kind_before"],
++            kind_after=r["kind_after"],
++            status_before=r["status_before"],
++            status_after=r["status_after"],
++            assignee_before=r["assignee_before"],
++            assignee_after=r["assignee_after"],
++            actor_id=r["actor_id"],
++            channel=r["channel"],
++            reason=r["reason"],
++            created_at=r["created_at"],
++        )
++        for r in rows
++    ]
++
++
++async def work_items_for_nodes(
++    conn: asyncpg.Connection,
++    *,
++    tenant_id: UUID,
++    node_ids: list[UUID],
++) -> dict[UUID, tuple[str, str, UUID | None]]:
++    """Light lookup returning (kind, status, assignee_id) for each node.
++
++    Used for mindmap_get embedding to show work item info inline.
++    Excludes deleted nodes.
++    """
++    if not node_ids:
++        return {}
++
++    rows = await conn.fetch(
++        """
++        SELECT wi.memory_id, wi.kind, wi.status, wi.assignee_id
++        FROM work_items wi
++        JOIN memories m ON m.id = wi.memory_id AND m.tenant_id = wi.tenant_id
++        WHERE wi.tenant_id = $1 AND wi.memory_id = ANY($2::uuid[]) AND m.deleted_at IS NULL
++        """,
++        tenant_id,
++        node_ids,
++    )
++
++    return {r["memory_id"]: (r["kind"], r["status"], r["assignee_id"]) for r in rows}
+diff --git a/tests/integration/test_mindmap_work_items_e2e.py b/tests/integration/test_mindmap_work_items_e2e.py
+new file mode 100644
+index 0000000..7e889a1
+--- /dev/null
++++ b/tests/integration/test_mindmap_work_items_e2e.py
+@@ -0,0 +1,1567 @@
++# mypy: disable-error-code="attr-defined"
++# BaseTool.__call__ is declared to return BaseModel, so mypy cannot see the
++# concrete output models' fields. Suppressed at module level rather than with
++# 28 inline ignores; the assertions themselves are what give these tests value.
++"""End-to-end integration tests for mindmap work item tools.
++
++Tests the MCP tool layer through the real Postgres pool:
++mark → set_status → set_kind → assign → error cases → transitions → history.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Any
++from uuid import UUID, uuid4
++
++import asyncpg  # type: ignore[import-untyped]
++import pytest
++
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tools._base import ToolContext
++from mem_mcp.mcp.tools.mindmap_close import MindmapCloseInput
++from mem_mcp.mcp.tools.mindmap_get import MindmapGetInput, MindmapGetTool
++from mem_mcp.mcp.tools.mindmap_open import MindmapOpenInput, MindmapOpenTool
++from mem_mcp.mcp.tools.mindmap_work_assign import (
++    MindmapWorkAssignInput,
++)
++from mem_mcp.mcp.tools.mindmap_work_mark import (
++    MindmapWorkMarkInput,
++    MindmapWorkMarkTool,
++)
++from mem_mcp.mcp.tools.mindmap_work_set_kind import (
++    MindmapWorkSetKindInput,
++)
++from mem_mcp.mcp.tools.mindmap_work_set_status import (
++    MindmapWorkSetStatusInput,
++    MindmapWorkSetStatusTool,
++)
++
++# Skip all tests if MEM_MCP_TEST_DSN not set
++pytestmark = pytest.mark.skipif(
++    not os.getenv("MEM_MCP_TEST_DSN"),
++    reason="MEM_MCP_TEST_DSN not set",
++)
++
++
++def _build_deps() -> Any:
++    from mem_mcp.audit.logger import NoopAuditLogger
++    from mem_mcp.mcp.tools._deps import NoopQuotas, ToolDeps
++
++    class _StubEmbed:
++        async def embed(self, content: str) -> Any:
++            from mem_mcp.embeddings.bedrock import EmbedResult
++
++            return EmbedResult(vector=[0.0] * 1024, input_tokens=max(1, len(content) // 4))
++
++    return ToolDeps(embeddings=_StubEmbed(), audit=NoopAuditLogger(), quotas=NoopQuotas())
++
++
++async def _setup(conn: asyncpg.Connection) -> dict[str, Any]:
++    """Set up test data: tenant, team, identity, oauth client, map with nodes."""
++    tenant_a = await conn.fetchval(
++        "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++        f"work-items-a-{uuid4()}@example.test",
++    )
++    tenant_b = await conn.fetchval(
++        "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++        f"work-items-b-{uuid4()}@example.test",
++    )
++
++    team = await conn.fetchval(
++        "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++        f"work-items-team-{uuid4().hex[:8]}",
++        tenant_a,
++    )
++
++    # Assign roles
++    await conn.execute(
++        """
++        INSERT INTO team_role_assignments (parent_team_id, member_kind, member_id, role_id, status, assigned_by_user_id)
++        SELECT $1, 'user', $2, (SELECT id FROM roles_catalog WHERE role_key = 'owner' ORDER BY id LIMIT 1), 'active', $2
++        """,
++        team,
++        tenant_a,
++    )
++    await conn.execute(
++        """
++        INSERT INTO team_role_assignments (parent_team_id, member_kind, member_id, role_id, status, assigned_by_user_id)
++        SELECT $1, 'user', $2, (SELECT id FROM roles_catalog WHERE role_key = 'member' ORDER BY id LIMIT 1), 'active', $2
++        """,
++        team,
++        tenant_b,
++    )
++
++    # Primary identity
++    await conn.execute(
++        """
++        INSERT INTO tenant_identities
++            (tenant_id, cognito_sub, provider, email, is_primary, default_team_id)
++        VALUES ($1, $2, 'cognito', $3, true, $4)
++        """,
++        tenant_a,
++        f"sub-work-items-a-{tenant_a}",
++        f"work-items-a-{tenant_a}@example.test",
++        team,
++    )
++    await conn.execute(
++        """
++        INSERT INTO tenant_identities
++            (tenant_id, cognito_sub, provider, email, is_primary, default_team_id)
++        VALUES ($1, $2, 'cognito', $3, true, $4)
++        """,
++        tenant_b,
++        f"sub-work-items-b-{tenant_b}",
++        f"work-items-b-{tenant_b}@example.test",
++        team,
++    )
++
++    client_id = f"client:work-items-{uuid4().hex[:8]}"
++    await conn.execute(
++        """
++        INSERT INTO oauth_clients (id, redirect_uris, scope, registration_payload, review_status)
++        VALUES ($1, ARRAY[]::text[], 'memory.read memory.write', '{}'::jsonb, 'auto_allowed')
++        """,
++        client_id,
++    )
++
++    return {"tenant_a": tenant_a, "tenant_b": tenant_b, "team": team, "client_id": client_id}
++
++
++async def _cleanup(pool: Any, tenant_a: UUID, tenant_b: UUID, team: UUID, client_id: str, tenant_c: UUID | None = None) -> None:
++    """Clean up test data in reverse order of dependencies."""
++    tenants = [tenant_a, tenant_b]
++    if tenant_c:
++        tenants.append(tenant_c)
++    async with pool.acquire() as conn:
++        async with conn.transaction():
++            await conn.execute(
++                "DELETE FROM memory_references WHERE source_memory_id IN "
++                "(SELECT id FROM memories WHERE tenant_id = ANY($1::uuid[])) "
++                "OR target_memory_id IN (SELECT id FROM memories WHERE tenant_id = ANY($1::uuid[]))",
++                tenants,
++            )
++            await conn.execute("DELETE FROM memory_map_events WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM memory_map_membership WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM work_items WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM work_item_history WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM memory_maps WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM slugs WHERE team_id = $1", team)
++            await conn.execute("DELETE FROM memories WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM team_role_assignments WHERE parent_team_id = $1", team)
++            await conn.execute("DELETE FROM tenant_identities WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM teams WHERE id = $1", team)
++            await conn.execute("DELETE FROM tenants WHERE id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM oauth_clients WHERE id = $1", client_id)
++
++
++def _ctx(pool: Any, tenant: UUID, client_id: str, scopes: frozenset[str] = frozenset({"memory.read", "memory.write"})) -> ToolContext:
++    return ToolContext(
++        request_id=f"req-{uuid4().hex[:8]}",
++        tenant_id=tenant,
++        identity_id=tenant,
++        client_id=client_id,
++        scopes=scopes,
++        db_pool=pool,
++        deps=_build_deps(),
++    )
++
++
+<email>
++async def test_work_item_mark_happy_path_story(pg_pool: Any) -> None:
++    """Mark a node as a work item with kind=story and verify DB state."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        # Open a map and write a node
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Work tracking", root_question="What needs to be done?"),
++        )
++        map_key = opened.map_key
++
++        # Write a position node
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=map_key,
++                content="Implement user authentication",
++                node_role="position",
++            ),
++        )
++        node_id = node.node_id
++
++        # Mark as work item
++        from mem_mcp.mcp.tools._work_item_common import WorkItemOutput
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        result = await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node_id, kind="story"),
++        )
++        assert isinstance(result, WorkItemOutput)
++        assert result.map_key == map_key
++        assert result.kind == "story"
++        assert result.status == "todo"
++        assert result.assignee_id is None
++
++        # Verify DB row state
++        async with pg_pool.acquire() as conn:
++            row = await conn.fetchrow(
++                "SELECT kind, status, assignee_id, created_by FROM work_items WHERE memory_id = $1",
++                node_id,
++            )
++        assert row is not None
++        assert row["kind"] == "story"
++        assert row["status"] == "todo"
++        assert row["assignee_id"] is None
++        assert row["created_by"] == tenant
++
++        # Check history row
++        async with pg_pool.acquire() as conn:
++            hist = await conn.fetchrow(
++                "SELECT change_type, kind_after, status_after, actor_id, channel FROM work_item_history WHERE memory_id = $1 ORDER BY id DESC LIMIT 1",
++                node_id,
++            )
++        assert hist["change_type"] == "created"
++        assert hist["kind_after"] == "story"
++        assert hist["status_after"] == "todo"
++        assert hist["actor_id"] == tenant
++        assert hist["channel"] == "mcp"
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_mark_with_assignee(pg_pool: Any) -> None:
++    """Mark a work item with an assignee."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    tenant_b = s["tenant_b"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        # Open a map and write a node
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Work tracking", root_question="What needs to be done?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Write docs", node_role="position"),
++        )
++        node_id = node.node_id
++
++        # Mark as epic with assignee
++        result = await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(
++                map_key=map_key, node_id=node_id, kind="epic", assignee_id=tenant_b
++            ),
++        )
++        assert result.kind == "epic"
++        assert result.assignee_id == tenant_b
++
++        # Verify DB
++        async with pg_pool.acquire() as conn:
++            row = await conn.fetchrow(
++                "SELECT kind, status, assignee_id FROM work_items WHERE memory_id = $1",
++                node_id,
++            )
++        assert row["assignee_id"] == tenant_b
++
++    finally:
++        await _cleanup(pg_pool, tenant, tenant_b, team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_mark_milestone_kind(pg_pool: Any) -> None:
++    """Mark a work item with kind=milestone."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Release planning", root_question="What's the plan?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="v1.0 release", node_role="position"),
++        )
++        node_id = node.node_id
++
++        result = await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node_id, kind="milestone"),
++        )
++        assert result.kind == "milestone"
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_mark_bad_kind_error(pg_pool: Any) -> None:
++    """Invalid kind names allowed kinds in error message."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Test node", node_role="position"),
++        )
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node.node_id, kind="invalid_kind"),
++        )
++        # Should not reach here
++        raise AssertionError("Expected JsonRpcError")
++    except JsonRpcError as e:
++        assert e.code == -32602
++        assert "kind must be one of" in e.message
++        assert "story" in e.message
++        assert "epic" in e.message
++        assert "milestone" in e.message
++        assert "invalid_work_item_kind" in str(e.data)
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_mark_root_node_rejected(pg_pool: Any) -> None:
++    """Cannot mark the root question node as a work item."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="What should we do?"),
++        )
++
++        # Try to mark root node
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkMarkTool()(
++                ctx,
++                MindmapWorkMarkInput(
++                    map_key=opened.map_key,
++                    node_id=opened.root_memory_id,
++                    kind="story",
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert "root" in exc_info.value.message.lower() or "root_node_not_allowed" in str(exc_info.value.data)
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_mark_node_from_another_map(pg_pool: Any) -> None:
++    """Node from another map should be rejected."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        # Open first map and write a node
++        map1 = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Map1", root_question="Why map1?"),
++        )
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map1.map_key, content="Node in map1", node_role="position"),
++        )
++
++        # Open second map
++        map2 = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Map2", root_question="Why map2?"),
++        )
++
++        # Try to mark node1 as work item in map2
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkMarkTool()(
++                ctx,
++                MindmapWorkMarkInput(
++                    map_key=map2.map_key,
++                    node_id=node1.node_id,
++                    kind="story",
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert exc_info.value.data is not None
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_mark_duplicate_rejected(pg_pool: Any) -> None:
++    """Duplicate mark on same node should error."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=opened.map_key, content="Test", node_role="position"),
++        )
++
++        # First mark
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=opened.map_key, node_id=node.node_id, kind="story"),
++        )
++
++        # Duplicate mark
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkMarkTool()(
++                ctx,
++                MindmapWorkMarkInput(map_key=opened.map_key, node_id=node.node_id, kind="epic"),
++            )
++        assert exc_info.value.code == -32602
++        assert "already" in exc_info.value.message.lower()
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_status_transitions(pg_pool: Any) -> None:
++    """Test all valid status transitions."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Status transitions", root_question="What's the status?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++
++        # Mark as story (initial state = todo)
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node.node_id, kind="story"),
++        )
++
++        # todo -> in_progress (reason required? NO - only blocked, cancelled, done require reason)
++        result = await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node.node_id,
++                status="in_progress",
++                reason="starting work",
++            ),
++        )
++        assert result.status == "in_progress"
++
++        # in_progress -> blocked (reason required)
++        result = await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node.node_id,
++                status="blocked",
++                reason="blocked by external dependency",
++            ),
++        )
++        assert result.status == "blocked"
++
++        # blocked -> in_progress
++        result = await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node.node_id,
++                status="in_progress",
++            ),
++        )
++        assert result.status == "in_progress"
++        # History count: 3 (created, blocked, in_progress)
++
++        # in_progress -> done
++        result = await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node.node_id,
++                status="done",
++            ),
++        )
++        assert result.status == "done"
++        # History count: 4
++
++        # done -> in_progress (requires reason)
++        result = await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node.node_id,
++                status="in_progress",
++                reason="need to fix before shipping",
++            ),
++        )
++        assert result.status == "in_progress"
++        # History count: 5
++
++        # in_progress -> todo
++        result = await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node.node_id,
++                status="todo",
++            ),
++        )
++        assert result.status == "todo"
++        # History count: 6
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_blocked_without_reason_rejected(pg_pool: Any) -> None:
++    """Status -> blocked requires reason."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node.node_id, kind="story"),
++        )
++
++        # First set to in_progress (valid transition to blocked)
++        await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node.node_id,
++                status="in_progress",
++            ),
++        )
++
++        # Try to set to blocked without reason
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkSetStatusTool()(
++                ctx,
++                MindmapWorkSetStatusInput(
++                    map_key=map_key,
++                    node_id=node.node_id,
++                    status="blocked",
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert exc_info.value.data is not None
++        assert exc_info.value.data["code"] == "reason_required"
++        assert exc_info.value.data["errors"][0]["path"] == "reason"
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_cancelled_without_reason_rejected(pg_pool: Any) -> None:
++    """Status -> cancelled requires reason."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node.node_id, kind="story"),
++        )
++
++        # Set to in_progress first
++        await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node.node_id,
++                status="in_progress",
++                reason="started",
++            ),
++        )
++
++        # Try to cancel without reason
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkSetStatusTool()(
++                ctx,
++                MindmapWorkSetStatusInput(
++                    map_key=map_key,
++                    node_id=node.node_id,
++                    status="cancelled",
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert "reason" in exc_info.value.message.lower()
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_disallowed_transition_error(pg_pool: Any) -> None:
++    """Invalid transition reports current/requested and history unchanged."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node.node_id, kind="story"),
++        )
++
++        # Try todo -> done (not allowed)
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkSetStatusTool()(
++                ctx,
++                MindmapWorkSetStatusInput(
++                    map_key=map_key,
++                    node_id=node.node_id,
++                    status="done",
++                    reason="already done",
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert "invalid_transition" in str(exc_info.value.data)
++        assert exc_info.value.data is not None
++        assert exc_info.value.data["current_status"] == "todo"
++        assert exc_info.value.data["requested_status"] == "done"
++
++        # Verify history count unchanged (only the first error attempt, no valid insert)
++        async with pg_pool.acquire() as conn:
++            count = await conn.fetchval(
++                "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1",
++                node.node_id,
++            )
++        assert count == 1  # Only the initial "created" entry
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_reason_blank_rejected(pg_pool: Any) -> None:
++    """Blank reason string should be rejected (reason_required)."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node.node_id, kind="story"),
++        )
++
++        # Set to in_progress first
++        await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node.node_id,
++                status="in_progress",
++                reason="started",
++            ),
++        )
++
++        # Try to set to blocked with blank reason
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkSetStatusTool()(
++                ctx,
++                MindmapWorkSetStatusInput(
++                    map_key=map_key,
++                    node_id=node.node_id,
++                    status="blocked",
++                    reason="   ",  # blank
++                ),
++            )
++        # Should fail for blank reason (treated as no reason)
++        assert exc_info.value.code == -32602 or exc_info.value.data is not None
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_same_status_unchanged(pg_pool: Any) -> None:
++    """Setting same status should error with status_unchanged."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node.node_id, kind="story"),
++        )
++
++        # Set to in_progress
++        await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node.node_id,
++                status="in_progress",
++                reason="started",
++            ),
++        )
++
++        # Try same status again
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkSetStatusTool()(
++                ctx,
++                MindmapWorkSetStatusInput(
++                    map_key=map_key,
++                    node_id=node.node_id,
++                    status="in_progress",
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert "status_unchanged" in str(exc_info.value.data)
++        assert exc_info.value.data is not None
++        assert exc_info.value.data["current_status"] == "in_progress"
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_expected_status_mismatch(pg_pool: Any) -> None:
++    """expected_status mismatch reports actual status."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node.node_id, kind="story"),
++        )
++
++        # Set to in_progress
++        await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node.node_id,
++                status="in_progress",
++                reason="started",
++            ),
++        )
++
++        # Try with wrong expected_status
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkSetStatusTool()(
++                ctx,
++                MindmapWorkSetStatusInput(
++                    map_key=map_key,
++                    node_id=node.node_id,
++                    status="done",
++                    reason="finished",
++                    expected_status="todo",  # wrong!
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert "status_conflict" in str(exc_info.value.data)
++        assert exc_info.value.data is not None
++        assert exc_info.value.data["current_status"] == "in_progress"
++        assert exc_info.value.data["expected_status"] == "todo"
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_branch_status_unchanged(pg_pool: Any) -> None:
++    """Work item status change should not affect branch status in memory_map_membership."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++        node_id = node.node_id
++
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node_id, kind="story"),
++        )
++
++        # Get branch status before
++        async with pg_pool.acquire() as conn:
++            before_status = await conn.fetchval(
++                "SELECT status FROM memory_map_membership WHERE memory_id = $1",
++                node_id,
++            )
++
++        # Change work item status
++        from mem_mcp.mcp.tools.mindmap_work_set_status import MindmapWorkSetStatusTool
++
++        await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node_id,
++                status="in_progress",
++                reason="started",
++            ),
++        )
++
++        # Get branch status after - should be unchanged
++        async with pg_pool.acquire() as conn:
++            after_status = await conn.fetchval(
++                "SELECT status FROM memory_map_membership WHERE memory_id = $1",
++                node_id,
++            )
++
++        assert before_status == after_status == "open"
++
++        # Verify work item status changed
++        async with pg_pool.acquire() as conn:
++            wi_status = await conn.fetchval(
++                "SELECT status FROM work_items WHERE memory_id = $1",
++                node_id,
++            )
++        assert wi_status == "in_progress"
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_viewer_permission_denied(pg_pool: Any) -> None:
++    """Viewer should get -32603 with missing_permission."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant_a, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant_a, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        # Change tenant_a's role from owner to viewer using a new connection
++        async with pg_pool.acquire() as conn_role:
++            await conn_role.execute(
++                """
++                UPDATE team_role_assignments
++                SET role_id = (SELECT id FROM roles_catalog WHERE role_key = 'viewer' ORDER BY id LIMIT 1)
++                WHERE parent_team_id = $1 AND member_kind = 'user' AND member_id = $2
++                """,
++                team,
++                tenant_a,
++            )
++
++        ctx_viewer = _ctx(pg_pool, tenant_a, client_id, frozenset({"memory.read", "memory.write"}))
++
++        try:
++            await MindmapWorkMarkTool()(
++                ctx_viewer,
++                MindmapWorkMarkInput(map_key=map_key, node_id=node.node_id, kind="story"),
++            )
++            raise AssertionError("Expected JsonRpcError")
++        except JsonRpcError as e:
++            assert e.code == -32603
++            assert e.data is not None
++            assert "missing_permission" in e.data
++            assert e.data["missing_permission"] == "team.write_memory"
++
++        # Verify no change was made
++        async with pg_pool.acquire() as conn:
++            exists = await conn.fetchval(
++                "SELECT 1 FROM work_items WHERE memory_id = $1",
++                node.node_id,
++            )
++        assert exists is None
++
++    finally:
++        await _cleanup(pg_pool, tenant_a, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_user_not_on_team_same_error(pg_pool: Any) -> None:
++    """User not on team gets same error as nonexistent map_key."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant_a, tenant_b, team, client_id = s["tenant_a"], s["tenant_b"], s["team"], s["client_id"]
++
++    # tenant_b is NOT on the team
++    ctx = _ctx(pg_pool, tenant_b, client_id)
++
++    try:
++        # Try to use a map_key from tenant_a's team - but tenant_b can't access it
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkMarkTool()(
++                ctx,
++                MindmapWorkMarkInput(
++                    map_key=f"nonexistent-{uuid4().hex[:8]}",
++                    node_id=uuid4(),
++                    kind="story",
++                ),
++            )
++        # Should get -32602 with map not found (opaque error)
++        assert exc_info.value.code == -32602
++        assert exc_info.value.data is not None
++        assert "errors" in exc_info.value.data
++
++    finally:
++        await _cleanup(pg_pool, tenant_a, tenant_b, team, client_id)
++
++
+<email>
++async def test_work_item_assign_reassign_unassign(pg_pool: Any) -> None:
++    """Test assign, reassign, and unassign operations."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant_a, tenant_b, team, client_id = s["tenant_a"], s["tenant_b"], s["team"], s["client_id"]
++
++    # Create tenant_c first, then add to team
++    async with pg_pool.acquire() as conn_tenant:
++        async with conn_tenant.transaction():
++            tenant_c = await conn_tenant.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"assign-reassign-c-{uuid4()}@example.test",
++            )
++            await conn_tenant.execute(
++                """
++                INSERT INTO team_role_assignments (parent_team_id, member_kind, member_id, role_id, status, assigned_by_user_id)
++                SELECT $1, 'user', $2, (SELECT id FROM roles_catalog WHERE role_key = 'member' ORDER BY id LIMIT 1), 'active', $3
++                """,
++                team,
++                tenant_c,
++                tenant_a,  # assigned_by_user_id is a tenant, not a team
++            )
++
++    ctx = _ctx(pg_pool, tenant_a, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++        node_id = node.node_id
++
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node_id, kind="story"),
++        )
++
++        # Check history count after mark (1 entry for "created")
++        async with pg_pool.acquire() as conn:
++            initial_count = await conn.fetchval(
++                "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1",
++                node_id,
++            )
++        assert initial_count == 1  # "created" entry from marking
++
++        # Assign to tenant_b
++        from mem_mcp.mcp.tools.mindmap_work_assign import MindmapWorkAssignTool
++
++        result = await MindmapWorkAssignTool()(
++            ctx,
++            MindmapWorkAssignInput(
++                map_key=map_key,
++                node_id=node_id,
++                assignee_id=tenant_b,
++                reason="assigned to team lead",
++            ),
++        )
++        assert result.assignee_id == tenant_b
++
++        # Reassign to tenant_c
++        result = await MindmapWorkAssignTool()(
++            ctx,
++            MindmapWorkAssignInput(
++                map_key=map_key,
++                node_id=node_id,
++                assignee_id=tenant_c,
++                reason="moved to another team member",
++            ),
++        )
++        assert result.assignee_id == tenant_c
++
++        # Unassign (assignee_id=None)
++        result = await MindmapWorkAssignTool()(
++            ctx,
++            MindmapWorkAssignInput(
++                map_key=map_key,
++                node_id=node_id,
++                assignee_id=None,
++                reason="unassigned",
++            ),
++        )
++        assert result.assignee_id is None
++
++        # Verify history count - 3 changes (assign, reassign, unassign)
++        async with pg_pool.acquire() as conn:
++            count = await conn.fetchval(
++                "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1",
++                node_id,
++            )
++            assert count == initial_count + 3
++            rows = await conn.fetch(
++                "SELECT change_type, assignee_after FROM work_item_history WHERE memory_id = $1",
++                node_id,
++            )
++            # Should have 1 "created" and 3 "owner" entries
++            change_types = [row["change_type"] for row in rows]
++            assert "created" in change_types
++            assert sum(1 for ct in change_types if ct == "owner") == 3
++
++    finally:
++        await _cleanup(pg_pool, tenant_a, tenant_b, team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_kind_change(pg_pool: Any) -> None:
++    """Test changing work item kind."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++        node_id = node.node_id
++
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        # Mark as story
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node_id, kind="story"),
++        )
++
++        # Change to epic
++        from mem_mcp.mcp.tools.mindmap_work_set_kind import MindmapWorkSetKindTool
++
++        result = await MindmapWorkSetKindTool()(
++            ctx,
++            MindmapWorkSetKindInput(
++                map_key=map_key,
++                node_id=node_id,
++                kind="epic",
++                reason="needs to track multiple stories",
++            ),
++        )
++        assert result.kind == "epic"
++
++        # Try same kind should fail with kind_unchanged
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkSetKindTool()(
++                ctx,
++                MindmapWorkSetKindInput(
++                    map_key=map_key,
++                    node_id=node_id,
++                    kind="epic",
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert "kind_unchanged" in str(exc_info.value.data)
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_history_one_row_per_success(pg_pool: Any) -> None:
++    """Each successful operation creates exactly one history row with channel='mcp'."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++        node_id = node.node_id
++
++        # Mark - 1 history
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node_id, kind="story"),
++        )
++        async with pg_pool.acquire() as conn:
++            assert await conn.fetchval(
++                "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1", node_id
++            ) == 1
++
++        # Set status - 2 history
++        from mem_mcp.mcp.tools.mindmap_work_set_status import MindmapWorkSetStatusTool
++
++        await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node_id,
++                status="in_progress",
++                reason="started",
++            ),
++        )
++        async with pg_pool.acquire() as conn:
++            assert await conn.fetchval(
++                "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1", node_id
++            ) == 2
++
++        # Set kind - 3 history
++        from mem_mcp.mcp.tools.mindmap_work_set_kind import MindmapWorkSetKindTool
++
++        await MindmapWorkSetKindTool()(
++            ctx,
++            MindmapWorkSetKindInput(map_key=map_key, node_id=node_id, kind="epic", reason="promoted"),
++        )
++        async with pg_pool.acquire() as conn:
++            assert await conn.fetchval(
++                "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1", node_id
++            ) == 3
++
++        # Verify all channels are 'mcp'
++        async with pg_pool.acquire() as conn:
++            channels = await conn.fetchval(
++                "SELECT array_agg(DISTINCT channel) FROM work_item_history WHERE memory_id = $1",
++                node_id,
++            )
++        assert channels == ["mcp"]
++
++        # Verify actor is tenant
++        async with pg_pool.acquire() as conn:
++            actors = await conn.fetchval(
++                "SELECT array_agg(DISTINCT actor_id) FROM work_item_history WHERE memory_id = $1",
++                node_id,
++            )
++        assert actors == [tenant]
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_get_for_plain_node_unchanged(pg_pool: Any) -> None:
++    """mindmap_get output for a plain node unchanged after marking as work item."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        # Get node content BEFORE
++        node1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Node 1 content", node_role="position"),
++        )
++
++        # Get node content BEFORE work item marking
++        get_before = await MindmapGetTool()(ctx, MindmapGetInput(map_key=map_key))
++        node1_before = next(n for n in get_before.nodes if n.memory_id == node1.node_id)
++        assert node1_before.content == "Node 1 content"
++        assert node1_before.status == "open"  # branch status, not work item status
++
++        # Mark as work item
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node1.node_id, kind="story"),
++        )
++
++        # Get node content AFTER
++        get_after = await MindmapGetTool()(ctx, MindmapGetInput(map_key=map_key))
++        node1_after = next(n for n in get_after.nodes if n.memory_id == node1.node_id)
++
++        # Content should be unchanged
++        assert node1_after.content == "Node 1 content"
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_work_item_archived_map_mark_rejected_status_change_works(pg_pool: Any) -> None:
++    """Archived map: cannot mark, but can change status/kind/assign."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test", root_question="Question?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
++        )
++        node_id = node.node_id
++
++        # Write a second node BEFORE closing the map
++        node2 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Another task", node_role="position"),
++        )
++
++        # Mark node1 as work item, then close the map
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++
++        await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node_id, kind="story"),
++        )
++
++        # Close the map - now archived
++        from mem_mcp.mcp.tools.mindmap_close import MindmapCloseTool
++
++        await MindmapCloseTool()(
++            ctx,
++            MindmapCloseInput(
++                map_key=map_key,
++                confirmed_decisions=[],
++            ),
++        )
++
++        # Try to mark node2 on archived map - should fail
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkMarkTool()(
++                ctx,
++                MindmapWorkMarkInput(map_key=map_key, node_id=node2.node_id, kind="story"),
++            )
++        assert exc_info.value.code == -32602
++        assert "archived" in exc_info.value.message
++
++        # But status change should work on existing work item
++        from mem_mcp.mcp.tools.mindmap_work_set_status import MindmapWorkSetStatusTool
++
++        # First change todo -> in_progress (allowed transition)
++        result = await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node_id,
++                status="in_progress",
++            ),
++        )
++        assert result.status == "in_progress"
++
++        # Then in_progress -> done (allowed transition, no reason required)
++        result = await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node_id,
++                status="done",
++                reason="completed",
++            ),
++        )
++        assert result.status == "done"
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
+diff --git a/tests/unit/test_work_items_service.py b/tests/unit/test_work_items_service.py
+new file mode 100644
+index 0000000..3163306
+--- /dev/null
++++ b/tests/unit/test_work_items_service.py
+@@ -0,0 +1,1879 @@
++"""Tests for the work item service layer.
++
++Covers all allowed/disallowed status transitions, permission checks,
++tenancy isolation, and history append-only behavior.
++"""
++
++from __future__ import annotations
++
++from uuid import UUID, uuid4
++
++import asyncpg  # type: ignore[import-untyped]
++import pytest
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mindmap.work_items import (
++    AlreadyWorkItemError,
++    AssigneeUnchangedError,
++    InvalidAssigneeError,
++    InvalidKindError,
++    InvalidTransitionError,
++    KindUnchangedError,
++    NodeNotInMapError,
++    NotAWorkItemError,
++    ReasonRequiredError,
++    RootNodeNotAllowedError,
++    StatusConflictError,
++    StatusUnchangedError,
++    WorkItemMapNotFoundError,
++    WorkItemPermissionDeniedError,
++    work_items_for_nodes,
++)
++from mem_mcp.teams.assignments import assign_role
++
++pytestmark = pytest.mark.asyncio
++
++
++# -------------------------------------------------------------------------
++# Fixtures
++# -------------------------------------------------------------------------
++
++
+<email>
++async def tenant_a(pg_pool: asyncpg.Pool) -> UUID:
++    """Create tenant A."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"tenant-a-{uuid4()}@example.test",
++            )
++            return tid  # type: ignore[no-any-return]
++
++
+<email>
++async def tenant_b(pg_pool: asyncpg.Pool) -> UUID:
++    """Create tenant B."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"tenant-b-{uuid4()}@example.test",
++            )
++            return tid  # type: ignore[no-any-return]
++
++
+<email>
++async def team_a(pg_pool: asyncpg.Pool, tenant_a: UUID) -> UUID:
++    """Create team A with tenant A as owner."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++                f"team-a-{uuid4().hex[:8]}",
++                tenant_a,
++            )
++            await assign_role(
++                conn,
++                parent_team_id=tid,
++                member_kind="user",
++                member_id=tenant_a,
++                role_key="owner",
++                assigned_by_user_id=tenant_a,
++            )
++            return tid  # type: ignore[no-any-return]
++
++
+<email>
++async def team_b(pg_pool: asyncpg.Pool, tenant_b: UUID) -> UUID:
++    """Create team B with tenant B as owner."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++                f"team-b-{uuid4().hex[:8]}",
++                tenant_b,
++            )
++            await assign_role(
++                conn,
++                parent_team_id=tid,
++                member_kind="user",
++                member_id=tenant_b,
++                role_key="owner",
++                assigned_by_user_id=tenant_b,
++            )
++            return tid  # type: ignore[no-any-return]
++
++
++async def _setup_map(
++    conn: asyncpg.Connection,
++    tenant_id: UUID,
++    team_id: UUID,
++    title: str = "Test Map",
++    state: str = "live",
++) -> tuple[UUID, UUID, str]:
++    """Create a live mind-map with a root memory and a child node.
++
++    Returns (root_memory_id, child_memory_id, map_key).
++    """
++    # Create root memory
++    root_mem_id = await conn.fetchval(
++        """
++        INSERT INTO memories (tenant_id, team_id, content, content_hash,
++                             embedding, source_kind, type, visibility)
++        VALUES ($1, $2, 'Root node content', $3,
++                array_fill(0::real, ARRAY[1024])::vector, 'api', 'question', 'team')
++        RETURNING id
++        """,
++        tenant_id,
++        team_id,
++        f"hash-root-{uuid4().hex}",
++    )
++
++    # Create child node
++    child_mem_id = await conn.fetchval(
++        """
++        INSERT INTO memories (tenant_id, team_id, content, content_hash,
++                             embedding, source_kind, type, visibility)
++        VALUES ($1, $2, 'Child node content', $3,
++                array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++        RETURNING id
++        """,
++        tenant_id,
++        team_id,
++        f"hash-child-{uuid4().hex}",
++    )
++
++    # Insert into memory_maps (root_memory_id is PK and FK to memories)
++    await conn.execute(
++        """
++        INSERT INTO memory_maps
++            (root_memory_id, tenant_id, team_id, title, state)
++        VALUES ($1, $2, $3, $4, $5)
++        """,
++        root_mem_id,
++        tenant_id,
++        team_id,
++        title,
++        state,
++    )
++
++    # Add child to map via memory_map_membership
++    await conn.execute(
++        """
++        INSERT INTO memory_map_membership
++            (memory_id, root_memory_id, tenant_id, node_role, turn, authored_by)
++        VALUES ($1, $2, $3, 'position', 'owner', 'owner')
++        """,
++        child_mem_id,
++        root_mem_id,  # root_memory_id in membership = memory_maps.root_memory_id
++        tenant_id,
++    )
++
++    # Create slug for map_key
++    map_key = f"map-{uuid4().hex[:8]}"
++    await conn.execute(
++        """
++        INSERT INTO slugs
++            (memory_id, team_id, resource_type, slug, title)
++        VALUES ($1, $2, 'map', $3, $4)
++        """,
++        root_mem_id,
++        team_id,
++        map_key,
++        title,  # title is required
++    )
++
++    return root_mem_id, child_mem_id, map_key
++
++
+<email>
++async def map_setup(pg_pool: asyncpg.Pool, tenant_a: UUID, team_a: UUID) -> tuple[UUID, UUID, str]:
++    """Create a live mind-map with a root memory and child node.
++
++    Returns (root_memory_id, node_memory_id, map_key).
++    """
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            return await _setup_map(conn, tenant_a, team_a)
++
++
+<email>
++async def archived_map_setup(
++    pg_pool: asyncpg.Pool, tenant_a: UUID, team_a: UUID
++) -> tuple[UUID, UUID, str]:
++    """Create an archived mind-map with a root memory and child node.
++
++    Returns (root_memory_id, node_memory_id, map_key).
++    """
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            return await _setup_map(conn, tenant_a, team_a, title="Archived Map", state="archived")
++
++
+<email>
++async def member_tenant(pg_pool: asyncpg.Pool, tenant_a: UUID, team_a: UUID) -> UUID:
++    """Create a tenant that is a member (not owner) of team_a."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"member-{uuid4()}@example.test",
++            )
++            await assign_role(
++                conn,
++                parent_team_id=team_a,
++                member_kind="user",
++                member_id=tid,
++                role_key="member",
++                assigned_by_user_id=tenant_a,
++            )
++            return tid  # type: ignore[no-any-return]
++
++
+<email>
++async def viewer_tenant(pg_pool: asyncpg.Pool, tenant_a: UUID, team_a: UUID) -> UUID:
++    """Create a tenant that is a viewer of team_a (read-only)."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"viewer-{uuid4()}@example.test",
++            )
++            await assign_role(
++                conn,
++                parent_team_id=team_a,
++                member_kind="user",
++                member_id=tid,
++                role_key="viewer",
++                assigned_by_user_id=tenant_a,
++            )
++            return tid  # type: ignore[no-any-return]
++
++
++# -------------------------------------------------------------------------
++# Status transition tests
++# -------------------------------------------------------------------------
++
++
+<email>(
++    "current,requested,reason_required",
++    [
++        ("todo", "in_progress", False),
++        ("todo", "cancelled", True),
++        ("in_progress", "blocked", True),
++        ("in_progress", "done", False),
++        ("in_progress", "todo", False),
++        ("in_progress", "cancelled", True),
++        ("blocked", "in_progress", False),
++        ("blocked", "cancelled", True),
++        ("done", "in_progress", True),
++        ("cancelled", "todo", True),
++    ],
++)
++async def test_allowed_status_transitions(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    current: str,
++    requested: str,
++    reason_required: bool,
++) -> None:
++    """Every allowed transition should succeed."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Helper to get to a status from todo via valid path
++    async def setup_to_status(conn: asyncpg.Connection, target_status: str) -> None:
++        if target_status == "todo":
++            return  # Already at todo after marking
++        if target_status == "in_progress":
++            await work_items.set_work_item_status(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                status="in_progress",
++            )
++        elif target_status == "blocked":
++            # Path: todo -> in_progress -> blocked (blocked requires reason)
++            await work_items.set_work_item_status(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                status="in_progress",
++            )
++            await work_items.set_work_item_status(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                status="blocked",
++                reason="setup to blocked",
++            )
++        elif target_status == "done":
++            # Path: todo -> in_progress -> done
++            await work_items.set_work_item_status(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                status="in_progress",
++            )
++            await work_items.set_work_item_status(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                status="done",
++            )
++        elif target_status == "cancelled":
++            # Path: todo -> cancelled (cancelled requires reason)
++            await work_items.set_work_item_status(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                status="cancelled",
++                reason="setup to cancelled",
++            )
++
++    # First mark as work item (starts at todo)
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wi = await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++            reason="initial",
++        )
++        assert wi.status == "todo"
++
++    # Set up initial status using valid path
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await setup_to_status(conn, current)
++
++    # Now transition to requested status
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wi = await work_items.set_work_item_status(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            status=requested,
++            reason="test reason" if reason_required else None,
++        )
++        assert wi.status == requested
++
++        # Verify history was created
++        history = await work_items.get_work_item_history(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++        )
++        # At least the transition should be recorded
++        assert len(history) >= 1
++        assert history[-1].change_type == "status"
++
++
+<email>(
++    "current,requested",
++    [
++        ("blocked", "done"),  # skipped done
++        ("todo", "done"),  # skipped done
++        ("cancelled", "in_progress"),  # cannot resume from cancelled
++        ("done", "todo"),  # cannot go backwards
++    ],
++)
++async def test_disallowed_status_transitions(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++    current: str,
++    requested: str,
++) -> None:
++    """Disallowed transitions should raise InvalidTransitionError."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++    reason = "test reason"
++
++    # First mark as work item with initial status
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++            reason=reason,
++        )
++
++        # Manually set status to current
++        await conn.execute(
++            "UPDATE work_items SET status = $1, status_changed_at = now() WHERE memory_id = $2",
++            current,
++            node_id,
++        )
++
++    # Now try the disallowed transition
++    with pytest.raises(InvalidTransitionError) as exc_info:
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.set_work_item_status(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                status=requested,
++                reason="test reason",
++            )
++
++    assert exc_info.value.current == current
++    assert exc_info.value.requested == requested
++
++
++async def test_reason_required_with_none(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Transition that requires reason should fail with None."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Mark as work item
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++            reason="initial",
++        )
++
++    # Cancel requires reason - should fail with None
++    with pytest.raises(ReasonRequiredError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.set_work_item_status(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                status="cancelled",
++                reason=None,
++            )
++
++
++async def test_reason_required_with_whitespace(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Transition that requires reason should fail with whitespace-only reason."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Mark as work item
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++            reason="initial",
++        )
++
++    # Cancel requires reason - should fail with whitespace
++    with pytest.raises(ReasonRequiredError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.set_work_item_status(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                status="cancelled",
++                reason="   ",  # whitespace only
++            )
++
++
++async def test_status_unchanged_error(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Setting same status should raise StatusUnchangedError."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++            reason="initial",
++        )
++
++    with pytest.raises(StatusUnchangedError) as exc_info:
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.set_work_item_status(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                status="todo",
++                reason="test",
++            )
++
++    assert exc_info.value.current == "todo"
++
++
++async def test_status_conflict_error(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Expected status mismatch should raise StatusConflictError."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++            reason="initial",
++        )
++        # Set status to in_progress
++        await work_items.set_work_item_status(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            status="in_progress",
++            reason="test",
++        )
++
++    # Try to cancel while in_progress, expecting todo
++    with pytest.raises(StatusConflictError) as exc_info:
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.set_work_item_status(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                status="cancelled",
++                reason="done",
++                expected_status="todo",
++            )
++
++    assert exc_info.value.expected == "todo"
++    assert exc_info.value.actual == "in_progress"
++
++
++# -------------------------------------------------------------------------
++# Permission tests
++# -------------------------------------------------------------------------
++
++
++async def test_viewer_permission_denied(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    viewer_tenant: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Viewer role should be denied write access."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Viewer cannot mark work items
++    with pytest.raises(WorkItemPermissionDeniedError) as exc_info:
++        async with tenant_tx(pg_pool, viewer_tenant) as conn:
++            await work_items.mark_work_item(
++                conn,
++                tenant_id=viewer_tenant,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                kind="story",
++            )
++
++    assert exc_info.value.team_id == team_a
++    # Verify nothing was written
++    async with tenant_tx(pg_pool, viewer_tenant) as conn:
++        result = await conn.fetchrow("SELECT 1 FROM work_items WHERE memory_id = $1", node_id)
++        assert result is None
++
++
++async def test_non_member_team_not_found(
++    pg_pool: asyncpg.Pool,
++    tenant_b: UUID,  # Not in team_a
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Non-member tenant should get WorkItemMapNotFoundError, not permission denied."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    with pytest.raises(WorkItemMapNotFoundError):
++        async with tenant_tx(pg_pool, tenant_b) as conn:
++            await work_items.mark_work_item(
++                conn,
++                tenant_id=tenant_b,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                kind="story",
++            )
++
++
++# -------------------------------------------------------------------------
++# Mark validation tests
++# -------------------------------------------------------------------------
++
++
++async def test_mark_invalid_kind(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Invalid kind should raise InvalidKindError."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    with pytest.raises(InvalidKindError) as exc_info:
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.mark_work_item(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                kind="invalid_kind",
++            )
++
++    assert exc_info.value.kind == "invalid_kind"
++    assert "story" in exc_info.value.allowed
++
++
++async def test_mark_root_node_not_allowed(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Root node cannot be marked as work item."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    with pytest.raises(RootNodeNotAllowedError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.mark_work_item(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=root_mem_id,  # root node
++                kind="story",
++            )
++
++
++async def test_mark_non_member_node(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Node not in map should raise NodeNotInMapError."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++    other_node = uuid4()  # Not in the map
++
++    with pytest.raises(NodeNotInMapError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.mark_work_item(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=other_node,
++                kind="story",
++            )
++
++
++async def test_mark_duplicate_no_change(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Marking already-marked node should raise AlreadyWorkItemError and not change anything."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # First mark succeeds
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++            reason="first mark",
++        )
++
++    # Second mark should fail
++    with pytest.raises(AlreadyWorkItemError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.mark_work_item(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                kind="epic",  # Different kind
++                reason="second mark",
++            )
++
++    # Verify no history row from second attempt
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        history = await work_items.get_work_item_history(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++        )
++        # Only 1 history row (from first mark)
++        assert len(history) == 1
++        assert history[0].change_type == "created"
++
++
++async def test_mark_viewer_bad_kind_gets_permission_denied(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    viewer_tenant: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Viewer with bad kind should get permission denied, not invalid kind error."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Viewer should get permission denied, not invalid kind error
++    # (permission is checked before kind validation)
++    with pytest.raises(WorkItemPermissionDeniedError) as exc_info:
++        async with tenant_tx(pg_pool, viewer_tenant) as conn:
++            await work_items.mark_work_item(
++                conn,
++                tenant_id=viewer_tenant,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                kind="invalid_kind",
++            )
++
++    assert exc_info.value.team_id == team_a
++
++
++async def test_mark_non_member_bad_kind_gets_not_found(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    tenant_b: UUID,  # Not on team_a
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Non-member should get map not found, not invalid kind error."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Non-member should get WorkItemMapNotFoundError (opaque error),
++    # not InvalidKindError (the map check happens before kind validation)
++    with pytest.raises(WorkItemMapNotFoundError):
++        async with tenant_tx(pg_pool, tenant_b) as conn:
++            await work_items.mark_work_item(
++                conn,
++                tenant_id=tenant_b,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                kind="invalid_kind",
++            )
++
++
++# -------------------------------------------------------------------------
++# Archived map tests
++# -------------------------------------------------------------------------
++
++
++async def test_kind_on_archived_map_allowed(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Kind change on archived map should be allowed after map is archived."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Mark on live map
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wi = await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++        assert wi.map_state == "live"
++
++    # Archive the map
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            await conn.execute(
++                "UPDATE memory_maps SET state = 'archived' WHERE root_memory_id = $1",
++                root_mem_id,
++            )
++
++    # Change kind on archived map - should be allowed
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wi = await work_items.set_work_item_kind(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="epic",
++            reason="changed to epic",
++        )
++        assert wi.kind == "epic"
++
++
++# -------------------------------------------------------------------------
++# Assignee tests
++# -------------------------------------------------------------------------
++
++
++async def test_assign_unassign(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Unassign should work correctly."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Create a second user to assign
++    member_id = await pg_pool.fetchval(
++        "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++        f"assignee-{uuid4()}@example.test",
++    )
++    await assign_role(
++        pg_pool,
++        parent_team_id=team_a,
++        member_kind="user",
++        member_id=member_id,
++        role_key="member",
++        assigned_by_user_id=tenant_a,
++    )
++
++    # Mark and assign
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wi = await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++            assignee_id=member_id,
++        )
++        assert wi.assignee_id == member_id
++
++    # Unassign
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wi = await work_items.assign_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            assignee_id=None,  # Unassign
++        )
++        assert wi.assignee_id is None
++
++
++async def test_assign_invalid_assignee(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Assigning non-member or removed member should fail."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Create a tenant not in the team (vendor = read-only)
++    vendor_id = await pg_pool.fetchval(
++        "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++        f"vendor-{uuid4()}@example.test",
++    )
++    await assign_role(
++        pg_pool,
++        parent_team_id=team_a,
++        member_kind="user",
++        member_id=vendor_id,
++        role_key="vendor",  # Read-only
++        assigned_by_user_id=tenant_a,
++    )
++
++    # Mark first
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++
++    # Try to assign vendor - should fail
++    with pytest.raises(InvalidAssigneeError) as exc_info:
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.assign_work_item(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                assignee_id=vendor_id,
++            )
++
++    assert exc_info.value.assignee_id == vendor_id
++
++
++async def test_assignee_unchanged(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Assigning same assignee should raise AssigneeUnchangedError."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++            assignee_id=tenant_a,  # First assign tenant_a
++        )
++
++    # Try to assign same tenant again (should fail - unchanged)
++    with pytest.raises(AssigneeUnchangedError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.assign_work_item(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                assignee_id=tenant_a,
++            )
++
++
++async def test_reassigned_member_remains_assignee(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Removed member should remain visible as assignee."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Create a member and assign them
++    member_id = await pg_pool.fetchval(
++        "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++        f"assignee-{uuid4()}@example.test",
++    )
++    await assign_role(
++        pg_pool,
++        parent_team_id=team_a,
++        member_kind="user",
++        member_id=member_id,
++        role_key="member",
++        assigned_by_user_id=tenant_a,
++    )
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wi = await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++            assignee_id=member_id,
++        )
++        assert wi.assignee_id == member_id
++
++    # Now remove the member (change to viewer)
++    await assign_role(
++        pg_pool,
++        parent_team_id=team_a,
++        member_kind="user",
++        member_id=member_id,
++        role_key="viewer",  # Downgrade to viewer
++        assigned_by_user_id=tenant_a,
++    )
++
++    # Try to assign back - should get AssigneeUnchangedError since they're the same
++    with pytest.raises(AssigneeUnchangedError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.assign_work_item(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                assignee_id=member_id,  # Same assignee
++            )
++
++
++# -------------------------------------------------------------------------
++# History tests
++# -------------------------------------------------------------------------
++
++
++async def test_history_append_only(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """history table should be append-only - verify RLS deny policies exist."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Create a history entry
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++
++    # Verify RLS policies exist and deny UPDATE/DELETE for mem_app
++    # The policies must be in place to ensure append-only history
++    async with pg_pool.acquire() as conn:
++        # Check that UPDATE deny policy exists
++        deny_update = await conn.fetchrow(
++            "SELECT polname FROM pg_policy "
++            "WHERE polrelid = 'work_item_history'::regclass AND polname = 'work_item_history_update_deny'"
++        )
++        assert deny_update is not None, "work_item_history_update_deny policy not found"
++
++        # Check that DELETE deny policy exists
++        deny_delete = await conn.fetchrow(
++            "SELECT polname FROM pg_policy "
++            "WHERE polrelid = 'work_item_history'::regclass AND polname = 'work_item_history_delete_deny'"
++        )
++        assert deny_delete is not None, "work_item_history_delete_deny policy not found"
++
++        # Verify SELECT and INSERT policies exist for mem_app
++        select_policy = await conn.fetchrow(
++            "SELECT 1 FROM pg_policy "
++            "WHERE polrelid = 'work_item_history'::regclass AND polname = 'work_item_history_select'"
++        )
++        assert select_policy is not None, "work_item_history_select policy not found"
++
++        insert_policy = await conn.fetchrow(
++            "SELECT 1 FROM pg_policy "
++            "WHERE polrelid = 'work_item_history'::regclass AND polname = 'work_item_history_insert'"
++        )
++        assert insert_policy is not None, "work_item_history_insert policy not found"
++
++        # Verify RLS is enabled
++        rls_enabled = await conn.fetchval(
++            "SELECT relrowsecurity FROM pg_class WHERE relname = 'work_item_history'"
++        )
++        assert rls_enabled, "RLS not enabled on work_item_history"
++
++
++async def test_last_history_matches_current_state(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Last row's *_after values should match current work item state."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++            assignee_id=None,
++        )
++        await work_items.set_work_item_status(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            status="in_progress",
++        )
++        await work_items.set_work_item_kind(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="epic",
++        )
++
++    # Check history
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        history = await work_items.get_work_item_history(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++        )
++
++        # Last entry's *_after should match current state
++        current_wi = await work_items.get_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++        )
++
++        last_entry = history[-1]
++        assert last_entry.kind_after == current_wi.kind
++        assert last_entry.status_after == current_wi.status
++        assert last_entry.assignee_after == current_wi.assignee_id
++
++
++async def test_history_oldest_first(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """History should be ordered oldest-first by id."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++        await work_items.set_work_item_status(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            status="in_progress",
++        )
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        history = await work_items.get_work_item_history(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++        )
++
++        # Should have 2 entries, created first, then status
++        assert len(history) == 2
++        assert history[0].change_type == "created"
++        assert history[1].change_type == "status"
++        assert history[0].id < history[1].id
++
++
++# -------------------------------------------------------------------------
++# Membership status unchanged test
++# -------------------------------------------------------------------------
++
++
++async def test_branch_status_unchanged_after_work_item_status(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Changing work item status should not affect branch status in memory_map_membership."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Get initial membership status
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        mem_before = await conn.fetchrow(
++            "SELECT status FROM memory_map_membership WHERE memory_id = $1",
++            node_id,
++        )
++
++    # Change work item status
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++        await work_items.set_work_item_status(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            status="in_progress",
++        )
++
++    # Check membership status unchanged
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        mem_after = await conn.fetchrow(
++            "SELECT status FROM memory_map_membership WHERE memory_id = $1",
++            node_id,
++        )
++
++    assert mem_before["status"] == mem_after["status"]
++
++
++# -------------------------------------------------------------------------
++# List work items tests
++# -------------------------------------------------------------------------
++
++
++async def test_list_work_items_filters(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """List should support status/kind/assignee/unassigned/map_state filters."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Create another node in the same map
++    other_node = await pg_pool.fetchval(
++        """
++        INSERT INTO memories (tenant_id, team_id, content, content_hash,
++                             embedding, source_kind, type, visibility)
++        VALUES ($1, $2, 'Other node', $3,
++                array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++        RETURNING id
++        """,
++        tenant_a,
++        team_a,
++        f"hash-other-{uuid4().hex}",
++    )
++    # Add other node to map
++    await pg_pool.execute(
++        """
++        INSERT INTO memory_map_membership
++            (memory_id, root_memory_id, tenant_id, node_role, turn, authored_by)
++        VALUES ($1, $2, $3, 'position', 'owner', 'owner')
++        """,
++        other_node,
++        root_mem_id,
++        tenant_a,
++    )
++
++    # Mark both nodes with different kinds
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=other_node,
++            kind="epic",
++        )
++        await work_items.set_work_item_status(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            status="in_progress",
++        )
++
++    # Filter by kind
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        stories = await work_items.list_work_items(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            kind="story",
++        )
++        assert len(stories) == 1
++        assert stories[0].kind == "story"
++
++    # Filter by status
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        in_progress = await work_items.list_work_items(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            status="in_progress",
++        )
++        assert len(in_progress) == 1
++        assert in_progress[0].status == "in_progress"
++
++
++# -------------------------------------------------------------------------
++# Two-tenant isolation tests
++# -------------------------------------------------------------------------
++
++
++async def test_two_tenant_isolation(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    tenant_b: UUID,
++    team_a: UUID,
++    team_b: UUID,
++) -> None:
++    """Work items in one tenant should not be visible to another tenant."""
++    from mem_mcp.mindmap import work_items
++
++    # Create map in tenant_a
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        root_mem_id, node_id, map_key = await _setup_map(conn, tenant_a, team_a)
++
++    # Mark as work item
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++
++    # tenant_b should not see it (different team)
++    with pytest.raises(WorkItemMapNotFoundError):
++        async with tenant_tx(pg_pool, tenant_b) as conn:
++            await work_items.get_work_item(
++                conn,
++                tenant_id=tenant_b,
++                team_id=team_b,  # Different team
++                map_key=map_key,  # Same key, but in different team
++                node_id=node_id,
++            )
++
++
++# -------------------------------------------------------------------------
++# work_items_for_nodes tests
++# -------------------------------------------------------------------------
++
++
++async def test_work_items_for_nodes_embedding(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """work_items_for_nodes should return light lookup for embedding."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Mark one node
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++            assignee_id=tenant_a,
++        )
++
++    # Query for both nodes (one with WI, one without)
++    other_node = uuid4()  # Not a work item
++    result = await work_items_for_nodes(
++        pg_pool,
++        tenant_id=tenant_a,
++        node_ids=[node_id, other_node],
++    )
++
++    # Only the marked node should be in result
++    assert node_id in result
++    assert result[node_id] == ("story", "todo", tenant_a)
++    assert other_node not in result
++
++
++async def test_work_items_for_nodes_excludes_deleted(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Deleted memories should be excluded from lookup."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Mark node
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++
++    # Soft-delete the memory
++    await pg_pool.execute(
++        "UPDATE memories SET deleted_at = now() WHERE id = $1",
++        node_id,
++    )
++
++    # Should not return deleted node
++    result = await work_items_for_nodes(
++        pg_pool,
++        tenant_id=tenant_a,
++        node_ids=[node_id],
++    )
++    assert node_id not in result
++
++
++async def test_mark_race_condition_unique_violation(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Concurrent mark on same node should raise AlreadyWorkItemError."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Pre-get history count before first mark
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        initial_count = await conn.fetchval(
++            "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1",
++            node_id,
++        )
++
++    # Simulate a race condition by inserting a work_items row directly
++    # This bypasses the pre-check, simulating concurrent access
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await conn.execute(
++            """
++            INSERT INTO work_items
++                (memory_id, root_memory_id, tenant_id, team_id, kind, assignee_id,
++                 created_by, status, status_changed_at)
++            VALUES ($1, $2, $3, $4, 'story', NULL, $3, 'todo', now())
++            """,
++            node_id,
++            root_mem_id,
++            tenant_a,
++            team_a,
++        )
++
++    # Now mark_work_item should fail with AlreadyWorkItemError
++    # due to UniqueViolationError from the INSERT
++    with pytest.raises(AlreadyWorkItemError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.mark_work_item(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                kind="story",
++            )
++
++    # History count should be unchanged (no new history row created)
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        final_count = await conn.fetchval(
++            "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1",
++            node_id,
++        )
++    assert final_count == initial_count  # No new history row
++
++
++# -------------------------------------------------------------------------
++# Kind validation tests
++# -------------------------------------------------------------------------
++
++
++async def test_kind_unchanged_error(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Setting same kind should raise KindUnchangedError."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++
++    with pytest.raises(KindUnchangedError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.set_work_item_kind(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                kind="story",  # Same kind
++            )
++
++
++async def test_cross_tenant_assignee_rejected(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    tenant_b: UUID,  # Different tenant - not on same team
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Assigning someone from another tenant should be rejected."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Mark as work item
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++
++    # tenant_b is on team_b, not team_a - cannot be assignee
++    with pytest.raises(InvalidAssigneeError) as exc_info:
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.assign_work_item(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=node_id,
++                assignee_id=tenant_b,  # From different tenant/team
++            )
++
++    assert exc_info.value.assignee_id == tenant_b
++
++
++async def test_wrong_map_key_rejected(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Using a map_key that doesn't exist or belongs to another team should fail."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Mark as work item on the first map
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++
++    # Use a wrong/nonexistent map_key
++    with pytest.raises(WorkItemMapNotFoundError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.set_work_item_status(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key="nonexistent-map-xyz",  # Wrong map_key
++                node_id=node_id,
++                status="in_progress",
++            )
++
++
++async def test_list_work_items_team_wide(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """list_work_items with map_key=None should list all work items in team."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # Create another node in the same map
++    other_node = await pg_pool.fetchval(
++        """
++        INSERT INTO memories (tenant_id, team_id, content, content_hash,
++                             embedding, source_kind, type, visibility)
++        VALUES ($1, $2, 'Another node', $3,
++                array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++        RETURNING id
++        """,
++        tenant_a,
++        team_a,
++        f"hash-other-{uuid4().hex}",
++    )
++    await pg_pool.execute(
++        """
++        INSERT INTO memory_map_membership
++            (memory_id, root_memory_id, tenant_id, node_role, turn, authored_by)
++        VALUES ($1, $2, $3, 'position', 'owner', 'owner')
++        """,
++        other_node,
++        root_mem_id,
++        tenant_a,
++    )
++
++    # Mark both nodes as work items
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=other_node,
++            kind="epic",
++        )
++
++    # List all work items for the team (map_key=None)
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        all_wis = await work_items.list_work_items(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=None,  # Team-wide listing
++        )
++        assert len(all_wis) == 2
++
++        # Verify both kinds are present
++        kinds = {wi.kind for wi in all_wis}
++        assert "story" in kinds
++        assert "epic" in kinds
++
++
++async def test_get_work_item_history_for_plain_node(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Getting history for a plain node (not a work item) should raise NotAWorkItemError."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    # First, mark one node as a work item (to set up the map)
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++
++    # Create another node that is NOT a work item
++    plain_node = await pg_pool.fetchval(
++        """
++        INSERT INTO memories (tenant_id, team_id, content, content_hash,
++                             embedding, source_kind, type, visibility)
++        VALUES ($1, $2, 'Plain node', $3,
++                array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++        RETURNING id
++        """,
++        tenant_a,
++        team_a,
++        f"hash-plain-{uuid4().hex}",
++    )
++    await pg_pool.execute(
++        """
++        INSERT INTO memory_map_membership
++            (memory_id, root_memory_id, tenant_id, node_role, turn, authored_by)
++        VALUES ($1, $2, $3, 'position', 'owner', 'owner')
++        """,
++        plain_node,
++        root_mem_id,
++        tenant_a,
++    )
++
++    # Try to get history for plain node (not a work item) - should raise NotAWorkItemError
++    with pytest.raises(NotAWorkItemError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await work_items.get_work_item_history(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                map_key=map_key,
++                node_id=plain_node,  # Plain node, not a work item
++            )
++
++
++async def test_blank_reason_stored_as_null(
++    pg_pool: asyncpg.Pool,
++    tenant_a: UUID,
++    team_a: UUID,
++    map_setup: tuple[UUID, UUID, str],
++) -> None:
++    """Blank reason string should be stored as NULL in work_item_history."""
++    from mem_mcp.mindmap import work_items
++
++    root_mem_id, node_id, map_key = map_setup
++
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await work_items.mark_work_item(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            kind="story",
++        )
++        await work_items.set_work_item_status(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            map_key=map_key,
++            node_id=node_id,
++            status="in_progress",
++            reason="   ",  # Whitespace-only, should become None/NULL
++        )
++
++    # Verify reason is NULL in database
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        history = await conn.fetch(
++            "SELECT change_type, reason FROM work_item_history WHERE memory_id = $1 ORDER BY id ASC",
++            node_id,
++        )
++
++        # The status change should have reason as NULL
++        status_entry = next((h for h in history if h["change_type"] == "status"), None)
++        assert status_entry is not None
++        assert status_entry["reason"] is None  # Should be NULL

@@ -1,0 +1,260 @@
+  # T2 — "memory_not_accessible" when citing my own memory
+
+  Category: multi-file root-cause bug · Complexity: complex · Time box: 90–120 min
+
+  ## Symptom (as reported)
+
+  From the PMO plugin (it talks to Memsys through the in-process plugin SDK,
+  `mem_mcp.plugins`):
+
+  > I write memory M1. `memory_get(M1)` returns it fine. Then I write M2 with
+  > `references=[{target_uuid: M1, reference_kind: "cites"}]` and the write is
+  > rejected with `memory_not_accessible` ("reference target not found or not
+  > accessible"). M1 is mine — same account, I just read it.
+
+  It does not happen for every account. It reproduces reliably for users whose
+  account was provisioned the "natural" way — tenant, personal team, owner
+  assignment and primary identity created by raw SQL (this is how the 0026
+  personal-team backfill provisioned all pre-existing users) — rather than
+  through the team-management API. It started after the teams/references work
+  landed (migrations ~0024–0026).
+
+  A failing repro is provided:
+  `tests/integration/test_references_own_memory_repro.py` (already in your
+  working tree). It must pass when you are done.
+
+  ## What we expect
+
+  - A user can always reference (and otherwise act on, via the references
+    machinery) memories they can read. Write-time access checks for references
+    must agree with the read path — i.e. with what `memory_get` lets the caller see.
+  - Find the root cause rather than special-casing the write call. If the
+    faulty rule is evaluated in more than one place, every such place must be
+    fixed and behave consistently — hidden regression tests cover more than the
+    repro.
+  - Cross-tenant protection must not regress: referencing another tenant's memory
+    that you have no team access to is still rejected with the same **opaque**
+    `memory_not_accessible` error envelope (not-found and no-access stay
+    indistinguishable).
+  - Slug-based lookups that are resolved *before* the target is known
+    (`memsys_slug_lookup`, `memory_get` by slug, `memory_get_batch` by slug) gate
+    at the team level on purpose — it prevents slug enumeration in teams the
+    caller cannot see. Do **not** change those.
+
+  ## Constraints
+
+  - Follow existing patterns. If you need a database-side helper, schema changes
+    go through a new Alembic migration in `alembic/versions/` (follow the naming
+    and the `SECURITY DEFINER` / `NULLIF`-guarded GUC conventions used by the
+    existing RLS helper migrations). The scoring harness runs
+    `alembic upgrade head` on a fresh database before running tests.
+  - A fix that only changes tests is an automatic fail. Do not modify existing
+    tests; add regression tests of your own for each site you change.
+  - The rest of the suite must not get new failures (some tests are red before
+    you start — pre-existing; leave them).
+
+  ## Running tests
+
+  `MEM_MCP_TEST_DSN` points at a fresh migrated Postgres (if you add a migration,
+  apply it with `alembic upgrade head`; `MEM_MCP_DB_MAINT_DSN` is set for that).
+  Run the repro with
+  `pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py`
+  and the wider suite with `pytest -q -p no:cacheprovider tests`.
+  The `sdk_client_factory` fixture (`tests/integration/conftest.py`) builds a
+  plugin-SDK client bound to a tenant.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_01BwzuzkSURVdo5anZQ1sCHU
+
+● I'll start by understanding the repro and the relevant code.
+
+  Searched for 2 patterns, read 7 files, listed 1 directory (ctrl+o to expand)
+
+● Still researching: the root cause looks like the references access check relying on the user_effective_team_access cache, which raw-SQL provisioning never fills. I'm checking the RLS helpers next.
+
+  Searched for 3 patterns, read 8 files (ctrl+o to expand)
+
+● I've confirmed the root cause. Next I'm checking the remaining reference call sites in write.py, then I'll write the first work order.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Plan is clear. Writing work order 1.
+
+● Write(~/laguna-bench/runs/T2-A1/orders/order-1.md)
+  ⎿  Wrote 131 lines to ../orders/order-1.md
+       1 # Work order 1 — fix `memory_not_accessible` when referencing one's own memory
+       2
+       3 ## Bug
+       4 A user writes memory M1, can read it with `memory_get(M1)`, but writing M2 with
+       5 `references=[{target_uuid: M1, reference_kind: "cites"}]` fails with
+       6 `memory_not_accessible`. Reproduces for users provisioned by raw SQL (tenant + personal team +
+       7 owner `team_role_assignments` row + primary `tenant_identities` row — exactly how migration 0026
+       8 backfilled existing users) instead of via the team-management API.
+       9
+      10 Failing repro (already in the tree, do NOT modify it):
+     … +121 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh A T2-A1 ~/laguna-bench/runs/T2-A1/orders/order-1.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +20 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor wrote the fix but couldn't run Bash, so nothing is verified yet. Reviewing the diff now.
+
+● Bash(git -C ~/laguna-bench/runs/T2-A1/repo diff; git -C ~/laguna-bench/runs/T2-A1/repo status --short)
+  ⎿  diff --git a/alembic/versions/0035_2026_06_01_memory_readable_by.py b/alembic/versions/0035_2026_06_01_memory_readable_by.py
+     new file mode 100644
+     index 0000000..df21196
+     … +735 lines (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+● The diff looks solid—canonical SQL predicate, domain helper, all four sites updated, slug gates untouched, no existing tests broken—but nothing's been run yet. I'll send order 2 to verify.
+
+● Write(~/laguna-bench/runs/T2-A1/orders/order-2.md)
+  ⎿  Wrote 25 lines to ../orders/order-2.md
+       1 # Work order 2 — verify order 1 (run everything)
+       2
+       3 Your order-1 code changes look right on review; keep the design. Last session, Bash was
+       4 unavailable, so nothing was verified. This session's job is to **run** the verification and fix
+       5 whatever breaks. Use Bash for each command below and paste the exact summary lines into your report.
+       6
+       7 1. `alembic upgrade head` (uses `MEM_MCP_DB_MAINT_DSN`), then `alembic downgrade -1`, then
+       8    `alembic upgrade head` again. Confirm `alembic current` shows `0035_memory_readable_by`.
+       9 2. `pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py`
+      10 3. `pytest -q -p no:cacheprovider tests/integration/test_references_memory_readable_by.py`
+     … +15 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh A T2-A1 ~/laguna-bench/runs/T2-A1/orders/order-2.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +20 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Bash(git -C ~/laguna-bench/runs/T2-A1/repo status --short; git -C ~/laguna-bench/runs/T2-A1/repo stash list)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Bash(git -C ~/laguna-bench/runs/T2-A1/repo status --short)
+  ⎿   A alembic/versions/0035_2026_06_01_memory_readable_by.py
+      M src/mem_mcp/mcp/tools/refs_in.py
+      M src/mem_mcp/mcp/tools/refs_out.py
+     … +2 lines (ctrl+o to expand)
+
+● The working tree is intact, so no stash happened. Let me look at the executor's list of failing tests to triage them.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/T2-A1/orders/order-3.md)
+  ⎿  Wrote 36 lines to ../orders/order-3.md
+       1 # Work order 3 — finish verification without git stash
+       2
+       3 `git stash` is not permitted in your environment. Don't retry it, and don't use any other command
+       4 that rewrites the working tree or git state (no checkout, reset or worktree). Your working tree is
+       5 intact.
+       7 ## A. Lint and types (step 7 from order 2)
+       8 Run each command on its own:
+       9 - `ruff check src tests`
+      10 - `ruff format --check src/mem_mcp/teams/references.py src/mem_mcp/mcp/tools/refs_in.py src/mem_mcp/mcp/tools/refs_out.py tests/integration/test_references_memory_readable_by.py alembic/versions/0035_2026
+         _06_01_memory_readable_by.py`
+     … +28 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh A T2-A1 ~/laguna-bench/runs/T2-A1/orders/order-3.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +20 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor's Bash is being denied intermittently, probably on compound commands, piped commands, or commands that write files. Meanwhile, I'll check whether any test pins the alembic head revision.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● The new migration passes the bare-GUC-cast lint by construction. Sending one more verification order with single, read-only commands.
+
+● Write(~/laguna-bench/runs/T2-A1/orders/order-4.md)
+  ⎿  Wrote 22 lines to ../orders/order-4.md
+       1 # Work order 4 — verification, one simple command at a time
+       2
+       3 Bash appears to be denied for compound commands (`&&`, `;`), piped commands (`|`), and
+       4 file-rewriting tools. Run **each command below as its own Bash call, exactly as written, with no
+       5 pipes, chaining or redirection**. If a command is denied, skip it, note "denied", and keep going
+       7
+       8 1. `ruff check src tests`
+       9 2. `ruff format --diff src/mem_mcp/teams/references.py src/mem_mcp/mcp/tools/refs_in.py src/mem_mcp/mcp/tools/refs_out.py tests/integration/test_references_memory_readable_by.py alembic/versions/0035_2026
+         _06_01_memory_readable_by.py`
+      10    Apply any diff it prints by hand with Edit, then rerun the command until it is clean.
+     … +14 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh A T2-A1 ~/laguna-bench/runs/T2-A1/orders/order-4.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +20 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Lint, format, mypy and all targeted tests are green. One last check of the final tree.
+
+● Bash(git -C ~/laguna-bench/runs/T2-A1/repo status --short)
+  ⎿   A alembic/versions/0035_2026_06_01_memory_readable_by.py
+      M src/mem_mcp/mcp/tools/refs_in.py
+      M src/mem_mcp/mcp/tools/refs_out.py
+     … +2 lines (ctrl+o to expand)
+
+● The bug is fixed and the repro test passes. The full suite has 37 failures and 15 errors, which I believe were already failing before this change, but that isn't proven. I couldn't run the suite against the unchanged
+  code for a before/after comparison.
+
+  Root cause: the references code decided whether a caller can see a memory using only the user_effective_team_access table. That table is a cache that only gets filled by the team-management API or by a reconciler job
+  that runs every minute. Users set up with raw SQL, including everyone the 0026 migration backfilled, have no rows there. So their own memories counted as inaccessible, while memory_get (which only checks ownership)
+  returned them fine. The same faulty check ran in four places:
+  - the write-time reference check (resolve_reference_target, by UUID and by slug)
+  - the citer list shown when a hard delete is blocked
+  - the memsys_refs_in tool
+  - the memsys_refs_out tool
+
+  Fix:
+  - New migration alembic/versions/0035_2026_06_01_memory_readable_by.py adds one database function, memory_readable_by(memory_id, user_id). It returns true when the memory exists, isn't deleted, and the user either owns
+    it or has team access to it. It follows the existing SECURITY DEFINER / safe_current_tenant_id() conventions, and a missing user returns false instead of crashing.
+  - src/mem_mcp/teams/references.py gets one batched helper that calls this function, and all four places now use it. The reference check no longer skips the access test when a memory has no team.
+  - refs_in.py / refs_out.py no longer contain their own SQL.
+  - Unchanged on purpose: the team-level slug checks in slug_lookup, memory_get by slug and memory_get_batch by slug. Referencing another tenant's memory without team access still fails with the same opaque
+    memory_not_accessible error as a UUID that doesn't exist.
+
+  Tests: I added tests/integration/test_references_memory_readable_by.py with 12 regression tests:
+  - reference checks: own memory by UUID, by slug, and with no team; another tenant's memory is rejected with the same error as a missing one, but allowed with team access
+  - the hard-delete citer list
+  - RefsInTool and RefsOutTool
+  - the SQL function itself, including deleted memories, a missing user, and the fallback to the current-tenant setting
+  - two SDK end-to-end tests: citing an own memory by slug, and checking that the no-access error matches the not-found error
+
+  No existing tests were changed.
+
+  Verification (run by the executor):
+  - alembic upgrade head, then downgrade -1, then upgrade head all worked; the database is now at 0035_memory_readable_by.
+  - The repro test, the 12 new tests and the related reference and lint suites: 38 passed.
+  - ruff check, ruff format and mypy are clean.
+  - Full suite: 37 failed, 1042 passed, 31 skipped, 15 errors.
+
+  Remaining concerns:
+  - Baseline not compared: the executor wasn't allowed to run git stash, so it classified each failure from its error message instead (fixtures colliding on hard-coded emails, AWS credentials, leftover rows in the shared
+    database, a missing fixture). None of those failures go through the changed code or mention the new migration. The failure count also varied between runs (50 vs 52 failures plus errors), which fits the shared test
+    database.
+  - Different query counts: a missing target takes one query and a no-access target takes two. That gap existed before the fix and was not changed.
+  - Memory with no team: an owner can now pass the reference check for their own memory that has no team. Inserting that reference may then fail because target_team_id can't be null. That gap was already there; it's out
+    of scope and not tested.
+
+  It took four executor round-trips: one to implement, three to verify, because its Bash access kept being denied.
+
+  I'm highly confident the fix meets the acceptance criteria. I'm moderately to highly confident there are no new test failures.
+
+✻ Sautéed for 7m 51s · done 6:30 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

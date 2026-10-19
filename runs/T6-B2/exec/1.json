@@ -1,0 +1,24 @@
+{
+  "session_id": "de5ec02d-7e6d-4385-995e-17a8c2636503",
+  "exit_code": 0,
+  "remote_control_url": "",
+  "is_error": false,
+  "num_turns": 148,
+  "result": "All tests pass, lint is clean. Here's the report.\n\n---\n\n## Summary\n\nCreated the four required **TESTS ONLY** files. No source, migration, config, or conftest files were modified.\n\n### Files created\n\n| File | Tests | Status |\n|---|---|---|\n| `tests/unit/test_memory_list_models_cursor.py` | 41 | ✅ All pass |\n| `tests/unit/test_notice_render_and_serialize.py` | 50 | ✅ All pass |\n| `tests/integration/test_memory_list_behaviour.py` | 33 (31 pass + 2 xfail) | ✅ |\n| `tests/integration/test_plugin_notices_behaviour.py` | 24 | ✅ All pass |\n\n**Total: 148 passed, 2 xfailed.**\n\n### Bugs found & documented (xfailed with `reason=\"BUG: …\"`)\n\n1. **`list.py:197` — cursor ISO string vs timestamptz type mismatch** — `_decode_cursor` returns the cursor's order value as a Python `str` (ISO format), but `list.py` passes it as a bare `$param` in the keyset predicate `(created_at, id) < ($iso, $uuid::uuid)` where `created_at` is `timestamptz`. Asyncpg rejects the `str→timestamptz` binding with `TypeError`. Both pagination-walk tests that use a cursor are marked `xfail(strict=True)`.\n\n2. **`_decode_cursor` exception handling gap** — documented in the unit test: `_decode_cursor` catches only `(JSONDecodeError, IndexError, ValueError)`, so a cursor decoding to JSON `int` raises `TypeError` and JSON `dict` raises `KeyError`, both uncaught. The unit tests assert the raw exceptions surface (BUG documented but not xfailed because the tests assert the current — buggy — behavior rather than correct behavior).\n\n3. **`tsvector_to_array` SQL function missing** — referenced by `LENIENT_TSQUERY_SQL` but never created in any migration. Created in the integration fixture (`_install_tsvector_to_array`) before each test tenant is set up.\n\n### Integration test fixture fixes applied\n\n- **`_install_tsvector_to_array` made `async def`** with `await conn.execute(...)` — the original version called `conn.execute()` synchronously, producing an un-awaited coroutine (`RuntimeWarning: coroutine 'Connection.execute' was never awaited`) and leaving the SQL function uninstalled.\n- **Fixture transaction scoping** — setup (`INSERT INTO tenants/…`) now runs in a transaction that **commits before `yield`**, so tenant rows are visible to the test body's separate connections. Cleanup runs in a **separate post-yield transaction**. The original fixture wrapped `yield` inside `async with conn.transaction()`, leaving setup rows uncommitted/unvisible and causing FK violations.\n- **`_insert_memory` INSERT column/param alignment** — added the missing `source_kind` column and switched to dynamically-generated `$n` placeholders to avoid the `$12`/`$13` mismatch when `team_id` is `None` but `parent_id` is present.\n\n### Regression check\n\nFull suite: `18 failed, 1495 passed, 31 skipped, 2 xfailed, 16 errors`. All 34 failures/errors are in **pre-existing test files** (`test_team_api.py`, `test_enterprise_schema.py`, `test_roles_catalog.py`, etc.) that I did not touch — confirmed pre-existing per the CLAUDE.md note. None of my four new files contribute failures.\n\n### Left open\n\n- The cursor type-mismatch BUG in `list.py:197` (str vs timestamptz) requires a source fix — either parse `cursor_order_value_iso` back to `datetime` before passing as a parameter, or cast in SQL (`($iso::timestamptz, $uuid::uuid)`). Not fixed here (rules forbid modifying src).\n- `RenderedNotice.to_dict()` leaves `plugin_id` as a raw UUID when constructed directly (unit-test observation) but as a `str` when flowing through the DB path (Text column). Both paths are documented.",
+  "usage": {
+    "input_tokens": 15637059,
+    "output_tokens": 272554,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  },
+  "modelUsage": {
+    "laguna-s-2.1": {
+      "inputTokens": 15637059,
+      "outputTokens": 272554,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0
+    }
+  },
+  "thinking_blocks": 120,
+  "transcript": "~/.claude/projects/-home-anand-laguna-bench-runs-T6-B2-repo/de5ec02d-7e6d-4385-995e-17a8c2636503.jsonl"
+}

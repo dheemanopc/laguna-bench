@@ -1,0 +1,260 @@
+         |
+     207 |             cursor=cursor,
+     208 |             request_id=ctx.request_id,
+     209 |         )
+         |           W292
+         |
+         = help: Add trailing newline
+
+     … +203 lines (ctrl+o to expand)
+
+  Thought for 3s (ctrl+o to expand)
+
+● Let me fix the lint issues:
+
+● Bash(ruff check --fix src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mcp/tools/mindmap_get.py src/mem_mcp/mindmap/__init__.py src/mem_mcp/mindmap/service.py 2>…)
+  ⎿  Error: Exit code 1
+     src/mem_mcp/mcp/tools/mindmap_resolve.py:111:21: F841 Local variable `resolved` is assigned to but never used
+         |
+     109 |             async with system_tx(ctx.db_pool) as sys_conn:
+     110 |                 try:
+     111 |                     resolved = await resolve_reference_target(
+         |                     ^^^^^^^^ F841
+     112 |                         sys_conn,
+     113 |                         target_uuid=inp.resolved_by_memory_id,
+         |
+     … +4 lines (ctrl+o to expand)
+
+  Thought for 7s, read 1 file (ctrl+o to expand)
+
+● Update(src/mem_mcp/mcp/tools/mindmap_resolve.py)
+  ⎿  Added 1 line, removed 1 line
+      108                  )
+      109              async with system_tx(ctx.db_pool) as sys_conn:
+      110                  try:
+      111 -                    resolved = await resolve_reference_target(
+      111 +                    await resolve_reference_target(
+      112                          sys_conn,
+      113                          target_uuid=inp.resolved_by_memory_id,
+      114                          caller_user_id=ctx.tenant_id,
+
+  Thought for 2s (ctrl+o to expand)
+
+● Now fix test file issues:
+
+● Update(tests/unit/test_mindmap_resolve_get_models.py)
+  ⎿  Added 3 lines, removed 3 lines
+       8  from uuid import uuid4
+       9
+      10  import pytest
+      11 +from pydantic import ValidationError
+      12
+      12 -from mem_mcp.mcp.errors import JsonRpcError
+      13 -from mem_mcp.mcp.tools.mindmap_get import MindmapGetInput, MindmapGetTool, _truncate_content
+      14 -from mem_mcp.mcp.tools.mindmap_resolve import MindmapResolveInput, MindmapResolveTool
+      13 +from mem_mcp.mcp.tools.mindmap_get import MindmapGetInput, _truncate_content
+      14 +from mem_mcp.mcp.tools.mindmap_resolve import MindmapResolveInput
+      15  from mem_mcp.mindmap import SUMMARY_CONTENT_CHARS
+      16
+      17
+
+  Thought for 6s (ctrl+o to expand)
+
+● Update(tests/unit/test_mindmap_resolve_get_models.py)
+  ⎿  Added 2 lines, removed 2 lines
+      19      """Input validation for MindmapResolveInput."""
+      20
+      21      def test_summary_required(self) -> None:
+      22 -        with pytest.raises(Exception):  # Pydantic ValidationError
+      22 +        with pytest.raises(ValidationError):
+      23              MindmapResolveInput(
+      24                  map_key="test-map",
+      25                  node_id=uuid4(),
+     ...
+      32              node_id=uuid4(),
+      33              resolution_summary="x" * 500,
+      34          )
+      35 -        with pytest.raises(Exception):  # Pydantic ValidationError
+      35 +        with pytest.raises(ValidationError):
+      36              MindmapResolveInput(
+      37                  map_key="test-map",
+      38                  node_id=uuid4(),
+
+  Thought for 3s (ctrl+o to expand)
+
+● Update(tests/unit/test_mindmap_resolve_get_models.py)
+  ⎿  Added 1 line, removed 1 line
+      120          MindmapGetInput(map_key="test", since=100)
+      121
+      122      def test_since_negative_rejected(self) -> None:
+      123 -        with pytest.raises(Exception):  # Pydantic ValidationError
+      123 +        with pytest.raises(ValidationError):
+      124              MindmapGetInput(map_key="test", since=-1)
+      125
+      126      def test_since_none(self) -> None:
+
+  Thought for 5s (ctrl+o to expand)
+
+● Update(tests/integration/test_mindmap_resolve_e2e.py)
+  ⎿  Removed 1 line
+      19  from mem_mcp.mcp.errors import JsonRpcError
+      20  from mem_mcp.mcp.tools._base import ToolContext
+      21  from mem_mcp.mcp.tools.mindmap_close import (
+      22 -    ConfirmedDecision,
+      22      MindmapCloseInput,
+      23      MindmapCloseTool,
+      24  )
+
+  Thought for 2s (ctrl+o to expand)
+
+● Update(tests/integration/test_mindmap_resolve_e2e.py)
+  ⎿  Removed 1 line
+      30      MindmapWriteNodeInput,
+      31      MindmapWriteNodeTool,
+      32  )
+      33 -from mem_mcp.mindmap import service
+      33  from mem_mcp.teams.assignments import assign_role
+      34
+      35  pytestmark = pytest.mark.asyncio
+
+  Thought for 5s (ctrl+o to expand)
+
+● Update(tests/integration/test_mindmap_resolve_e2e.py)
+  ⎿  Added 1 line, removed 1 line
+      697          assert len(got_all.resolved) == 0
+      698          node_ids_in_all = {n.memory_id for n in got_all.nodes}
+      699          assert n1.node_id in node_ids_in_all
+      700 -        n1_node = [n for n in got_all.nodes if n.memory_id == n1.node_id][0]
+      700 +        n1_node = next(n for n in got_all.nodes if n.memory_id == n1.node_id)
+      701          assert n1_node.status == "resolved"
+      702
+      703          # depth=full → no truncation
+
+  Thought for 3s (ctrl+o to expand)
+
+● Update(tests/integration/test_mindmap_resolve_e2e.py)
+  ⎿  Added 1 line, removed 1 line
+      748          assert got_empty.cursor == cursor0
+      749
+      750          # Write another node → cursor advances
+      751 -        n2 = await MindmapWriteNodeTool()(
+      751 +        await MindmapWriteNodeTool()(
+      752              ctx,
+      753              MindmapWriteNodeInput(
+      754                  map_key=opened.map_key, content="Node 2", node_role="position"
+
+  Thought for 3s (ctrl+o to expand)
+
+● Bash(ruff check --fix tests/unit/test_mindmap_resolve_get_models.py tests/integration/test_mindmap_resolve_e2e.py 2>&1 && ruff format src/mem_mcp/mcp/tools/mindmap_r…)
+  ⎿  Found 2 errors (2 fixed, 0 remaining).
+     4 files reformatted, 2 files left unchanged
+
+  Thought for 3s (ctrl+o to expand)
+
+● Bash(ruff check src/mem_mcp/mindmap/ src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mcp/tools/mindmap_get.py src/mem_mcp/main.py src/mem_mcp/mcp/tool_descripti…)
+  ⎿  All checks passed!
+
+  Thought for 10s (ctrl+o to expand)
+
+● Bash(ruff format --check src/mem_mcp/mindmap/ src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mcp/tools/mindmap_get.py src/mem_mcp/main.py src/mem_mcp/mcp/tool_…)
+  ⎿  8 files already formatted
+
+  Thought for 8s (ctrl+o to expand)
+
+● Bash(mypy src/mem_mcp/mindmap/__init__.py src/mem_mcp/mindmap/service.py src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mcp/tools/mindmap_get.py src/mem_mcp/ma…)
+  ⎿  Error: Exit code 1
+     src/mem_mcp/mindmap/service.py:65: error: Returning Any from function declared to return "UUID | None"  [no-any-return]
+     src/mem_mcp/mindmap/service.py:76: error: Returning Any from function declared to return "UUID | None"  [no-any-return]
+     Found 2 errors in 1 file (checked 5 source files)
+
+  Thought for 6s, read 1 file (ctrl+o to expand)
+
+● Bash(mypy src/mem_mcp/mindmap/service.py --no-error-summary 2>&1 | head -20)
+  ⎿  src/mem_mcp/mindmap/service.py:65: error: Returning Any from function declared to return "UUID | None"  [no-any-return]
+     src/mem_mcp/mindmap/service.py:76: error: Returning Any from function declared to return "UUID | None"  [no-any-return]
+
+  Thought for 3s (ctrl+o to expand)
+
+● Bash(git stash && mypy src/mem_mcp/mindmap/service.py --no-error-summary 2>&1; git stash pop 2>&1)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 4s (ctrl+o to expand)
+
+● These are pre-existing mypy errors in resolve_map_root and find_live_map_seeded_from — both existed before my changes. My new code doesn't introduce any new mypy errors.
+
+  Now let me run the final test verification:
+
+● Bash(pytest -q -p no:cacheprovider tests/unit/test_mindmap_resolve_get_models.py tests/integration/test_mindmap_resolve_e2e.py tests/integration/test_mindmap_e2e.py…)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0
+     rootdir: ~/laguna-bench/runs/T4-Q1/repo
+     … +10 lines (ctrl+o to expand)
+
+  Thought for 5s (ctrl+o to expand)
+
+● All 33 tests pass. Here is the complete report:
+
+  ---
+
+  Work Order 1 — Report
+
+  Files Changed
+
+  New files:
+  - alembic/versions/0044_2026_10_16_mindmap_branch_status.py — Migration adding status columns to memory_map_membership with CHECK constraints, explicit constraint names, and full downgrade
+  - src/mem_mcp/mcp/tools/mindmap_resolve.py — New tool class MindmapResolveTool
+  - tests/unit/test_mindmap_resolve_get_models.py — Unit tests (DB-free)
+  - tests/integration/test_mindmap_resolve_e2e.py — Integration tests (DB-backed, 8 scenarios)
+
+  Modified files:
+  - src/mem_mcp/mindmap/__init__.py — Added BRANCH_STATUSES, DISPOSITION_TO_REFERENCE_KIND, RESOLVE_DISPOSITIONS, RESOLVE_PARTIES, SUMMARY_CONTENT_CHARS = 200
+  - src/mem_mcp/mindmap/service.py — Added get_membership, set_branch_status, current_cursor, fetch_touched_member_ids, fetch_members_cursor, fetch_settled_members, fetch_open_loop_ids; updated fetch_members to include
+    status column
+  - src/mem_mcp/mcp/tools/mindmap_get.py — Added since/include/depth input fields; status/truncated/resolution_summary/resolved_by_party to MindmapNode; new MindmapResolvedEntry output type; resolved and cursor on
+    MindmapGetOutput; open_loops now filters by status='open' AND responsible_party; content truncation helper
+  - src/mem_mcp/main.py — Registered MindmapResolveTool
+  - src/mem_mcp/mcp/tool_descriptions.py — Updated mindmap_get description; added mindmap_resolve description
+  - skills/mindmap-driver/SKILL.md — Added Resolve/Drop section and Resume section with cursor usage
+  - docs/mindmap-v1-build-design.md — Added mindmap_resolve to tool table; added branch status note to open loops section
+
+  Verification Results
+
+  ┌─────────────────────────────────────────┬────────────────────────────────┐
+  │                  Check                  │             Result             │
+  ├─────────────────────────────────────────┼────────────────────────────────┤
+  │ alembic upgrade head                    │ OK (0044 applied)              │
+  ├─────────────────────────────────────────┼────────────────────────────────┤
+  │ alembic downgrade -1 && upgrade head    │ OK (round-trips)               │
+  ├─────────────────────────────────────────┼────────────────────────────────┤
+  │ ruff check on changed files             │ 0 errors                       │
+  ├─────────────────────────────────────────┼────────────────────────────────┤
+  │ ruff format --check on changed files    │ 0 files need formatting        │
+  ├─────────────────────────────────────────┼────────────────────────────────┤
+  │ mypy on changed source files            │ 2 pre-existing errors (no-new) │
+  ├─────────────────────────────────────────┼────────────────────────────────┤
+  │ Unit tests (23)                         │ All pass                       │
+  ├─────────────────────────────────────────┼────────────────────────────────┤
+  │ Integration tests — mindmap_resolve (8) │ All pass                       │
+  ├─────────────────────────────────────────┼────────────────────────────────┤
+  │ Integration tests — mindmap_e2e (2)     │ All pass (existing)            │
+  └─────────────────────────────────────────┴────────────────────────────────┘
+
+  Design Decisions
+
+  1. set_branch_status WHERE clause: Uses only memory_id + root_memory_id for the UPDATE; tenant scoping is enforced by RLS (the membership table has a tenant-scoped policy). Added safe_current_tenant_id() in OR clause
+     as defense-in-depth.
+  2. target_team_id for insert_reference: Queried directly from memories table (SELECT team_id FROM memories WHERE id = $1) rather than resolving through system_tx — this is the FK-referenced value and avoids an extra
+     system_tx round-trip.
+  3. open_loops definition: status='open' AND metadata.responsible_party in ('owner','model') — matches the design doc's "whose-turn" semantics exactly. Resolved/dropped nodes never appear.
+  4. since semantics: fetch_touched_member_ids looks at both memory_id and payload->>'target' for link events. An empty window returns nodes=[], resolved=[], edges=[] — never falls back to "everything."
+
+✻ Crunched for 10m 51s · done 1:42 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                4% until auto-compact
+

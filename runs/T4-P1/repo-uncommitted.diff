@@ -1,0 +1,394 @@
+diff --git a/src/mem_mcp/main.py b/src/mem_mcp/main.py
+index 8439507..57b1d4e 100644
+--- a/src/mem_mcp/main.py
++++ b/src/mem_mcp/main.py
+@@ -469,7 +469,7 @@ def _wire_routers(app: FastAPI) -> None:
+         nli=nli,
+     )
+ 
+-    # Build ToolRegistry with 22 tools (15 memory + 1 onboarding + 6 team).
++    # Build ToolRegistry with 23 tools (15 memory + 1 onboarding + 6 team + 1 mindmap resolve).
+     # Localdev mode (cognito-local sidecar): skip per-tool required_scope check.
+     # cognito-local's ROPC tokens only carry `aws.cognito.signin.user.admin`,
+     # not memory.read/write, so without this bypass every tool call rejects.
+@@ -507,6 +507,7 @@ def _wire_routers(app: FastAPI) -> None:
+         MindmapGetTool,
+         MindmapReviewTool,
+         MindmapCloseTool,
++        MindmapResolveTool,  # New tool for settling branches
+     ]
+     for tool_cls in tools_list:  # type: ignore[attr-defined]
+         registry.register(tool_cls)  # type: ignore[arg-type]
+diff --git a/src/mem_mcp/mcp/tool_descriptions.py b/src/mem_mcp/mcp/tool_descriptions.py
+index 22711c7..0125dd9 100644
+--- a/src/mem_mcp/mcp/tool_descriptions.py
++++ b/src/mem_mcp/mcp/tool_descriptions.py
+@@ -425,11 +425,15 @@ Use to connect map nodes: a challenge displaced-from a position, a position reso
+ Pass map_key to log the link as a map event. Required scope: memory.write.
+ 
+ Example: mindmap_link(source_memory_id="<challenge>", target_memory_id="<position>", reference_kind="displaced-from", map_key="caching-strategy").""",
+-    "mindmap_get": """Read a map's current state — its root, all nodes, the edges between them, review status, and open loops.
++    "mindmap_get": """Read a map's current state — its root, nodes, edges, review status, open loops, and settled branches.
+ 
+-Call when: resuming a map mid-conversation; the user asks "where were we", "what have we got so far", "what's still open"; before graduating, to review what was built. open_loops lists nodes whose turn is the owner's (waiting on the user). Required scope: memory.read.
++Call when: resuming a map mid-conversation; the user asks "where were we", "what have we got so far", "what's still open"; before graduating, to review what was built.
++    New since/include/depth parameters allow incremental reads.
++    open_loops lists open nodes whose turn is owner or model (metadata.responsible_party in {'owner', 'model'}).
++    Settled branches (status resolved/dropped) appear in the resolved list with compact info.
++    Required scope: memory.read.
+ 
+-Example: "Where did we get to on caching?" → mindmap_get(map_key="caching-strategy").""",
++    Example: "Where did we get to on caching?" → mindmap_get(map_key="caching-strategy").""",
+     "mindmap_review": """Run the structural reviewer pass over a map and reset its write-counter.
+ 
+ Call when mindmap_write_node returns review_due=true (every 15 owned writes), or before graduating. Returns the map's full structure (nodes, edges, recent events) for you — or a review sub-agent — to smoke-test for structural problems: orphan positions, unaddressed challenges, nodes that bundle multiple decisions, mislabeled ratifications. The reviewer looks at the MAP ONLY, never the transcript — it catches mistakes, not cheating. It is advisory; it flags, it does not block. Required scope: memory.write.
+@@ -444,4 +448,11 @@ After close the map is archived: it no longer surfaces in mindmap_open similarit
+ Do not call until the user has confirmed the decisions. Required scope: memory.write.
+ 
+ Example: mindmap_close(map_key="caching-strategy", confirmed_decisions=[{content:"Adopt Redis for the hot read path", slug_clue:"redis-hot-path", from_node_id:"<position>", ratification_strength:"survived-challenge"}]).""",
+-}
++    "mindmap_resolve": """Settle a branch in a thinking map as resolved or dropped, creating a reference edge from an optional resolving node.
++
++Call when: user wants to mark a thinking node as settled (resolved or dropped) within a map; need to create a memory_reference edge showing the resolution path; want to update the branch status without closing the entire map.
++
++Do not call for: closing the whole map (use mindmap_close); just drawing an edge without settling (use mindmap_link); settling without creating a reference edge (use service directly).
++
++Example: mindmap_resolve(map_key="caching-strategy", node_id=<node-uuid>, disposition="resolved", resolution_summary="We chose Redis for performance").""",
++}
+\ No newline at end of file
+diff --git a/src/mem_mcp/mcp/tools/mindmap_get.py b/src/mem_mcp/mcp/tools/mindmap_get.py
+index a78e673..8884052 100644
+--- a/src/mem_mcp/mcp/tools/mindmap_get.py
++++ b/src/mem_mcp/mcp/tools/mindmap_get.py
+@@ -1,7 +1,14 @@
+ """mindmap_get — read a map's graph: root, nodes, edges, flags, open loops.
+ 
+-Read-only resume/inspect surface. Open loops = nodes whose turn is the owner's
+-(metadata.responsible_party == 'owner'), the spec's whose-turn resume surface.
++Read-only resume/inspect surface. Open loops = open nodes whose turn is the owner's
++or model's (metadata.responsible_party in {'owner', 'model'}), the spec's whose-turn
++resume surface. Settled branches (status resolved/dropped) are never open loops.
++
++New levers:
++- since: return only nodes touched since event cursor (default None = all)
++- include: 'open' (default) returns open nodes in nodes, settled in resolved;
++           'all' returns all candidates in nodes with status, settled still in resolved
++- depth: 'summary' (default) truncates content >200 chars; 'full' returns full content
+ """
+ 
+ from __future__ import annotations
+@@ -23,6 +30,9 @@ from mem_mcp.mindmap import service
+ class MindmapGetInput(BaseModel):
+     map_key: str = Field(..., min_length=1, max_length=64)
+     team_id: UUID | None = None
++    since: int | None = Field(default=None, ge=0)
++    include: str = Field(default="open", pattern="^(open|all)$")
++    depth: str = Field(default="summary", pattern="^(summary|full)$")
+ 
+ 
+ class MindmapNode(BaseModel):
+@@ -32,6 +42,8 @@ class MindmapNode(BaseModel):
+     content: str
+     metadata: dict[str, Any]
+     created_at: datetime
++    status: str
++    truncated: bool
+ 
+ 
+ class MindmapEdge(BaseModel):
+@@ -40,6 +52,13 @@ class MindmapEdge(BaseModel):
+     reference_kind: str
+ 
+ 
++class MindmapResolvedBranch(BaseModel):
++    memory_id: UUID
++    resolution_summary: str | None
++    status: str
++    resolved_by_party: str | None
++
++
+ class MindmapGetOutput(BaseModel):
+     map_key: str
+     root_memory_id: UUID
+@@ -51,6 +70,8 @@ class MindmapGetOutput(BaseModel):
+     nodes: list[MindmapNode]
+     edges: list[MindmapEdge]
+     open_loops: list[UUID]
++    resolved: list[MindmapResolvedBranch]
++    cursor: int
+     request_id: str
+ 
+ 
+@@ -71,26 +92,94 @@ class MindmapGetTool(BaseTool):
+                 raise JsonRpcError(-32602, "map not found", data={"errors": [{"path": "map_key"}]})
+             row = await service.get_map_row(conn, root_memory_id=root_id)
+             assert row is not None
++
++            # Fetch members with new columns
+             members = await service.fetch_members(
+                 conn, root_memory_id=root_id, tenant_id=ctx.tenant_id
+             )
+-            member_ids = [m["memory_id"] for m in members]
++
++            # Get cursor
++            cursor = await service.current_cursor(conn, root_memory_id=root_id, tenant_id=ctx.tenant_id)
++
++            # Determine candidate set based on since
++            if inp.since is not None:
++                touched = await service.touched_since(
++                    conn, root_memory_id=root_id, tenant_id=ctx.tenant_id, since=inp.since
++                )
++                # Filter members to only those touched since
++                candidates = [m for m in members if m["memory_id"] in touched]
++                # If nothing touched, nodes and resolved should be empty
++                if not touched:
++                    candidates = []
++            else:
++                candidates = members
++
++            member_ids = [m["memory_id"] for m in candidates]
+             edges = await service.fetch_internal_edges(conn, member_ids=member_ids)
+ 
+-        nodes = [
+-            MindmapNode(
+-                memory_id=m["memory_id"],
+-                node_role=m["node_role"],
+-                type=m["type"],
+-                content=m["content"],
+-                metadata=m["metadata"],
+-                created_at=m["created_at"],
++        # Process nodes based on depth
++        nodes = []
++        for m in candidates:
++            content = m["content"]
++            truncated = False
++            if inp.depth == "summary" and len(content) > service.SUMMARY_CONTENT_CHARS:
++                content = content[:service.SUMMARY_CONTENT_CHARS] + "…"
++                truncated = True
++
++            nodes.append(
++                MindmapNode(
++                    memory_id=m["memory_id"],
++                    node_role=m["node_role"],
++                    type=m["type"],
++                    content=content,
++                    metadata=m["metadata"],
++                    created_at=m["created_at"],
++                    status=m["status"],
++                    truncated=truncated,
++                )
+             )
+-            for m in members
+-        ]
++
++        # Process resolved branches
++        resolved = []
++        for m in candidates:
++            if m["status"] in ("resolved", "dropped"):
++                resolved.append(
++                    MindmapResolvedBranch(
++                        memory_id=m["memory_id"],
++                        resolution_summary=m["resolution_summary"],
++                        status=m["status"],
++                        resolved_by_party=m["resolved_by_party"],
++                    )
++                )
++
++        # Compute open loops over ALL members (not just candidates)
++        all_members = await service.fetch_members(
++            conn, root_memory_id=root_id, tenant_id=ctx.tenant_id
++        )
+         open_loops = [
+-            m["memory_id"] for m in members if m["metadata"].get("responsible_party") == "owner"
++            m["memory_id"] for m in all_members
++            if m["status"] == "open" and m["metadata"].get("responsible_party") in ("owner", "model")
+         ]
++
++        # Filter nodes based on include
++        if inp.include == "open":
++            # Keep only open nodes in nodes, settled go to resolved
++            filtered_nodes = [n for n in nodes if n.status == "open"]
++            # Rebuild resolved list to include settled nodes from candidates
++            resolved = [
++                MindmapResolvedBranch(
++                    memory_id=m["memory_id"],
++                    resolution_summary=m["resolution_summary"],
++                    status=m["status"],
++                    resolved_by_party=m["resolved_by_party"],
++                )
++                for m in candidates
++                if m["status"] in ("resolved", "dropped")
++            ]
++            nodes = filtered_nodes
++        # For include='all', keep all nodes in nodes (already done above)
++        # resolved still lists settled nodes (compact) - this is already handled above
++
+         return MindmapGetOutput(
+             map_key=inp.map_key,
+             root_memory_id=root_id,
+@@ -109,5 +198,7 @@ class MindmapGetTool(BaseTool):
+                 for e in edges
+             ],
+             open_loops=open_loops,
++            resolved=resolved,
++            cursor=cursor,
+             request_id=ctx.request_id,
+         )
+diff --git a/src/mem_mcp/mindmap/__init__.py b/src/mem_mcp/mindmap/__init__.py
+index b120fd9..ad4d488 100644
+--- a/src/mem_mcp/mindmap/__init__.py
++++ b/src/mem_mcp/mindmap/__init__.py
+@@ -23,6 +23,18 @@ DEFAULT_REVIEW_THRESHOLD: Final[int] = 15
+ # written; the response carries split_suggested=True. Never truncates.
+ SOFT_NODE_CHARS: Final[int] = 1200
+ 
++# Branch statuses for memory_map_membership.status
++BRANCH_STATUSES: Final[tuple[str, ...]] = ("open", "resolved", "dropped")
++
++# Character limit for summary truncation in mindmap_get
++SUMMARY_CONTENT_CHARS: Final[int] = 200
++
++# Disposition reference kinds mapping
++DISPOSITION_REFERENCE_KINDS: Final[dict[str, str]] = {
++    "resolved": "resolves-under",
++    "dropped": "dropped-under"
++}
++
+ # node_role values a map node may carry. The root is 'root' (type question);
+ # working thinking nodes are position/challenge/note. In-map "decisions" are
+ # represented as ratified positions and only become real KB decisions at
+diff --git a/src/mem_mcp/mindmap/service.py b/src/mem_mcp/mindmap/service.py
+index 340773c..43d36d7 100644
+--- a/src/mem_mcp/mindmap/service.py
++++ b/src/mem_mcp/mindmap/service.py
+@@ -15,6 +15,8 @@ from uuid import UUID
+ if TYPE_CHECKING:
+     import asyncpg  # type: ignore[import-untyped]
+ 
++from mem_mcp.mindmap import BRANCH_STATUSES, SUMMARY_CONTENT_CHARS, DISPOSITION_REFERENCE_KINDS
++
+ 
+ def _as_dict(value: Any) -> dict[str, Any]:
+     """asyncpg returns JSONB as a str when no codec is registered; accept both."""
+@@ -183,7 +185,9 @@ async def fetch_members(
+     rows = await conn.fetch(
+         """
+         SELECT mm.memory_id, mm.node_role, mm.added_at,
+-               m.content, m.type, m.metadata, m.created_at
++               m.content, m.type, m.metadata, m.created_at,
++               mm.status, mm.resolution_summary, mm.resolved_by_memory_id,
++               mm.resolved_by_party, mm.resolved_at
+         FROM memory_map_membership mm
+         JOIN memories m ON m.id = mm.memory_id
+         WHERE mm.root_memory_id = $1 AND m.tenant_id = $2 AND m.deleted_at IS NULL
+@@ -239,3 +243,110 @@ async def fetch_recent_events(
+         d["payload"] = _as_dict(d.get("payload"))
+         out.append(d)
+     return out
++
++
++async def settle_branch(
++    conn: asyncpg.Connection,
++    *,
++    root_memory_id: UUID,
++    tenant_id: UUID,
++    memory_id: UUID,
++    status: str,
++    resolution_summary: str,
++    resolved_by_memory_id: UUID | None,
++    resolved_by_party: str,
++) -> dict[str, Any]:
++    """Settle a branch (resolved or dropped). Returns the updated row."""
++    # Validate status
++    if status not in ("open", "resolved", "dropped"):
++        raise ValueError(f"Invalid status: {status}")
++
++    # Update the membership record
++    row = await conn.fetchrow(
++        """
++        UPDATE memory_map_membership
++        SET status = $1,
++            resolution_summary = $2,
++            resolved_by_memory_id = $3,
++            resolved_by_party = $4,
++            resolved_at = now()
++        WHERE memory_id = $5
++          AND root_memory_id = $6
++          AND tenant_id = $7
++          AND node_role <> 'root'
++        RETURNING *
++        """,
++        status,
++        resolution_summary,
++        resolved_by_memory_id,
++        resolved_by_party,
++        memory_id,
++        root_memory_id,
++        tenant_id,
++    )
++
++    if row is None:
++        from mem_mcp.mindmap.service import MapNodeNotFoundError
++        raise MapNodeNotFoundError(f"Node {memory_id} is not a member of map {root_memory_id}")
++
++    return dict(row)
++
++
++async def current_cursor(
++    conn: asyncpg.Connection, *, root_memory_id: UUID, tenant_id: UUID
++) -> int:
++    """Get the current cursor (max event id) for a map."""
++    return await conn.fetchval(
++        """
++        SELECT COALESCE(MAX(id), 0) FROM memory_map_events
++        WHERE root_memory_id = $1
++        """,
++        root_memory_id,
++    )
++
++
++async def touched_since(
++    conn: asyncpg.Connection, *, root_memory_id: UUID, tenant_id: UUID, since: int
++) -> set[UUID]:
++    """Get memory ids touched by events with id > since for this map."""
++    if since < 0:
++        raise ValueError("since must be non-negative")
++
++    rows = await conn.fetch(
++        """
++        SELECT DISTINCT mm.memory_id
++        FROM memory_map_membership mm
++        JOIN memory_map_events mme ON mm.root_memory_id = mme.root_memory_id
++        WHERE mm.root_memory_id = $1
++          AND mme.id > $2
++          AND (mme.memory_id IS NOT NULL
++               OR (mme.event = 'link' AND mme.payload->>'target' IS NOT NULL))
++        """,
++        root_memory_id,
++        since,
++    )
++
++    # Also need to get target memory ids from link events
++    target_rows = await conn.fetch(
++        """
++        SELECT DISTINCT (payload->>'target')::uuid
++        FROM memory_map_events
++        WHERE root_memory_id = $1
++          AND id > $2
++          AND event = 'link'
++          AND (payload->>'target') IS NOT NULL
++        """,
++        root_memory_id,
++        since,
++    )
++
++    # Combine both sets
++    memory_ids = {row["memory_id"] for row in rows}
++    target_ids = {row["?column?"] for row in target_rows if row["?column?"] is not None}
++
++    return memory_ids.union(target_ids)
++
++
++class MapNodeNotFoundError(Exception):
++    """Raised when attempting to settle a node that is not a member of the map."""
++    pass

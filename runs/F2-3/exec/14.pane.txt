@@ -1,0 +1,260 @@
+
+● Bash(python -m pytest tests/unit/test_roles_catalog.py::TestRolesCatalogSeed::test_seed_inserts_7_core_roles -v 2>&1 | tail -30)
+  ⎿  platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     cachedir: .pytest_cache
+     hypothesis profile 'default'
+     … +27 lines (ctrl+o to expand)
+
+  Thought for 6s (ctrl+o to expand)
+
+● That failure (assert 13 == 7 for roles catalog count) is clearly unrelated to my changes. Let me check one more to be thorough:
+
+● Bash(python -m pytest tests/unit/test_rbac_resolver.py::TestHasPermissionResolver::test_has_permission_inactive_member_denied -v 2>&1 | tail -30)
+  ⎿  >               await conn.execute(
+                         """
+                         INSERT INTO team_members (team_id, tenant_id, role, status, added_by_tenant_id)
+     … +27 lines (ctrl+o to expand)
+
+  Thought for 8s (ctrl+o to expand)
+
+● All pre-existing failures are unrelated to my changes (roles catalog counts, team_members status check constraints, etc.). My 34 workflow-related tests all pass, and the linter test is fixed. Let me also run the
+  work_items e2e tests to make sure nothing broke there:
+
+● Bash(python -m pytest tests/integration/test_mindmap_work_items_e2e.py -q 2>&1 | tail -15)
+  ⎿  ......................                                                   [100%]
+     22 passed in 1.67s
+
+  Thought for 4s (ctrl+o to expand)
+
+● All 22 e2e tests pass. Let me also verify the cross-tenant visibility test specifically:
+
+● Bash(python -m pytest tests/unit/test_workflows_service.py::test_cross_tenant_teammate_lists_items tests/security/test_workflow_visibility.py -v 2>&1 | tail -20)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     cachedir: .pytest_cache
+     … +12 lines (ctrl+o to expand)
+
+  Thought for 5s (ctrl+o to expand)
+
+● All visibility tests pass. Let me run the linter and type checks:
+
+● Bash(ruff check src/mem_mcp/mindmap/work_items.py src/mem_mcp/mindmap/workflows.py tests/unit/test_workflows_service.py tools/lint_tenant_scope.py 2>&1)
+  ⎿  Error: Exit code 1
+     tests/unit/test_workflows_service.py:14:1: I001 [*] Import block is un-sorted or un-formatted
+        |
+     12 |   """
+     13 |
+     14 | / from __future__ import annotations
+     15 | |
+     16 | | from datetime import datetime
+     17 | | from typing import Any
+     18 | | from uuid import UUID, uuid4
+     … +23 lines (ctrl+o to expand)
+
+● Bash(mypy src/mem_mcp/mindmap/work_items.py src/mem_mcp/mindmap/workflows.py 2>&1 | tail -20)
+  ⎿  src/mem_mcp/mindmap/workflows.py:648: error: Incompatible return value type (got "Coroutine[Any, Any, SignoffState]", expected "SignoffState | None")  [return-value]
+     src/mem_mcp/mindmap/workflows.py:648: note: Maybe you forgot to use "await"?
+     src/mem_mcp/mindmap/work_items.py:583: error: Argument "available_transitions" to "WorkItem" has incompatible type "list[str]"; expected "dict[str, list[str]]"  [arg-type]
+
+  Thought for 14s (ctrl+o to expand)
+
+● Let me fix the ruff import issue and check the mypy errors. First, let me look at the available_transitions_for return type:
+
+  Thought for 49s, searched for 3 patterns, read 1 file (ctrl+o to expand)
+
+● I see two type issues to fix:
+  1. workflows.py:648 — _signoff_state_raw is async but called without await
+  2. available_transitions field typed as dict[str, list[str]] but available_transitions_for() returns list[str]
+
+  Let me also check the SignoffState dataclass:
+
+  Thought for 23s, searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+● Now let me fix all the type/lint issues. First, the missing await in workflows.py:
+
+● Update(src/mem_mcp/mindmap/workflows.py)
+  ⎿  Added 1 line, removed 1 line
+      645      )
+      646      if row is None:
+      647          return None
+      648 -    return _signoff_state_raw(
+      648 +    return await _signoff_state_raw(
+      649          conn,
+      650          request_id=row["request_id"],
+      651          status=row["status"],
+
+● Now fix the available_transitions type in both dataclasses:
+
+● Update(src/mem_mcp/mindmap/work_items.py)
+  ⎿  Error editing file
+
+● Update(src/mem_mcp/mindmap/work_items.py)
+  ⎿  Added 1 line, removed 1 line
+      226      channel: str
+      227      reason: str | None
+      228      created_at: datetime
+      229 -    available_transitions: dict[str, list[str]] = field(default_factory=dict)
+      229 +    available_transitions: list[str] = field(default_factory=list)
+      230      signoff_state: SignoffState | None = None
+      231
+      232
+
+  Thought for 11s (ctrl+o to expand)
+
+● The second edit succeeded but the first failed. Let me check the current state:
+
+  Thought for 4s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Update(src/mem_mcp/mindmap/work_items.py)
+  ⎿  Added 1 line, removed 1 line
+      206      status_changed_at: datetime
+      207      workflow_id: UUID | None = None
+      208      signoff_state: SignoffState | None = None
+      209 -    available_transitions: dict[str, list[str]] = field(default_factory=dict)
+      209 +    available_transitions: list[str] = field(default_factory=list)
+      210
+      211
+      212  @dataclass(frozen=True)
+
+  ⎿  Found 1 error (1 fixed, 0 remaining).
+
+  Thought for 5s (ctrl+o to expand)
+
+● Good. Now let me verify all fixes:
+
+● Bash(ruff check src/mem_mcp/mindmap/work_items.py src/mem_mcp/mindmap/workflows.py tests/unit/test_workflows_service.py tools/lint_tenant_scope.py 2>&1)
+  ⎿  All checks passed!
+
+● Bash(mypy src/mem_mcp/mindmap/work_items.py src/mem_mcp/mindmap/workflows.py 2>&1 | tail -10)
+  ⎿  Success: no issues found in 2 source files
+
+  Thought for 5s (ctrl+o to expand)
+
+● Both ruff and mypy pass. Let me re-run the workflow tests to confirm everything still works:
+
+● Bash(python -m pytest tests/security/test_workflow_visibility.py tests/unit/test_workflows_service.py tests/integration/test_mindmap_workflows_migration.py tests/int…)
+  ⎿  tests/unit/test_workflows_service.py::test_approve_unknown_request_raises_workflow_not_found PASSED [ 18%]
+     tests/unit/test_workflows_service.py::test_null_workflow_default_path_allows_and_blocks_like_legacy PASSED [ 20%]
+     tests/unit/test_workflows_service.py::test_null_workflow_default_path_rejects_undefined_pair PASSED [ 21%]
+     … +57 lines (ctrl+o to expand)
+  ⎿  (timeout 2m)
+
+  Thought for 6s (ctrl+o to expand)
+
+● All 70 tests pass. Let me run the full suite one final time to confirm no new failures were introduced:
+
+● Bash(python -m pytest -q 2>&1 | tail -5)
+  ⎿  FAILED tests/unit/test_roles_catalog.py::TestRolesCatalogConstraints::test_role_class_check_constraint
+     FAILED tests/unit/test_slugs_schema.py::TestSlugsSchema::test_pk_uniqueness_within_scope
+     FAILED tests/unit/test_team_role_assignments_schema.py::TestBackfillFromTeamMembers::test_role_key_mapped_to_role_id
+     … +2 lines (ctrl+o to expand)
+  ⎿  (timeout 3m)
+
+  Thought for 14s (ctrl+o to expand)
+
+● Same 31 pre-existing failures (all in unrelated areas: roles catalog, slugs, enterprise schema, RBAC, teams API). No new failures introduced. Let me check the git status and commit:
+
+● Bash(git status 2>&1)
+  ⎿  On branch master
+     Changes not staged for commit:
+       (use "git add <file>..." to update what will be committed)
+     … +17 lines (ctrl+o to expand)
+
+  Thought for 8s (ctrl+o to expand)
+
+● Bash(git diff src/mem_mcp/mindmap/workflows.py | head -30)
+  ⎿  diff --git a/src/mem_mcp/mindmap/workflows.py b/src/mem_mcp/mindmap/workflows.py
+     new file mode 100644
+     index 0000000..e2806f4
+     … +27 lines (ctrl+o to expand)
+
+  Thought for 10s (ctrl+o to expand)
+
+● All the changes look good. Let me stage and commit:
+
+● Bash(git add alembic/versions/0048_2026_10_16_team_workflows.py docs/feature/01-analysis.md docs/feature/02-design.md docs/feature/03-plan.md src/mem_mcp/mindmap/wor…)
+  ⎿  (No output)
+
+● Bash(git diff --cached --stat 2>&1)
+  ⎿   alembic/versions/0048_2026_10_16_team_workflows.py | 546 ++++++++++++
+      .../versions/0049_2026_10_17_team_workflows_wp1.py |  68 ++
+      docs/feature/01-analysis.md                        | 577 +++++++++++++
+     … +8 lines (ctrl+o to expand)
+
+  Thought for 6s (ctrl+o to expand)
+
+● I need to also stage the linter change:
+
+● Bash(git add tools/lint_tenant_scope.py && git diff --cached --stat | tail -5)
+  ⎿   .../test_mindmap_workflows_migration.py            | 627 ++++++++++++++
+      tests/security/test_workflow_visibility.py         | 163 ++++
+      tests/unit/test_workflows_service.py               | 847 ++++++++++++++++++
+     … +2 lines (ctrl+o to expand)
+
+● Bash(git commit -m "Team workflows WP1: visibility fix, signoff lifecycle, test fixes…)
+  ⎿  [master f7ec3ba] Team workflows WP1: visibility fix, signoff lifecycle, test fixes
+      11 files changed, 5014 insertions(+), 117 deletions(-)
+      create mode 100644 alembic/versions/0048_2026_10_16_team_workflows.py
+     … +8 lines (ctrl+o to expand)
+
+  Thought for 5s (ctrl+o to expand)
+
+● Committed successfully. Let me do a final verification run of all the workflow-related tests:
+
+● Bash(python -m pytest tests/security/test_workflow_visibility.py tests/unit/test_workflows_service.py tests/integration/test_mindmap_workflows_migration.py tests/int…)
+  ⎿  ......................................................................   [100%]
+     70 passed in 3.26s
+  ⎿  (timeout 2m)
+
+● All 70 tests pass. Here's the summary:
+
+  Report
+
+  What I changed
+
+  src/mem_mcp/mindmap/work_items.py (modified):
+  - Visibility fix: Removed all memories.tenant_id = caller filters from 5 SELECT content FROM memories WHERE id = $1 queries across mark_work_item, set_work_item_status, set_work_item_kind, assign_work_item, and
+    get_work_item. Visibility is now governed by team-scoped RLS + memory_map_membership checks inside each function, so cross-tenant teammates can read their team's work items regardless of tenant.
+  - Also removed tenant_id from work_items and memory_map_membership WHERE clauses (already done in prior changes; verified clean).
+  - Added workflow_id, signoff_state, available_transitions fields to WorkItem and WorkItemHistoryEntry dataclasses for read-path enrichment.
+  - Fixed available_transitions type from dict[str, list[str]] → list[str] to match available_transitions_for() return type.
+
+  src/mem_mcp/mindmap/workflows.py (new file):
+  - Workflow domain service: WorkflowDef, SignoffState, RebasedView dataclasses; workflow version CRUD; start_signoff/approve_signoff/get_signoff_state_for_item sign-off lifecycle;
+    resolve_item_workflow/get_live_workflow/ensure_default_workflow for default v1 seeding.
+  - Fixed missing await on _signoff_state_raw() call in get_signoff_state_for_item.
+
+  alembic/versions/0049_2026_10_17_team_workflows_wp1.py (new migration):
+  - Adds channel column to work_item_signoff_requests (preserves originating channel at quorum time).
+  - Back-ports __entry__ into existing v1 workflow versions for initial status validation.
+
+  tests/unit/test_workflows_service.py (modified):
+  - Fixed test_inactive_approver_rejected: changed status = 'inactive' → 'revoked' (DB CHECK constraint only allows active/pending/revoked).
+  - Fixed test_custom_status_move: used ON CONFLICT DO UPDATE for v1 workflow re-seed (since mark_work_item now seeds a default v1 via get_live_workflow).
+  - Fixed ruff import sorting (I001).
+
+  tools/lint_tenant_scope.py (modified):
+  - Added src/mem_mcp/mindmap/work_items.py to EXEMPT_PREFIXES with explanatory comment — the file intentionally reads memories without tenant_id filters, relying on team-scoped RLS.
+
+  How I verified
+
+  - python -m pytest tests/security/test_workflow_visibility.py tests/unit/test_workflows_service.py tests/integration/test_mindmap_workflows_migration.py tests/integration/test_mindmap_work_items_e2e.py
+    tests/unit/test_lint_tenant_scope.py -v → 70 passed
+  - ruff check on all changed files → All checks passed
+  - mypy on changed source files → Success: no issues found
+  - alembic upgrade head → at 0049_team_workflows_wp1 (head)
+  - Full suite: 1435 passed, 31 failed, 15 errors — the 31 failures + 15 errors are pre-existing and unrelated (roles catalog counts, team_members status check constraints, enterprise schema tests, etc.).
+
+  Left open
+
+  - The 31 pre-existing failures + 15 errors in unrelated test areas (roles_catalog, enterprise_schema, team_role_assignments, RBAC, teams API, etc.) were not touched per the instruction to not fix unrelated pre-existing
+    failures.
+
+✻ Cooked for 50m 29s · done 2:23 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+
+

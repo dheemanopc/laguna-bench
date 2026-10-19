@@ -1,0 +1,7 @@
+VERDICT: REVISE
+
+1. 56 new failures in test_mindmap_work_items_e2e.py (gates-wp0-1.md lines 7-22): migration:289 makes `work_items.workflow_id` NOT NULL with no DEFAULT, so the unchanged `mark_work_item` INSERT now violates it. WP0 "ships idempotently alone" must not break the existing green surface. Fix with a transitional default/trigger that stamps the team's live version, or move the NOT NULL to WP1.
+2. The planned migration tests are missing. Only tests/security/test_workflow_visibility.py was added (gates line 5), not tests/integration/test_mindmap_workflows_migration.py. Plan 03 WP0 lists seven tests: seeding, back-fill, CHECK dropped, change_type, INSERT policy, cross-tenant OR-shape, and signoff RLS isolation. The existing file has only two tests (lines 85 and 120).
+3. Teams created after the migration get no workflow (hooks are WP1/WP3), and `workflow_id` is NOT NULL, so item creation fails for any new team. This is the same root cause as finding 1, and it needs a DB-level fallback.
+4. migration:221 declares `workflow_id ... ON DELETE SET NULL` and migration:289 then sets NOT NULL. The two contradict each other; use RESTRICT, as the other version FKs do.
+5. The new-table policies (migration:353-357) use only the `user_effective_team_access` clause. They omit the same-tenant escape that the plan's "OR-shape" RLS basis describes (plan lines 29-33). A creator who is in `team_role_assignments` but not in UEA could not seed the workflow under RLS. Add a test proving the seed works under `mem_app`.

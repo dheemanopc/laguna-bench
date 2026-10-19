@@ -1,0 +1,260 @@
+      112 +
+      113  class MindmapGetTool(BaseTool):
+      114      name: ClassVar[str] = "mindmap_get"
+      115      description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_get"]
+     ...
+      127                  raise JsonRpcError(-32602, "map not found", data={"errors": [{"path": "map_key"}]})
+      128              row = await service.get_map_row(conn, root_memory_id=root_id)
+      129              assert row is not None
+      130 +
+      131 +            # Read the cursor FIRST so the delta query is bounded by it,
+      132 +            # preventing a concurrent write from being skipped or double-counted.
+      133 +            cursor = await service.current_cursor(
+      134 +                conn, root_memory_id=root_id, tenant_id=ctx.tenant_id
+      135 +            )
+      136              members = await service.fetch_members(
+      137                  conn, root_memory_id=root_id, tenant_id=ctx.tenant_id
+      138              )
+       77 -            member_ids = [m["memory_id"] for m in members]
+       78 -            edges = await service.fetch_internal_edges(conn, member_ids=member_ids)
+      139 +            all_member_ids = [m["memory_id"] for m in members]
+      140
+       80 -        nodes = [
+       81 -            MindmapNode(
+       82 -                memory_id=m["memory_id"],
+       83 -                node_role=m["node_role"],
+       84 -                type=m["type"],
+       85 -                content=m["content"],
+       86 -                metadata=m["metadata"],
+       87 -                created_at=m["created_at"],
+       88 -            )
+       89 -            for m in members
+       90 -        ]
+       91 -        open_loops = [
+       92 -            m["memory_id"] for m in members if m["metadata"].get("responsible_party") == "owner"
+       93 -        ]
+      141 +            # open_loops: whose-turn resume surface over ALL members (cheap).
+      142 +            open_loops = [
+      143 +                m["memory_id"]
+      144 +                for m in members
+      145 +                if m["status"] == "open"
+      146 +                and m["metadata"].get("responsible_party") in ("owner", "model")
+      147 +            ]
+      148 +
+      149 +            # Candidate set for nodes/edges/resolved.
+      150 +            if inp.since is None:
+      151 +                candidates = members
+      152 +            else:
+      153 +                # since >= cursor → nothing changed (id window is empty).
+      154 +                if inp.since >= cursor:
+      155 +                    candidates = []
+      156 +                else:
+      157 +                    touched = await service.touched_since(
+      158 +                        conn,
+      159 +                        root_memory_id=root_id,
+      160 +                        tenant_id=ctx.tenant_id,
+      161 +                        since=inp.since,
+      162 +                        upto=cursor,
+      163 +                    )
+      164 +                    member_by_id = {m["memory_id"]: m for m in members}
+      165 +                    candidates = [member_by_id[mid] for mid in touched if mid in member_by_id]
+      166 +
+      167 +            # Build nodes + resolved from candidates.
+      168 +            nodes: list[MindmapNode] = []
+      169 +            resolved: list[MindmapResolvedBranch] = []
+      170 +            for c in candidates:
+      171 +                if inp.include == "all":
+      172 +                    # every candidate goes in nodes with its status
+      173 +                    content, truncated = truncate_content(c["content"], inp.depth)
+      174 +                    nodes.append(
+      175 +                        MindmapNode(
+      176 +                            memory_id=c["memory_id"],
+      177 +                            node_role=c["node_role"],
+      178 +                            type=c["type"],
+      179 +                            content=content,
+      180 +                            metadata=c["metadata"],
+      181 +                            created_at=c["created_at"],
+      182 +                            status=c["status"],
+      183 +                            truncated=truncated,
+      184 +                        )
+      185 +                    )
+      186 +                else:  # include == "open"
+      187 +                    if c["status"] == "open":
+      188 +                        content, truncated = truncate_content(c["content"], inp.depth)
+      189 +                        nodes.append(
+      196 +                                created_at=c["created_at"],
+      197 +                                status=c["status"],
+      198 +                                truncated=truncated,
+      199 +                            )
+      200 +                        )
+      201 +                    else:
+      202 +                        # settled candidate → compact entry, no content
+      203 +                        resolved.append(
+      204 +                            MindmapResolvedBranch(
+      205 +                                memory_id=c["memory_id"],
+      206 +                                resolution_summary=c["resolution_summary"] or "",
+      207 +                                status=c["status"],
+      208 +                                resolved_by_party=c["resolved_by_party"] or "",
+      209 +                            )
+      210 +                        )
+      211 +
+      212 +            # Edges: full set for since=None, candidate-filtered for deltas.
+      213 +            if inp.since is None:
+      214 +                edges_raw = await service.fetch_internal_edges(conn, member_ids=all_member_ids)
+      215 +            elif candidates:
+      216 +                candidate_ids = {c["memory_id"] for c in candidates}
+      217 +                # internal edges among all members, filtered to those touching a candidate
+      218 +                all_edges = await service.fetch_internal_edges(conn, member_ids=all_member_ids)
+      219 +                edges_raw = [
+      220 +                    e for e in all_edges
+      221 +                    if e["source_memory_id"] in candidate_ids
+      222 +                    or e["target_memory_id"] in candidate_ids
+      223 +                ]
+      224 +            else:
+      225 +                edges_raw = []
+      226 +
+      227          return MindmapGetOutput(
+      228              map_key=inp.map_key,
+      229              root_memory_id=root_id,
+     ...
+      239                      target_memory_id=e["target_memory_id"],
+      240                      reference_kind=e["reference_kind"],
+      241                  )
+      109 -                for e in edges
+      242 +                for e in edges_raw
+      243              ],
+      244              open_loops=open_loops,
+      245 +            cursor=cursor,
+      246 +            resolved=resolved,
+      247              request_id=ctx.request_id,
+      248          )
+  ⎿  Read src/mem_mcp/mcp/tools/mindmap_get.py (249 lines)
+  ⎿  Read skills/mindmap-driver/SKILL.md (65 lines)
+  ⎿  Referenced file src/mem_mcp/mcp/tool_descriptions.py
+  ⎿  Referenced file src/mem_mcp/main.py
+  ⎿  Read src/mem_mcp/mcp/tools/mindmap_resolve.py (240 lines)
+  ⎿  Plan file referenced (~/.claude/plans/async-growing-platypus.md)
+
+  Thought for 3s (ctrl+o to expand)
+
+● Good, the rewrite is complete. Now let me verify the service layer and check existing test patterns before writing the tests.
+
+  Thought for 3s, searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+● Let me read the existing e2e tests and the tool description/common files to understand the patterns.
+
+  Thought for 3s, read 2 files (ctrl+o to expand)
+
+● Let me check the tool descriptions and the open tool's output to understand what data the tools produce.
+
+  Thought for 14s, searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+● Now let me check how tools are registered in main.py.
+
+  Thought for 9s, searched for 2 patterns (ctrl+o to expand)
+
+● Let me check the write_node tool to see what events it logs (needed for the since workflow test).
+
+  Thought for 6s, read 1 file (ctrl+o to expand)
+
+● Now I have everything I need. Let me write both test files.
+
+● Write(tests/unit/test_mindmap_resolve_models.py)
+  ⎿  Wrote 202 lines to tests/unit/test_mindmap_resolve_models.py
+      1 """DB-free model + registration tests for mindmap_resolve + mindmap_get.
+      2
+      3 Covers input validation, defaults, the truncation helper, and tool registration
+      4 without touching Postgres.
+      5 """
+      6
+      7 from __future__ import annotations
+      8
+      9 from uuid import uuid4
+     … +192 lines (ctrl+o to expand)
+
+  Thought for 1m 3s (ctrl+o to expand)
+
+● Let me check the error structure and how tests check for error codes.
+
+  Thought for 3s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Let me check the close tool and how the conftest provides pg_pool.
+
+  Thought for 30s, read 2 files (ctrl+o to expand)
+
+● Let me verify the migration file and check the pg_pool conftest fixture.
+
+  Thought for 13s, searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+● Let me check the ToolContext class definition.
+
+  Thought for 59s, searched for 1 pattern (ctrl+o to expand)
+
+● Let me check the schema for memory_map_membership to understand RLS and constraints.
+
+  Thought for 4m 21s, searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● I notice a mismatch between the resolve tool's event names and touched_since. The tool logs event=inp.disposition ('resolved'/'dropped') but touched_since checks for evt in ("resolve", "drop"). Let me fix the resolve
+  tool.
+
+  Thought for 9s, read 1 file (ctrl+o to expand)
+
+● Update(src/mem_mcp/mcp/tools/mindmap_resolve.py)
+  ⎿  Added 4 lines, removed 1 line
+      211                  )
+      212
+      213              # Log the event; the returned id IS the new cursor.
+      214 +            # Event name is the action verb ("resolve"/"drop"), not the disposition
+      215 +            # value ("resolved"/"dropped") — matches what touched_since() looks for.
+      216 +            event_name = "resolve" if inp.disposition == "resolved" else "drop"
+      217              event_id = await service.log_event(
+      218                  conn,
+      219                  root_memory_id=root_id,
+      220                  tenant_id=ctx.tenant_id,
+      218 -                event=inp.disposition,
+      221 +                event=event_name,
+      222                  actor=inp.resolved_by_party,
+      223                  memory_id=inp.node_id,
+      224                  payload={
+
+  Thought for 54s (ctrl+o to expand)
+
+● Now let me write the comprehensive integration test file.
+
+● Write(tests/integration/test_mindmap_branch_status.py)
+  ⎿  Wrote 1054 lines to tests/integration/test_mindmap_branch_status.py
+       1 """Integration tests for per-branch settlement (mindmap_resolve) + cheap reads
+       2 (mindmap_get with since/include/depth).
+       3
+       4 Coverage:
+       5   1. resolve with resolving node → status/summary/party/resolved_by/resolved_at;
+       6      memory_references row (resolves-under); event logged; cursor advanced.
+       7   2. drop with/without resolving node → status/edge or no edge.
+       8   3. node of different map / random uuid → -32602 opaque, nothing changed.
+       9   4. archived / unknown map / root / already-settled → -32602 right data codes.
+      10   5. mindmap_link(resolves-under) alone does NOT settle; still in open_loops.
+     … +1044 lines (ctrl+o to expand)
+
+  Thought for 4s (ctrl+o to expand)
+
+● Good, both test files are written. Now let me run the verification steps. First, apply the migration and run the unit tests.
+
+● Bash(echo "MEM_MCP_TEST_DSN=$MEM_MCP_TEST_DSN" && echo "MEM_MCP_DB_MAINT_DSN=$MEM_MCP_DB_MAINT_DSN")
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Baked for 26m 13s · done 10:19 PM
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── mindmap-branch-status ─
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents
+
+
+
+
+
+
+
+
+
+

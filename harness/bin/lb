@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# lb — laguna-bench toolkit (laptop side). One entry point for the GPU box lifecycle, serving profiles and test runs.
+#
+#   lb status                     instance state, vLLM health, tunnel/shim, active runs, AWS cost so far
+#   lb up                         start the stopped instance (or launch a new one if none), re-arm the dead-man switch,
+#                                 refresh SG IP, ssh_config, tunnel (127.0.0.1:18000) and shim (127.0.0.1:4000); wait for vLLM
+#   lb down                       STOP the instance (keeps disk + weights; ~$1.30/day EBS) after checking no runs are active
+#   lb destroy                    TERMINATE + delete SG/key pair; verify nothing tagged Project=laguna-bench remains (3 regions)
+#   lb serve <profile>            switch vLLM flags and restart; profiles: base | 1m | offload | dflash   (see PROFILES below)
+#   lb run <max_par> Tn:ARM:run_id ...   run benchmark runs (prepare → Opus master + executor → score) via run_queue.sh
+#   lb peek <run_id> [n]          what the run's executor is doing right now (read-only)
+#   lb curve                      re-run the capacity curve on the instance (tmux), results in /opt/bench/curve
+#
+# Safety: never more than one laguna-bench GPU instance; dead-man shutdown re-armed on every `up`;
+# SSH only from the laptop's current IP; vLLM bound to 127.0.0.1 on the box.
+set -uo pipefail
+B=$HOME/laguna-bench; . $B/instance.env; AWS="aws --region $R"
+ip() { $AWS ec2 describe-instances --instance-ids $IID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null; }
+state() { $AWS ec2 describe-instances --instance-ids $IID --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null; }
+set_host() { sed -i "s/^  HostName .*/  HostName $1/" $B/ssh_config; ssh -F $B/ssh_config -O exit gpu >/dev/null 2>&1 || true; }
+wait_vllm() { for i in $(seq 120); do curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:18000/health 2>/dev/null | grep -q 200 && { echo "vLLM healthy"; return 0; }; sleep 10; done; echo "vLLM not healthy after 20 min"; return 1; }
+start_local() {
+  pgrep -f "^bash $B/bin/tunnel.sh|bin/tunnel.sh" >/dev/null || { setsid nohup $B/bin/tunnel.sh >/dev/null 2>&1 < /dev/null & }
+  pgrep -f "bin/shim.py" >/dev/null || { setsid nohup $B/litellm-venv/bin/python $B/bin/shim.py > $B/logs/shim.out 2>&1 < /dev/null & }
+  pgrep -f "bin/prompt_guard.sh" >/dev/null || { setsid nohup $B/bin/prompt_guard.sh >/dev/null 2>&1 < /dev/null & }
+}
+stop_local() { pkill -f "bin/tunnel.sh"; pkill -f "bin/shim.py"; pkill -f "bin/prompt_guard.sh"; ssh -F $B/ssh_config -O exit gpu >/dev/null 2>&1; true; }
+active_runs() { tmux ls -F '#S' 2>/dev/null | grep -c '^rc-lb-'; }
+
+declare -A PROFILES=(
+  [base]=""
+  [1m]="--max-model-len 1048576"
+  [offload]="--kv-offloading-backend native --kv-offloading-size 300"
+  [dflash]="--max-num-seqs 32 --disable-custom-all-reduce --speculative-config {\"model\":\"poolside/Laguna-S-2.1-DFlash-FP8\",\"num_speculative_tokens\":7,\"method\":\"dflash\"}"
+)
+
+case "${1:-status}" in
+status)
+  st=$(state); echo "instance $IID ($R): $st  ip=$(ip)"
+  [ "$st" = running ] && { curl -s -m 20 -o /dev/null -w "vLLM health: %{http_code}\n" http://127.0.0.1:18000/health || echo "vLLM: unreachable"; $B/bin/gssh 'grep -o "GPU KV cache size: [0-9,]* tokens" /opt/bench/vllm.log | tail -1; cat /opt/bench/vllm.env' 2>/dev/null; }
+  echo "tunnel: $(pgrep -f bin/tunnel.sh >/dev/null && echo up || echo down)  shim: $(pgrep -f bin/shim.py >/dev/null && echo up || echo down)  active sessions: $(active_runs)"
+  lt=$($AWS ec2 describe-instances --instance-ids $IID --query 'Reservations[0].Instances[0].LaunchTime' --output text); echo "launched $lt (cost: see STATE.md running total)";;
+up)
+  st=$(state)
+  if [ "$st" = None ] || [ "$st" = terminated ] || [ -z "$st" ]; then
+    echo "no instance — launching a new one"; $B/bin/launch.sh $R g7e.12xlarge | tee -a $B/launch.log
+    echo "update IID in $B/instance.env from the LAUNCHED line, then re-run 'lb up'"; exit 0; fi
+  [ "$st" = stopped ] && { $AWS ec2 start-instances --instance-ids $IID >/dev/null; echo starting...; $AWS ec2 wait instance-running --instance-ids $IID; }
+  $B/bin/ip_guard.sh >/dev/null; set_host $(ip); echo "ip $(ip)"
+  for i in $(seq 30); do $B/bin/gssh true 2>/dev/null && break; sleep 10; done
+  # dead-man switch: user-data only runs on first boot, so re-arm it on every start (never extended mid-session)
+  $B/bin/gssh "sudo shutdown -c 2>/dev/null; sudo shutdown -h +$DEADMAN_MIN 'laguna-bench dead-man switch' 2>&1 | tail -1; sudo systemctl start vllm; tmux has-session -t scrape 2>/dev/null || tmux new -d -s scrape /opt/bench/scrape.sh"
+  start_local; wait_vllm;;
+down)
+  n=$(active_runs); [ "$n" -gt 0 ] && [ "${2:-}" != --force ] && { echo "REFUSE: $n bench sessions active (lb down --force to override)"; exit 2; }
+  $B/bin/gssh 'sudo shutdown -c' 2>/dev/null; stop_local
+  $AWS ec2 stop-instances --instance-ids $IID >/dev/null && $AWS ec2 wait instance-stopped --instance-ids $IID && echo "stopped (disk kept)";;
+destroy)
+  stop_local; $AWS ec2 terminate-instances --instance-ids $IID >/dev/null; $AWS ec2 wait instance-terminated --instance-ids $IID; echo terminated
+  $AWS ec2 delete-security-group --group-id $SG && echo "SG deleted"; $AWS ec2 delete-key-pair --key-name $KEY && echo "key pair deleted"
+  for r in us-east-1 us-east-2 ap-south-1; do echo "== $r"; aws --region $r ec2 describe-instances --filters Name=tag:Project,Values=laguna-bench Name=instance-state-name,Values=pending,running,stopping,stopped --query 'Reservations[].Instances[].InstanceId' --output text; aws --region $r ec2 describe-volumes --filters Name=tag:Project,Values=laguna-bench --query 'Volumes[].VolumeId' --output text; done | tee $B/logs/destroy-verify-$(date -u +%Y%m%dT%H%M).txt;;
+serve)
+  p="${2:?profile: ${!PROFILES[*]}}"; [ -n "${PROFILES[$p]+x}" ] || { echo "unknown profile $p"; exit 1; }
+  n=$(active_runs); [ "$n" -gt 0 ] && [ "${3:-}" != --force ] && { echo "REFUSE: $n bench sessions active (restart would break them)"; exit 2; }
+  printf 'EXTRA_ARGS=%q\n' "${PROFILES[$p]}" > $B/scratch/vllm.env.$p
+  scp -q -F $B/ssh_config $B/scratch/vllm.env.$p gpu:/opt/bench/vllm.env
+  $B/bin/gssh "mv /opt/bench/vllm.log /opt/bench/vllm.\$(date +%H%M%S).log 2>/dev/null; sudo systemctl restart vllm"
+  for i in $(seq 90); do s=$($B/bin/gssh 'echo $(grep -c "Application startup complete" /opt/bench/vllm.log) $(grep -c -E "Traceback|RuntimeError" /opt/bench/vllm.log)'); set -- $s
+    [ "$1" = 1 ] && break; [ "$2" != 0 ] && { echo "FAILED to start with profile $p"; $B/bin/gssh 'grep -E "Error|Failed" /opt/bench/vllm.log | head -5'; exit 1; }; sleep 10; done
+  $B/bin/gssh 'grep -E "GPU KV cache size|Maximum concurrency|hybrid|offload" /opt/bench/vllm.log | cut -c60-240 | tail -6';;
+run)  shift; exec $B/bin/run_queue.sh "$@";;
+peek) shift; exec $B/bin/peek.sh "$@";;
+curve) $B/bin/gssh 'tmux new -d -s curve /opt/bench/curve.sh && echo "curve started (tmux curve on the box)"';;
+*) sed -n '2,20p' $0;;
+esac

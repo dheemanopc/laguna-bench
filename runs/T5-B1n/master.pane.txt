@@ -1,0 +1,260 @@
+  Rules: do not try to edit files yourself; you cannot run tests or other commands yourself (only Read/Grep/Glob, writing order files, run_executor.sh and git diff/status) — ask the executor to run tests and report
+  exact results; do not use web access; stay within this repository.
+  When finished, reply with a final report: summary of the solution, number of executor round-trips, remaining
+  concerns, and your confidence that the task's acceptance criteria are met.
+
+  === TASK PACKET ===
+  # T5 — No lost updates when several agents edit the same memory
+
+  Category: logic-heavy concurrency · Complexity: complex · Time box: 90–120 min
+
+  ## Problem
+
+  Mind-map nodes are ordinary memories (`position`, `challenge`, `note`, …) and
+  are edited in place with `memory_update`. With several agents working the same
+  map at once we see silent data loss:
+
+  1. **Lost tag edits.** Agent A adds tag `x` and agent B adds tag `y` to the same
+     node at the same moment; afterwards the node has only one of them.
+     (`tags_op="add"`/`"remove"` merges in Python against a row it read earlier.)
+  2. **Forked version chains.** Two agents update the content of the same
+     `decision` (a versioned type) concurrently; both calls "succeed" and the chain
+     now has **two current versions** superseding the same parent. The same fork
+     happens without any concurrency if a caller updates an id that has already
+     been superseded (it still holds an old id).
+  3. **Blind overwrites.** Agent A reads a node, thinks for a minute, writes its
+     rewrite; meanwhile agent B rewrote the node. A's write silently discards B's.
+     There is no way for a caller to say "only apply this if the memory is still
+     what I read".
+
+  Relevant code: `src/mem_mcp/mcp/tools/update.py` (memory_update),
+  `src/mem_mcp/mcp/tools/get.py` (memory_get, `MemoryRecord`),
+  `src/mem_mcp/memory/versioning.py`, `src/mem_mcp/db/tenant_tx.py`.
+
+  ## Required behaviour
+
+  ### Revision tokens (optimistic concurrency)
+
+  - Every memory has a **revision**: an opaque string that changes whenever the
+    memory is changed by `memory_update` (content, tags, type or metadata — any
+    successful update yields a new revision; two successive updates never yield
+    the same revision).
+  - `memory_get` exposes it as `memory.revision` (a `revision` field on
+    `MemoryRecord`, so it also appears on history records and anywhere else
+    `MemoryRecord` is returned). `MemoryRecord` must stay constructible from its
+    existing fields alone (no new required constructor argument), and a record
+    built that way must still report a non-empty string `revision` (including in
+    `model_dump()`).
+  - `memory_update` output gains `revision`: the revision of the row that now holds
+    the memory (on the versioned path, the **new** row's revision — it must equal
+    what `memory_get(new_id)` reports).
+  - `memory_update` input gains optional `expected_revision: str | None`. When
+    given and it does not equal the memory's current revision, the update is
+    refused and **nothing changes**. When omitted, behaviour is as today
+    (subject to the rules below).
+  - The check and the write must be atomic: if N callers concurrently send
+    updates with the same (currently valid) `expected_revision`, **exactly one**
+    succeeds and the other N−1 are refused.
+
+  ### Serialized updates (no lost updates even without a token)
+
+  - Concurrent `memory_update` calls on the same memory must behave as if they ran
+    one after another: concurrent `tags_op="add"` / `"remove"` calls all take
+    effect (none is lost); in-place content updates are last-writer-wins.
+  - A version chain never has more than one current row. Updating a memory that is
+    no longer current (it has been superseded, e.g. by a versioned content update
+    or a note→decision type promotion) is refused — whether the caller is late by
+    a millisecond (concurrent) or by a day (sequential). Of N concurrent content
+    updates to the same current `decision`, exactly one creates version 2; the
+    others are refused.
+
+  ### Conflict error contract
+
+  A refused update raises `JsonRpcError` with code **-32000** (application error)
+  and `data["code"] == "update_conflict"`, plus:
+  - `data["current_revision"]` — the memory's current revision (when refused for a
+    stale `expected_revision`), so the caller can re-read, merge and retry;
+  - `data["current_id"]` — the id (string) of the current version of the chain
+    (when refused because the target was superseded).
+
+  Not-found / deleted targets keep their existing -32602 errors.
+
+  Document the new parameter and the conflict contract in the `memory_update`
+  tool description (`mcp/tool_descriptions.py`).
+
+  ## Constraints
+
+  - Correctness must come from the database (row locking / conditional writes /
+    constraints), not from in-process locks — the server runs several workers.
+  - Keep the existing layering (`tenant_tx`, `JsonRpcError`). If you need a schema
+    change, add a new Alembic migration (`alembic/versions/`, next revision after
+    the current head); the scoring harness runs `alembic upgrade head` on a fresh
+    database before tests. A solution without a migration is fine.
+  - Backward compatible: existing callers that never send `expected_revision`
+    keep working; existing unit tests for `memory_update` (mock-based, in
+    `tests/unit/test_tools_update.py`) and the web/plugin callers must keep
+    passing. Do not change the plugin SDK's `MemoryClient.update` signature.
+  - Do not modify existing tests. Add your own, including **real concurrency
+    tests against Postgres** (e.g. `asyncio.gather` of several updates, each on its
+    own pooled connection — create a pool larger than the default `pg_pool`
+    fixture's 4 connections) that fail without your fix.
+  - The rest of the suite must not get new failures (some tests are red before
+    you start — pre-existing; leave them).
+
+  ## Running tests
+
+  `MEM_MCP_TEST_DSN` (and `MEM_MCP_DB_MAINT_DSN` for alembic) point at a fresh
+  migrated Postgres. Run e.g. `pytest -q -p no:cacheprovider tests/unit tests/integration`.
+  To create memories in DB-backed tests, set up a tenant + team + primary identity
+  with `default_team_id` (see `tests/integration/test_mindmap_e2e.py`) and use
+  `MemoryWriteTool` with a stub embedder. Note `memory_get` fires a background
+  access-count update; let it drain before closing a pool you created.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_0133gadpqiGHRdTHKFEMGYeN
+
+  Searched for 1 pattern, read 2 files, listed 1 directory (ctrl+o to expand)
+
+● Bash(cd ~/laguna-bench/runs/T5-B1n/repo; sed -n 1,120p tests/unit/test_tools_update.py; grep -n "fetchrow\|execute\|fetchval\|fetch(" tests/unit/test_tools…)
+  ⎿  """Tests for memory.update tool (T-7.2)."""
+
+     from __future__ import annotations
+     … +246 lines (ctrl+o to expand)
+
+● Bash(cd ~/laguna-bench/runs/T5-B1n/repo; sed -n 130,240p tests/unit/test_tools_update.py; grep -rn "revision\|is_current" alembic/versions/0001_initial_sch…)
+  ⎿      async def test_update_decision_content_change_creates_version(
+             self, monkeypatch: pytest.MonkeyPatch
+         ) -> None:
+     … +136 lines (ctrl+o to expand)
+
+● Bash(cd ~/laguna-bench/runs/T5-B1n/repo; sed -n 1,60p alembic/versions/0045_2026_08_12_fix_turn_backfill_double_encoded.py | head -40; grep -n "memory_upda…)
+  ⎿  """Repair the 0044 `turn` backfill — metadata is double-encoded JSONB.
+
+     0044 backfilled ``memory_map_membership.turn`` with::
+     … +117 lines (ctrl+o to expand)
+
+● I've read the update tool, the get tool, the mocks in the unit tests and the migrations. Now I'm writing the first work order for the executor.
+
+● Write(~/laguna-bench/runs/T5-B1n/orders/order-1.md)
+  ⎿  Wrote 128 lines to ../orders/order-1.md
+       1 # Work order 1 — No lost updates on `memory_update` (revision tokens + DB-level serialization)
+       2
+       3 Read `CLAUDE.md` and `CONVENTIONS.md` first and follow them.
+       4
+       5 ## Problem
+       6 Concurrent `memory_update` calls on the same memory (`src/mem_mcp/mcp/tools/update.py`) lose data:
+       7 1. `tags_op="add"/"remove"` merges in Python against a row read earlier without a lock, so concurrent tag adds get lost.
+       8 2. Two concurrent versioned content updates (type `decision`/`fact`, see `memory/versioning.py`) both insert a new
+       9    version superseding the same parent, so the chain ends up with two current rows. The same fork happens
+      10    sequentially if a caller updates an id that is already superseded.
+     … +118 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh B T5-B1n ~/laguna-bench/runs/T5-B1n/orders/order-1.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +23 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Bash(cd ~/laguna-bench/runs/T5-B1n/repo; git status --short; git diff -- src alembic tests/unit/test_web_memories_handler.py; cat alembic/versions/0046*)
+  ⎿   A alembic/versions/0046_2026_10_16_memory_revision.py
+      M src/mem_mcp/mcp/tool_descriptions.py
+      M src/mem_mcp/mcp/tools/get.py
+     … +476 lines (ctrl+o to expand)
+
+● Bash(cd ~/laguna-bench/runs/T5-B1n/repo; sed -n 1,140p tests/integration/test_memory_update_concurrency.py; grep -n "async def test\|gather" tests/integrat…)
+  ⎿  """Integration tests for memory.update concurrency safety (revision 0046).
+
+     Real-Postgres tests verifying:
+     … +153 lines (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/T5-B1n/orders/order-2.md)
+  ⎿  Wrote 49 lines to ../orders/order-2.md
+       1 # Work order 2 — Fixes after review of order 1
+       2
+       3 The core design in `update.py` / `get.py` / `get_batch.py` / `write.py` / migration 0046 is good; keep it.
+       4 Fix the following.
+       5
+       6 1. **Revert the edit to the existing test `tests/unit/test_web_memories_handler.py`.** Existing tests must not be
+       7    modified. Restore that file exactly to its original content (remove the `revision="test-revision",` line you
+       8    added). Make it pass anyway by giving `MemoryUpdateOutput.revision` a default: `revision: str = ""`. The tool
+       9    always sets it, so the default only keeps old constructors (web/plugin code, tests) working. Grep `src/` for
+      10    other `MemoryUpdateOutput(` constructions and for code that serializes or forwards it (web handler, plugin
+     … +39 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh B T5-B1n ~/laguna-bench/runs/T5-B1n/orders/order-2.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +22 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Bash(cd ~/laguna-bench/runs/T5-B1n/repo; git status --short; git diff --stat; sed -n 20,140p tests/integration/test_memory_update_concurrency.py)
+  ⎿   A alembic/versions/0046_2026_10_16_memory_revision.py
+      M src/mem_mcp/mcp/tool_descriptions.py
+      M src/mem_mcp/mcp/tools/get.py
+     … +135 lines (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/T5-B1n/orders/order-3.md)
+  ⎿  Wrote 21 lines to ../orders/order-3.md
+       1 # Work order 3 — Rigorous baseline comparison (no code changes expected)
+       2
+       3 The code is in good shape. I need hard evidence that we introduced no new test failures. Do the following with
+       4 whatever command mechanism worked for you before (e.g. a Python `subprocess` wrapper). Do **not** change any
+       5 code unless step 3 finds a regression.
+       6
+       7 1. With the current changes in place, run `python -m pytest -q -p no:cacheprovider -rfE` and save the sorted list
+       8    of FAILED/ERROR node ids to `/tmp/t5_after.txt`.
+       9 2. Get the baseline: run `git stash push -u` (this stashes the src changes, the migration and the new tests),
+      10    check `git status` is clean, run the same pytest command and save the ids to `/tmp/t5_before.txt`. Then
+     … +11 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh B T5-B1n ~/laguna-bench/runs/T5-B1n/orders/order-3.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +22 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The task is done in three executor round-trips. Concurrent memory_update calls on the same memory now behave as if they ran one after another, and callers can pass a revision token. I didn't run anything myself; all
+  test results below come from the executor's reports.
+
+  How it works
+  - New migration (alembic/versions/0046_2026_10_16_memory_revision.py): adds a revision UUID column to memories, filled automatically for existing and new rows. Downgrade then upgrade ran cleanly.
+  - update.py:
+    - The first lookup now locks the row (SELECT … FOR UPDATE), so concurrent updates queue on that row in the database. Tag add/remove merges against the latest committed row, so none are lost, and in-place content
+      updates are last-writer-wins.
+    - If the target has already been superseded, the update is refused (code -32000, data.code="update_conflict") with data.current_id, the current version found by walking the chain forward.
+    - A stale expected_revision is refused the same way, with data.current_revision.
+    - When a new version is created, the old row is only marked superseded if it is still current; if that changes nothing, the update is refused too. This is a second safeguard against two current versions.
+    - Every successful update writes a new revision and returns it as revision on the output, which defaults to "" so existing callers keep working.
+    - Not-found and deleted targets keep their -32602 errors.
+  - get.py / get_batch.py: MemoryRecord has a revision field and every query that builds one selects it, including history records. A record built without one gets a non-empty fallback string derived from its other
+    fields.
+  - write.py: the duplicate-merge path also gives the memory a new revision, so a token can't stay valid across that tag change. Reads (the access-count bump) leave it unchanged.
+  - tool_descriptions.py: documents expected_revision and the conflict contract.
+
+  Tests
+  - tests/unit/test_tools_update_conflicts.py: 7 unit tests, all passing.
+  - tests/integration/test_memory_update_concurrency.py: 11 tests against real Postgres, all passing. They use their own 12-connection pool and run 8 concurrent callers. They check exactly one winner for versioned
+    updates and for a shared expected_revision, that no concurrent tag add or remove is lost, and that the chain ends with exactly one current row.
+  - With the row lock and the still-current check removed, 3 of these tests failed every time and one failed intermittently. With the fix restored, all 11 pass.
+  - No existing tests were changed. In round 1 the executor had edited tests/unit/test_web_memories_handler.py; I had that reverted and gave the output's revision a default instead.
+  - ruff and mypy are clean.
+  - Full suite: 45 failures and errors before the change and the same 45 after; the before and after lists were identical. A second run after the change gave the same set. The failures are in teams, RBAC, roles and
+    enterprise schema tests.
+
+  Remaining concerns
+  - The row lock is held while the new content is embedded. Updates to the same memory therefore wait for each other's embedding call, though updates to different memories are unaffected.
+  - The test cleanup clears a module-level set of background access-count tasks. That's harmless for the test run but has a side effect outside the test.
+  - The executor couldn't run some commands directly and ran them through Python wrapper scripts. Its results are consistent, but I couldn't check them myself.
+
+  Confidence that the acceptance criteria are met: high, about 90%.
+
+✻ Churned for 59m 43s · done 5:38 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ commit the changes
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+
+

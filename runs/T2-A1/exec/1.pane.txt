@@ -1,0 +1,260 @@
+      269 +    application layer via memory_readable_by (the per-citer access check
+      270 +    below: owner OR user_effective_team_access). The tenant-scope linter's
+      271 +    intent is satisfied because we never EXPOSE cross-tenant data — only its
+      272 +    count.
+      273      """
+      274      rows = await conn.fetch(
+      275          """
+
+● Update(src/mem_mcp/teams/references.py)
+  ⎿  Added 7 lines, removed 4 lines
+      64        (a) target_uuid given → SELECT FROM memories.
+      65        (b) (target_team_id, target_resource_type, target_slug) given → SELECT FROM slugs.
+      66
+      67 -    Access check: caller MUST have an active user_effective_team_access row
+      68 -    for the target's team. Failure (target absent OR access denied) raises
+      69 -    the SAME ReferenceTargetNotFoundError — caller cannot distinguish.
+      67 +    Access check: the caller MUST be able to read the target per the canonical
+      68 +    ``memory_readable_by`` rule (caller owns it OR has a
+      69 +    user_effective_team_access row for its team). Failure (target absent OR
+      70 +    access denied) raises the SAME ReferenceTargetNotFoundError — caller
+      71 +    cannot distinguish. The slug-tuple path resolves the row first and then
+      72 +    applies the same per-memory rule.
+      73
+      74      NOTE on tenant scoping: this helper queries `memories` ACROSS tenants
+      75      because a reference can legitimately point at a memory owned by a
+      76      DIFFERENT tenant in a shared/cross-team context. The opaque visibility
+      74 -    contract is enforced via user_effective_team_access (below), not via a
+      77 +    contract is enforced via memory_readable_by (below), not via a
+      78      same-tenant filter.
+      79
+      80      Raises:
+
+● Update(src/mem_mcp/teams/references.py)
+  ⎿  Added 1 line
+      20
+      21  from __future__ import annotations
+      22
+      23 +from collections.abc import Sequence
+      24  from typing import Any, Literal
+      25  from uuid import UUID
+      26
+
+● Update(src/mem_mcp/teams/references.py)
+  ⎿  Added 10 lines, removed 2 lines
+      14  prevent timing/probe attacks.
+      15
+      16  Hard-delete protection: BEFORE-DELETE check; if any inbound refs exist,
+      17 -returns the structured citer list FILTERED to the caller's accessible
+      18 -teams. Inaccessible citers contribute to an aggregate count only.
+      17 +returns the structured citer list FILTERED to the memories the caller can
+      18 +read. Inaccessible citers contribute to an aggregate count only.
+      19 +
+      20 +Access rule (all sites, via ``accessible_memory_ids`` → DB function
+      21 +``memory_readable_by``, migration 0035): the caller can read memory X iff X
+      22 +exists, is not deleted, and the caller owns it OR has a
+      23 +user_effective_team_access row for X's team. Ownership is consulted first
+      24 +because UEA is a materialised cache that lags raw-SQL provisioning (the 0026
+      25 +backfill), which previously made users' own memories "inaccessible" here
+      26 +while memory_get could read them.
+      27  """
+      28
+      29  from __future__ import annotations
+
+● Now the two tools.
+
+● Update(src/mem_mcp/mcp/tools/refs_in.py)
+  ⎿  Added 17 lines, removed 30 lines
+      44          assert isinstance(inp, RefsInInput)
+      45          async with system_tx(ctx.db_pool) as conn:
+      46              raw = await get_inbound_refs(conn, target_memory_id=inp.memory_id)
+      47 +            visible, inaccessible_count = await filter_refs_by_access(
+      48 +                conn,
+      49 +                refs=raw,
+      50 +                memory_id_key="source_memory_id",
+      51 +                caller_user_id=ctx.tenant_id,
+      52 +            )
+      53
+      48 -            # Filter by caller access to each source's team
+      49 -            accessible: list[InboundRef] = []
+      50 -            inaccessible_count = 0
+      51 -            for r in raw:
+      52 -                # Look up source's team
+      53 -                src_team = await conn.fetchval(
+      54 -                    "SELECT team_id FROM memories WHERE id = $1", r["source_memory_id"]
+      55 -                )
+      56 -                if src_team is None:
+      57 -                    inaccessible_count += 1
+      58 -                    continue
+      59 -                access = await conn.fetchval(
+      60 -                    "SELECT 1 FROM user_effective_team_access "
+      61 -                    "WHERE user_id = $1 AND resource_team_id = $2",
+      62 -                    ctx.tenant_id,
+      63 -                    src_team,
+      64 -                )
+      65 -                if access is None:
+      66 -                    inaccessible_count += 1
+      67 -                    continue
+      68 -                accessible.append(
+      69 -                    InboundRef(
+      70 -                        source_memory_id=str(r["source_memory_id"]),
+      71 -                        target_memory_id=str(r["target_memory_id"]),
+      72 -                        target_team_id=str(r["target_team_id"]),
+      73 -                        target_fragment=r["target_fragment"],
+      74 -                        reference_kind=r["reference_kind"],
+      75 -                        refs_version=r["refs_version"],
+      76 -                    )
+      77 -                )
+      54 +        accessible = [
+      55 +            InboundRef(
+      56 +                source_memory_id=str(r["source_memory_id"]),
+      57 +                target_memory_id=str(r["target_memory_id"]),
+      58 +                target_team_id=str(r["target_team_id"]),
+      59 +                target_fragment=r["target_fragment"],
+      60 +                reference_kind=r["reference_kind"],
+      61 +                refs_version=r["refs_version"],
+      62 +            )
+      63 +            for r in visible
+      64 +        ]
+      65
+      66          return RefsInOutput(
+      67              accessible_count=len(accessible),
+
+● Update(src/mem_mcp/mcp/tools/refs_in.py)
+  ⎿  Added 1 line, removed 1 line
+      10  from mem_mcp.db import system_tx
+      11  from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+      12  from mem_mcp.mcp.tools._base import BaseTool, ToolContext
+      13 -from mem_mcp.teams.references import get_inbound_refs
+      13 +from mem_mcp.teams.references import filter_refs_by_access, get_inbound_refs
+      14
+      15
+      16  class RefsInInput(BaseModel):
+
+● Update(src/mem_mcp/mcp/tools/refs_out.py)
+  ⎿  Added 17 lines, removed 22 lines
+      44          assert isinstance(inp, RefsOutInput)
+      45          async with system_tx(ctx.db_pool) as conn:
+      46              raw = await get_outbound_refs(conn, source_memory_id=inp.memory_id)
+      47 +            visible, inaccessible_count = await filter_refs_by_access(
+      48 +                conn,
+      49 +                refs=raw,
+      50 +                memory_id_key="target_memory_id",
+      51 +                caller_user_id=ctx.tenant_id,
+      52 +            )
+      53
+      48 -            accessible: list[OutboundRef] = []
+      49 -            inaccessible_count = 0
+      50 -            for r in raw:
+      51 -                access = await conn.fetchval(
+      52 -                    "SELECT 1 FROM user_effective_team_access "
+      53 -                    "WHERE user_id = $1 AND resource_team_id = $2",
+      54 -                    ctx.tenant_id,
+      55 -                    r["target_team_id"],
+      56 -                )
+      57 -                if access is None:
+      58 -                    inaccessible_count += 1
+      59 -                    continue
+      60 -                accessible.append(
+      61 -                    OutboundRef(
+      62 -                        source_memory_id=str(r["source_memory_id"]),
+      63 -                        target_memory_id=str(r["target_memory_id"]),
+      64 -                        target_team_id=str(r["target_team_id"]),
+      65 -                        target_fragment=r["target_fragment"],
+      66 -                        reference_kind=r["reference_kind"],
+      67 -                        refs_version=r["refs_version"],
+      68 -                    )
+      69 -                )
+      54 +        accessible = [
+      55 +            OutboundRef(
+      56 +                source_memory_id=str(r["source_memory_id"]),
+      57 +                target_memory_id=str(r["target_memory_id"]),
+      58 +                target_team_id=str(r["target_team_id"]),
+      59 +                target_fragment=r["target_fragment"],
+      60 +                reference_kind=r["reference_kind"],
+      61 +                refs_version=r["refs_version"],
+      62 +            )
+      63 +            for r in visible
+      64 +        ]
+      65
+      66          return RefsOutOutput(
+      67              accessible_count=len(accessible),
+
+● Update(src/mem_mcp/mcp/tools/refs_out.py)
+  ⎿  Added 1 line, removed 1 line
+      10  from mem_mcp.db import system_tx
+      11  from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+      12  from mem_mcp.mcp.tools._base import BaseTool, ToolContext
+      13 -from mem_mcp.teams.references import get_outbound_refs
+      13 +from mem_mcp.teams.references import filter_refs_by_access, get_outbound_refs
+      14
+      15
+      16  class RefsOutInput(BaseModel):
+
+● Now I need the ToolContext fixture pattern for the tests.
+
+  Searched for 4 patterns, read 1 file (ctrl+o to expand)
+
+● Write(tests/integration/test_references_memory_readable_by.py)
+  ⎿  Wrote 428 lines to tests/integration/test_references_memory_readable_by.py
+      1 """Regression: referencing one's OWN memory failed with `memory_not_accessible`.
+      2
+      3 Bug: the references machinery (resolve_reference_target,
+      4 check_hard_delete_with_filtered_citers, refs_in, refs_out) decided per-memory
+      5 visibility solely by a `user_effective_team_access` (UEA) row for the memory's
+      6 team. UEA is a materialised cache that raw-SQL provisioning (the 0026 backfill)
+      7 never fills, so a user's own memory looked inaccessible while `memory_get` read
+      8 it fine. Fix: one canonical predicate, DB function `memory_readable_by()`
+      9 (migration 0035), reached through `teams.references.accessible_memory_ids`.
+     … +418 lines (ctrl+o to expand)
+
+● The fix and regression tests are written, but I couldn't run anything: Bash was denied partway through the session ("don't ask mode"). None of the verification steps in the acceptance list have been done.
+
+  Changes
+
+  - alembic/versions/0035_2026_06_01_memory_readable_by.py (new, revision 0035_memory_readable_by, down_revision 0034_safe_current_tenant_id):
+    - Adds memory_readable_by(p_memory_id uuid, p_user_id uuid DEFAULT NULL) → boolean, written as LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public.
+    - The predicate is: memory exists, not deleted, and (owner OR a UEA row for its team).
+    - A NULL user falls back to safe_current_tenant_id(), and a NULL result gives false.
+    - Granted to PUBLIC, matching 0034's safe_current_tenant_id(). I used PUBLIC rather than mem_app because that is the established pattern in 0034.
+    - downgrade() drops the function.
+  - src/mem_mcp/teams/references.py:
+    - New helpers accessible_memory_ids (batch, one query), memory_accessible_to, and filter_refs_by_access.
+    - resolve_reference_target now gates through the helper for both the UUID and slug-tuple paths, with the same error message. The team_id IS NULL bypass is removed.
+    - check_hard_delete_with_filtered_citers classifies citers with the helper.
+    - Module and function docstrings updated to describe the new rule and why.
+  - src/mem_mcp/mcp/tools/refs_in.py and refs_out.py: the per-row UEA SQL is gone and both call filter_refs_by_access (keyed on source_memory_id and target_memory_id respectively). Output shape is unchanged.
+  - tests/integration/test_references_memory_readable_by.py (new): 11 tests covering:
+    - resolve_reference_target (UUID, slug tuple, NULL team, foreign opaque, foreign with UEA)
+    - hard-delete citers (own plus foreign, own only)
+    - RefsInTool and RefsOutTool
+    - the SQL function directly (owner, foreign, deleted, missing, NULL user, GUC fallback)
+    - two SDK end-to-end tests (own memory by slug tuple, and no-access envelope equals nonexistent-UUID envelope)
+
+  The existing references.py entry in the tenant-scope linter's exempt list already covers the new SQL there. The tools no longer contain memory SQL, so no lint change should be needed.
+
+  Not verified (needs running)
+
+  I haven't run any of these, so they are unconfirmed:
+  - alembic upgrade head, then alembic downgrade -1 && alembic upgrade head
+  - pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py
+  - pytest -q -p no:cacheprovider tests/integration/test_references_memory_readable_by.py
+  - pytest -q -p no:cacheprovider tests against the baseline via git stash (pass/fail counts and failing ids)
+  - ruff check src tests, mypy, tests/unit/test_lint_tenant_scope.py
+
+  Things most likely to need a tweak on first run:
+  - Test-file typing: the # type: ignore[attr-defined] comments in the test file may be flagged by mypy as unused.
+  - ruff format: a few of the lines I wrote may need reformatting.
+  - Memory inserts: my raw INSERT INTO memories relies on defaults for visibility and source_client_id, copied from test_slugs_integration.py.
+  - Slug resource type: I used resource_type="decision" for slugs, as that file does.
+  - SDK error attributes: I read .code on the SDK error as the repro's comment implies, but haven't confirmed the attribute name.
+
+  To finish verification, either allow Bash for this session or run the commands above with the ! prefix.
+
+✻ Worked for 1m 49s · done 6:26 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ run the tests and migration
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

@@ -1,0 +1,260 @@
+      81 +    revision: str
+      82      tags: list[str] | None
+      83      request_id: str
+      84
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 3 lines, removed 10 lines
+       98              raise JsonRpcError(-32603, "tool deps not wired")
+       99
+      100          async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
+      101 -            # Initial lookup
+      102 -            target = await conn.fetchrow(
+      103 -                """
+      104 -                SELECT id, type, content, version, tags, metadata, deleted_at
+      105 -                FROM memories
+      106 -                WHERE id = $1 AND tenant_id = $2
+      107 -                """,
+      108 -                inp.id,
+      109 -                ctx.tenant_id,
+      110 -            )
+      101 +            # Lock + lookup. The row lock serializes concurrent updates of this row;
+      102 +            # under READ COMMITTED the waiter re-reads the latest committed row.
+      103 +            target = await lock_memory_for_update(conn, inp.id, ctx.tenant_id)
+      104              if target is None:
+      105                  raise JsonRpcError(
+      106                      -32602,
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 9 lines
+      113                      "cannot update deleted memory",
+      114                      data={"errors": [{"path": "id", "message": "memory is deleted"}]},
+      115                  )
+      116 +            try:
+      117 +                await self._check_conflicts(conn, ctx, inp, target)
+      118 +            except UpdateConflictError as e:
+      119 +                conflict: dict[str, Any] = {"code": "update_conflict"}
+      120 +                if e.current_revision is not None:
+      121 +                    conflict["current_revision"] = e.current_revision
+      122 +                if e.current_id is not None:
+      123 +                    conflict["current_id"] = str(e.current_id)
+      124 +                raise JsonRpcError(-32000, str(e), data=conflict) from e
+      125
+      126              # Decide path
+      127              content_changed = inp.content is not None and inp.content != target["content"]
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 1 line, removed 1 line
+      175                          type, tags, metadata,
+      176                          version, supersedes, is_current
+      177                      ) VALUES ($1, $2, $3, $4::vector, $5, 'api', $6, $7, $8::jsonb, $9, $10, true)
+      178 -                    RETURNING id, version
+      178 +                    RETURNING id, version, updated_at
+      179                      """,
+      180                      ctx.tenant_id,
+      181                      new_content,
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 1 line, removed 1 line
+      194                      """
+      195                      UPDATE memories
+      196                      SET is_current = false, superseded_by = $1
+      197 -                    WHERE id = $2 AND tenant_id = $3
+      197 +                    WHERE id = $2 AND tenant_id = $3 AND is_current = true
+      198                      """,
+      199                      new_row["id"],
+      200                      target["id"],
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 2 lines
+      222                  # Quota
+      223                  await ctx.deps.quotas.increment_write(ctx.tenant_id, new_embed_tokens)
+      224
+      225 +                new_updated_at = new_row.get("updated_at") or datetime.now(UTC)
+      226                  return MemoryUpdateOutput(
+      227                      id=new_row["id"],
+      228                      version=int(new_row["version"]),
+      229                      is_new_version=True,
+      230 +                    revision=memory_revision(new_row["id"], new_updated_at),
+      231                      tags=final_tags,
+      232                      request_id=ctx.request_id,
+      233                  )
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 3 lines, removed 2 lines
+      268                      content_hash = hash_content(inp.content)
+      269
+      270                      # UPDATE with content change
+      271 -                    await conn.fetchval(
+      271 +                    updated_at = await conn.fetchval(
+      272                          """
+      273                          UPDATE memories
+      274                          SET content = $1, content_hash = $2, embedding = $3::vector,
+      275 -                            type = $4, tags = $5, metadata = $6::jsonb, updated_at = now()
+      275 +                            type = $4, tags = $5, metadata = $6::jsonb,
+      276 +                            updated_at = GREATEST(now(), updated_at + interval '1 microsecond')
+      277                          WHERE id = $7 AND tenant_id = $8
+      278                          RETURNING updated_at
+      279                          """,
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 3 lines, removed 2 lines
+      288                      )
+      289                  else:
+      290                      # UPDATE without content change (no embedding)
+      291 -                    await conn.fetchval(
+      291 +                    updated_at = await conn.fetchval(
+      292                          """
+      293                          UPDATE memories
+      294 -                        SET type = $1, tags = $2, metadata = $3::jsonb, updated_at = now()
+      294 +                        SET type = $1, tags = $2, metadata = $3::jsonb,
+      295 +                            updated_at = GREATEST(now(), updated_at + interval '1 microsecond')
+      296                          WHERE id = $4 AND tenant_id = $5
+      297                          RETURNING updated_at
+      298                          """,
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 1 line
+      329                      id=target["id"],
+      330                      version=int(target.get("version") or 1),
+      331                      is_new_version=False,
+      332 +                    revision=memory_revision(target["id"], updated_at),
+      333                      tags=final_tags,
+      334                      request_id=ctx.request_id,
+      335                  )
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 21 lines
+      334                      request_id=ctx.request_id,
+      335                  )
+      336
+      337 +    async def _check_conflicts(
+      338 +        self,
+      339 +        conn: Any,
+      340 +        ctx: ToolContext,
+      341 +        inp: MemoryUpdateInput,
+      342 +        target: Any,
+      343 +    ) -> None:
+      344 +        """Refuse superseded targets and stale ``expected_revision`` tokens."""
+      345 +        if not target.get("is_current", True):
+      346 +            current_id = await resolve_current_id(conn, target["id"], ctx.tenant_id)
+      347 +            raise UpdateConflictError("memory has been superseded", current_id=current_id)
+      348 +        updated_at = target.get("updated_at")
+      349 +        if inp.expected_revision is not None and updated_at is not None:
+      350 +            current = memory_revision(target["id"], updated_at)
+      351 +            if inp.expected_revision != current:
+      352 +                raise UpdateConflictError(
+      353 +                    "memory was modified since expected_revision",
+      354 +                    current_revision=current,
+      355 +                    current_id=target["id"],
+      356 +                )
+      357 +
+      358      def _compute_tags(
+      359          self,
+      360          existing_tags: list[str],
+
+● Update(src/mem_mcp/mcp/tool_descriptions.py)
+  ⎿  Added 3 lines, removed 1 line
+      109
+      110  Do not call for decision or fact types when the update represents a changed conclusion — use memory_supersede instead (it preserves history). Do not call without a known memory ID — search first. Do not
+            call when the user wants to delete and rewrite from scratch — delete then write.
+      111
+      112 -Examples: "Fix that note to say the deadline is April 15, not March 15." → update content. "Add tag 'urgent' to that memory." → update tags. "That snippet has a bug — here's the corrected version." → up
+          -date content.""",
+      112 +Examples: "Fix that note to say the deadline is April 15, not March 15." → update content. "Add tag 'urgent' to that memory." → update tags. "That snippet has a bug — here's the corrected version." → up
+          +date content.
+      113 +
+      114 +Concurrency: concurrent updates of one memory are serialized, so tag adds/removes are never lost. Pass expected_revision (take memory.revision from memory_get) to apply only if the memory is unchanged s
+          +ince you read it; omit it for last-writer-wins. The output carries the new revision. Conflicts are -32000 with data.code="update_conflict": data.current_revision is set when expected_revision is stale (
+          +re-read, merge, retry); data.current_id is set when the target was superseded (update that current version instead — updating a superseded id is refused).""",
+      115      "memory_delete": """Soft-delete a memory — call this when the user explicitly wants to remove a memory from their active store. Deleted memories are not returned in search or list by default but can
+            be restored.
+      116
+      117  Call when: user says "delete that", "remove that memory", "I don't need that anymore", "forget that", "that's outdated, get rid of it"; user explicitly instructs removal after you display a memory.
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 4 lines, removed 1 line
+      329                      id=target["id"],
+      330                      version=int(target.get("version") or 1),
+      331                      is_new_version=False,
+      332 -                    revision=memory_revision(target["id"], updated_at),
+      332 +                    revision=memory_revision(
+      333 +                        target["id"],
+      334 +                        updated_at if isinstance(updated_at, datetime) else datetime.now(UTC),
+      335 +                    ),
+      336                      tags=final_tags,
+      337                      request_id=ctx.request_id,
+      338                  )
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 3 lines, removed 1 line
+      222                  # Quota
+      223                  await ctx.deps.quotas.increment_write(ctx.tenant_id, new_embed_tokens)
+      224
+      225 -                new_updated_at = new_row.get("updated_at") or datetime.now(UTC)
+      225 +                new_updated_at = new_row.get("updated_at")
+      226 +                if not isinstance(new_updated_at, datetime):
+      227 +                    new_updated_at = datetime.now(UTC)  # mocks only; real DB returns it
+      228                  return MemoryUpdateOutput(
+      229                      id=new_row["id"],
+      230                      version=int(new_row["version"]),
+
+● Write(tests/integration/test_update_concurrency.py)
+  ⎿  Wrote 301 lines to tests/integration/test_update_concurrency.py
+       1 # mypy: disable-error-code="attr-defined"
+       2 """Concurrency / optimistic-locking tests for memory_update (work order 1).
+       3
+       4 Regressions covered: lost tag updates under concurrent add/remove, forked
+       5 decision version chains (concurrent and sequential), and the opt-in
+       6 `expected_revision` compare-and-set. Uses its own pool (max_size >= 12) so each
+       7 concurrent call really holds its own connection.
+       8 """
+       9
+      10 from __future__ import annotations
+     … +291 lines (ctrl+o to expand)
+
+● The implementation and new tests are written, but nothing has been run: Bash was denied in this session's "don't ask" mode, so I couldn't execute pytest, ruff, mypy or the baseline git stash comparison.
+
+  What changed
+
+  - src/mem_mcp/memory/versioning.py
+    - New memory_revision(id, updated_at), UpdateConflictError, lock_memory_for_update (the FOR UPDATE lookup) and resolve_current_id (recursive CTE, tenant-filtered, and non-deleted is_current preferred).
+  - src/mem_mcp/mcp/tools/get.py
+    - MemoryRecord.revision plus an after-validator that fills it from (id, updated_at).
+    - model_dump(mode="json") is the tool output path, so the field serializes.
+  - src/mem_mcp/mcp/tools/update.py
+    - Models: expected_revision input and revision output.
+    - Conflict checks: after the not-found/deleted checks, a superseded target gives -32000 update_conflict with current_id, and a stale expected_revision gives -32000 with current_revision and current_id.
+      UpdateConflictError is mapped with raise ... from e.
+    - Writes: the supersede UPDATE is conditional on is_current = true. The INSERT returns updated_at. Both in-place UPDATEs use GREATEST(now(), updated_at + interval '1 microsecond').
+  - src/mem_mcp/mcp/tool_descriptions.py
+    - Documented expected_revision, the output revision, and the conflict contract.
+  - tests/integration/test_update_concurrency.py (new)
+    - Covers your tests 1–7. It uses its own pool with max_size=14 and drains the access-bump tasks before closing.
+
+  Not done or checked
+
+  - Verification commands:
+    - pytest tests/unit/test_tools_update.py plus the new tests
+    - pytest tests/unit tests/integration against a baseline
+    - ruff check src tests and mypy
+    - The "tests 1, 2 and 5 fail on the original code" check.
+  - Mock compatibility:
+    - I used .get() for is_current and updated_at.
+    - The mock tests have fetchval and INSERT results without a datetime, so I fall back to datetime.now(UTC) when it isn't one.
+    - I haven't confirmed the existing unit tests pass.
+  - Unchecked callers:
+    - I did not edit the plugin SDK MemoryClient.update or web/handlers/memories.py.
+    - From reading, the SDK wraps -32000 as PluginValidationError(code="update_conflict"), and the web handler routes via _jsonrpc_to_http. I haven't checked how _jsonrpc_to_http maps -32000.
+  - bump_access: the SQL I read only sets last_accessed_at and access_count, so a read doesn't change updated_at. I didn't check whether a DB trigger touches updated_at.
+  - Sandbox tests: the new tests are unrun and may need small fixture fixes, such as the MemoryWriteInput type annotations or the cleanup table list.
+
+  If you allow Bash (or run ! pytest -q -p no:cacheprovider tests/unit/test_tools_update.py tests/integration/test_update_concurrency.py yourself), I can finish the verification and the stash comparison.
+
+✻ Cogitated for 1m 41s · done 6:17 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

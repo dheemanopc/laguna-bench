@@ -1,0 +1,260 @@
+
+  Not-found / deleted targets keep their existing -32602 errors.
+
+  Document the new parameter and the conflict contract in the `memory_update`
+  tool description (`mcp/tool_descriptions.py`).
+
+  ## Constraints
+
+  - Correctness must come from the database (row locking / conditional writes /
+    constraints), not from in-process locks — the server runs several workers.
+  - Keep the existing layering (`tenant_tx`, `JsonRpcError`). If you need a schema
+    change, add a new Alembic migration (`alembic/versions/`, next revision after
+    the current head); the scoring harness runs `alembic upgrade head` on a fresh
+    database before tests. A solution without a migration is fine.
+  - Backward compatible: existing callers that never send `expected_revision`
+    keep working; existing unit tests for `memory_update` (mock-based, in
+    `tests/unit/test_tools_update.py`) and the web/plugin callers must keep
+    passing. Do not change the plugin SDK's `MemoryClient.update` signature.
+  - Do not modify existing tests. Add your own, including **real concurrency
+    tests against Postgres** (e.g. `asyncio.gather` of several updates, each on its
+    own pooled connection — create a pool larger than the default `pg_pool`
+    fixture's 4 connections) that fail without your fix.
+  - The rest of the suite must not get new failures (some tests are red before
+    you start — pre-existing; leave them).
+
+  ## Running tests
+
+  `MEM_MCP_TEST_DSN` (and `MEM_MCP_DB_MAINT_DSN` for alembic) point at a fresh
+  migrated Postgres. Run e.g. `pytest -q -p no:cacheprovider tests/unit tests/integration`.
+  To create memories in DB-backed tests, set up a tenant + team + primary identity
+  with `default_team_id` (see `tests/integration/test_mindmap_e2e.py`) and use
+  `MemoryWriteTool` with a stub embedder. Note `memory_get` fires a background
+  access-count update; let it drain before closing a pool you created.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_018a6omAooKZPVQkDBDVtSX3
+
+● I'll start by reading the relevant code.
+
+  Searched for 4 patterns, read 4 files (ctrl+o to expand)
+
+● Bash(sed -n 1,140p tests/unit/test_tools_update.py; grep -n "fetchrow\|fetchval\|execute\|side_effect\|return_value" tests/unit/test_tools_update.py | head -60; ls t…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Read 1 file (ctrl+o to expand)
+
+● Reviewing the existing mock-based unit tests so the plan stays compatible with them.
+
+  Read 1 file (ctrl+o to expand)
+
+● Checking how delete interacts with is_current before finalizing the plan.
+
+  Read 1 file (ctrl+o to expand)
+
+● I've settled on a no-migration design: revision derives from (id, updated_at) with strictly increasing timestamps, and correctness relies on SELECT … FOR UPDATE plus is_current checks. Writing the work order now.
+
+● Write(~/laguna-bench/runs/T5-X1/orders/order-1.md)
+  ⎿  Wrote 74 lines to ../orders/order-1.md
+      1 # Work order 1 — No lost updates in `memory_update` (revision tokens + DB-serialized updates)
+      2
+      3 ## Goal
+      4 Several agents edit the same memory concurrently via `memory_update` and we lose data:
+      5 1. Concurrent `tags_op="add"/"remove"` calls lose each other's tags (Python merge against a stale read).
+      6 2. Concurrent content updates to a versioned type (`decision`/`fact`) fork the chain (two `is_current` rows superseding the same parent). Same fork happens sequentially if a caller updates an id that is al
+        ready superseded.
+      7 3. No optimistic concurrency: callers can't say "only apply if unchanged since I read it".
+      8
+      9 Correctness MUST come from the database (row locks / conditional writes), not in-process locks (multiple workers). **No Alembic migration** — use the design below.
+     … +85 lines (ctrl+o to expand)
+
+● Work order written; dispatching it to the executor (this may take a while).
+
+● Bash(~/laguna-bench/bin/run_executor.sh X T5-X1 ~/laguna-bench/runs/T5-X1/orders/order-1.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +21 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor finished, but its report is thin: no before/after full-suite comparison and no proof that the tests fail without the fix. Reviewing the diff.
+
+● Bash(git -C ~/laguna-bench/runs/T5-X1/repo status; git -C ~/laguna-bench/runs/T5-X1/repo diff)
+  ⎿  On branch master
+     Changes not staged for commit:
+       (use "git add <file>..." to update what will be committed)
+     … +716 lines (ctrl+o to expand)
+
+● Bash(git -C ~/laguna-bench/runs/T5-X1/repo diff -- src/)
+  ⎿  diff --git a/src/mem_mcp/mcp/tool_descriptions.py b/src/mem_mcp/mcp/tool_descriptions.py
+     index 7c495ce..04c33d8 100644
+     --- a/src/mem_mcp/mcp/tool_descriptions.py
+     … +369 lines (ctrl+o to expand)
+
+● The source diff looks mostly right. A few things to verify: tenant_tx isolation, the error conventions, and the tests.
+
+  Searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● Implementation is sound. The tests need tightening, and the verification evidence is missing. Sending order 2.
+
+● Write(~/laguna-bench/runs/T5-X1/orders/order-2.md)
+  ⎿  Wrote 23 lines to ../orders/order-2.md
+       1 # Work order 2 — Tighten tests + provide verification evidence
+       3 The implementation in `update.py` / `get.py` / `versioning.py` looks right. Please make the following changes. Do not change the design.
+       4
+       6 1. In the in-place content branch you moved `content_hash = hash_content(inp.content)` inside the `else:` of the embed block, where it is now a dead assignment (the UPDATE calls `hash_content(...)` inline
+         ). Remove the dead assignment / restore one clean `content_hash = hash_content(inp.content)` before the UPDATE and pass `content_hash`. Keep behaviour identical.
+         ne round-trip. Keep it walking forward via `superseded_by` (that's fine).
+       8
+      10 3. **Use a dedicated larger pool for the concurrent calls.** The `pg_pool` fixture has only 4 connections, so 10 "concurrent" calls are mostly queued on the client side. Add a fixture (module-level, async
+         ) that creates `asyncpg.create_pool(<same DSN/init as the pg_pool fixture uses — look at tests/conftest.py / tests/integration/conftest.py for how it's built, including any `init=` codec setup>, min_size=
+         bump drain (e.g. `await asyncio.sleep(0.2)` and/or await any pending tasks from `mem_mcp.memory.access_tracking` if it keeps a task set), then `await pool.close()`.
+     … +25 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh X T5-X1 ~/laguna-bench/runs/T5-X1/orders/order-2.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +22 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor modified an existing test, tests/unit/test_web_memories_handler.py, which the rules forbid. Checking why.
+
+● Bash(git -C ~/laguna-bench/runs/T5-X1/repo diff -- tests/unit/test_web_memories_handler.py src/mem_mcp/mcp/tools/update.py | head -150)
+  ⎿  diff --git a/src/mem_mcp/mcp/tools/update.py b/src/mem_mcp/mcp/tools/update.py
+     index c38fc1c..956bdfe 100644
+     --- a/src/mem_mcp/mcp/tools/update.py
+     … +147 lines (ctrl+o to expand)
+
+● Bash(git -C ~/laguna-bench/runs/T5-X1/repo diff -- tests/unit/test_web_memories_handler.py; git -C ~/laguna-bench/runs/T5-X1/repo diff -- src/mem…)
+  ⎿  diff --git a/tests/unit/test_web_memories_handler.py b/tests/unit/test_web_memories_handler.py
+     index 2fc40fc..0f9c4e2 100644
+     --- a/tests/unit/test_web_memories_handler.py
+     … +134 lines (ctrl+o to expand)
+
+● Order 3: revert the edit to the existing test, give revision a default so old callers that build MemoryUpdateOutput still work, and insist on the missing evidence.
+
+● Write(~/laguna-bench/runs/T5-X1/orders/order-3.md)
+  ⎿  Wrote 18 lines to ../orders/order-3.md
+      1 # Work order 3 — Revert edit to an existing test; deliver the verification evidence
+      2
+      3 ## 1. Do not modify existing tests (hard rule)
+      4 You edited `tests/unit/test_web_memories_handler.py` (an existing test). That is not allowed. Revert it exactly:
+      5 `git checkout -- tests/unit/test_web_memories_handler.py`
+      7 The test broke because `MemoryUpdateOutput.revision` is a required field and existing callers/tests construct `MemoryUpdateOutput` without it. Fix on the source side instead, for backward compatibility: in
+         `src/mem_mcp/mcp/tools/update.py` declare `revision: str = ""` on `MemoryUpdateOutput` (the tool itself always sets a real revision on both paths). Then confirm `tests/unit/test_web_memories_handler.py` p
+        asses **unmodified**. Check `git status` / `git diff --stat` afterwards: the only modified pre-existing files must be the 4 src files; the only other changes are your 2 new test files.
+      8
+      9 Also grep the rest of `tests/` and `src/` for other constructions of `MemoryUpdateOutput(` / `MemoryRecord(` to make sure nothing else depends on new required fields.
+     … +16 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh X T5-X1 ~/laguna-bench/runs/T5-X1/orders/order-3.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +21 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Stash wasn't available, so the "fails without fix" claim is still unverified and the full-suite comparison is missing. I'll start by checking whether the order-2 test changes actually landed.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Order-2 changes are in, but the mixed test still reads tags from the superseded v1 row instead of the current one. I'll fix that in order 4 by restoring the original src files via git show HEAD: rather than stash,
+  which also recovers the missing evidence.
+
+● Write(~/laguna-bench/runs/T5-X1/orders/order-4.md)
+  ⎿  Wrote 28 lines to ../orders/order-4.md
+       1 # Work order 4 — Last fixes + the two missing pieces of evidence
+       2
+       3 ## 1. Small test fix (`tests/integration/test_update_concurrency.py::TestConcurrentMixedOperations::test_concurrent_mixed_on_decision`)
+         t(<its output id>)`; otherwise `memory_get(memory_id)`. Assert every tag from a successful tag-add call (`inp` tag, i.e. the tag that call added) is present on that current row.
+       5 - Assert the content update itself succeeded (it is the only content change on a current decision, so it can never be refused — tag adds may be refused only if they ran after the version bump). Remove the
+          vacuous asserts (`len(conflicts) >= 0`) and the misleading "Exactly 2 should succeed" comment.
+       6 - Also assert every refused call is a tag-add with `data["current_id"] == str(content_output.id)`.
+       8 ## 2. Prove the tests fail against the original code (stash was unavailable — use this instead)
+       9 ```
+      10 S=<your scratch dir>; mkdir -p $S/backup
+     … +26 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh X T5-X1 ~/laguna-bench/runs/T5-X1/orders/order-4.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +23 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Since the executor's sandbox can't swap files for a true before/after comparison, I'll run the full test suite now and check each failure against the code we modified.
+
+● Write(~/laguna-bench/runs/T5-X1/orders/order-5.md)
+  ⎿  Wrote 10 lines to ../orders/order-5.md
+       1 # Work order 5 — Full-suite failure triage (no code changes expected)
+       2
+       4
+       5 1. Run the full suite once: `pytest -q -p no:cacheprovider -rfE 2>&1 | tail -80` and report the summary line and the full list of FAILED/ERROR node ids (with the one-line reason pytest prints).
+       6 2. For **every** failing/erroring test, classify it: does its failure involve `memory_update`, `MemoryUpdateTool/Input/Output`, `MemoryRecord`, `memory_get`/`memory_get_batch`, `compute_revision`, `versio
+         related to our change (yes/no + why). For any that are tenants_email_key / fixture issues, one representative traceback is enough.
+       7 3. Also run any tests touching tool descriptions / tool registry / MCP schema (grep tests for `TOOL_DESCRIPTIONS`, `memory_update`, `inputSchema`, `tools/list`) and any web/plugin tests that touch update/
+         get (grep tests for `MemoryUpdate`, `memory_update`, `MemoryRecord`, `memory_get`), list the files you ran and their results.
+       9
+      10 Do not modify existing tests.
+     … +3 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh X T5-X1 ~/laguna-bench/runs/T5-X1/orders/order-5.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +21 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Bash(git -C ~/laguna-bench/runs/T5-X1/repo status --short; git -C ~/laguna-bench/runs/T5-X1/repo diff --stat)
+  ⎿   M src/mem_mcp/mcp/tool_descriptions.py
+      M src/mem_mcp/mcp/tools/get.py
+      M src/mem_mcp/mcp/tools/update.py
+     … +10 lines (ctrl+o to expand)
+
+● The executor's tests pass, but I could not show that the new concurrency tests fail on the original code. Its sandbox blocked swapping the source files (stash, copy and checkout), so that step was never run. I did get
+  a full-suite run with the change in place (5 executor round-trips in all).
+
+  How it works (4 source files changed, no schema migration):
+  - Revision token: compute_revision(id, updated_at) in memory/versioning.py hashes the row id and updated_at into an opaque string. MemoryRecord has revision: str = "", filled in automatically when empty. So it still
+    builds from its old fields alone, shows a non-empty revision in model_dump(), and carries it through memory_get, history and memory_get_batch.
+  - Revision always changes: every memory_update sets updated_at = GREATEST(clock_timestamp(), updated_at + 1µs), so the value strictly increases and two updates in a row never share a revision.
+  - Serialized updates (update.py): the first read is now SELECT … FOR UPDATE, so concurrent updates to the same memory run one after another in the database. The checks then run in this order:
+    a. Not found or deleted: the existing -32602 errors, unchanged.
+    b. is_current = false: refused with -32000, data.code = "update_conflict", and current_id (the chain's current row, found by walking forward through superseded_by) plus that row's current_revision.
+    c. Stale expected_revision: refused with -32000, update_conflict, current_revision and current_id.
+  - Tags and content: tag add/remove now merges against the locked, fresh row, so no tag edit is lost. In-place content updates are last-writer-wins.
+  - Version chain: of N concurrent updates to a decision, exactly one creates v2; the others are refused once they see the old row is no longer current. Marking the old row superseded also carries AND is_current = true
+    as a second guard.
+  - Output: memory_update returns revision (the new row's on the versioned path). It defaults to "" so existing code that builds MemoryUpdateOutput itself keeps working.
+  - Docs: expected_revision and the conflict contract are described in the memory_update entry of tool_descriptions.py.
+
+  Tests: two new files, no existing tests changed. In round 2 the executor edited an existing web-handler test; I had it reverted and fixed the cause in the source instead.
+  - tests/unit/test_update_revision.py: 16 tests covering the revision helper, MemoryRecord, and conflict handling with mocks.
+  - tests/integration/test_update_concurrency.py: 14 tests against real Postgres on its own 12-connection pool. They cover 10 concurrent tag adds and removes, 10 concurrent decision content updates (exactly one v2, the
+    rest refused with the winner's id), updating an already-superseded id later (including after a note→decision promotion), 10 concurrent updates with the same expected_revision (exactly one succeeds), a stale revision
+    leaving the memory unchanged, the update's revision matching memory_get, a mixed content-plus-tags race, and in-place last-writer-wins.
+
+  Results reported by the executor:
+  - The targeted set (old update tests, web handler test, both new files) passed: 49 tests. The concurrency file passed 5 runs in a row.
+  - ruff and mypy (on src) are clean.
+  - Full suite: 31 failed, 15 errors, 1363 passed. The executor triaged each failure, and all look unrelated to this change: duplicate-key and foreign-key fixture problems, missing AWS credentials, and team/role tests.
+    Without a baseline run, "no new failures" rests on that triage rather than a direct comparison.
+
+  Remaining concerns:
+  - Fail-without-fix is unproven. The concurrent tag-add and decision fork tests clearly exercise the races the old read-then-write code had, but they were never run against it.
+  - In production, the row lock is held while a content update is re-embedded. Updates to the same memory wait during the embedding call; updates to other memories are not affected.
+  - memory_supersede and the write path's supersede were left alone, as the task scoped only memory_update. They can still mark rows superseded without taking the lock.
+
+  Confidence: fairly high (about 85%) that the acceptance criteria are met. The locking and revision design is sound and the important cases are covered by real-database tests.
+
+✻ Crunched for 33m 42s · done 12:25 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+
+

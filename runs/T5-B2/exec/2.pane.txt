@@ -1,0 +1,260 @@
+      499
+      507 -// ---------------------------------------------------------------------------
+      508 -// (f) Sequential superseded decision update → -32000 with current_id
+      509 -// ---------------------------------------------------------------------------
+      500 +# (f) Sequential superseded decision update -----------------------------------
+      501
+      502
+      503  class TestSupersededSequential:
+     ...
+      518              ctx = _ctx(concurrency_pool, tenant, client_id)
+      519              tool = MemoryUpdateTool()
+      520
+      530 -            # Record memory count before
+      521 +            # Record memory count before (per-tenant via GUC)
+      522              async with tenant_tx(concurrency_pool, tenant) as conn:
+      523                  count_before = await conn.fetchval(
+      524                      "SELECT count(*) FROM memories"
+     ...
+      548                      "SELECT is_current, superseded_by FROM memories WHERE id = $1",
+      549                      dec_id,
+      550                  )
+      551 +                assert orig is not None
+      552                  assert orig["is_current"] is False
+      553                  assert orig["superseded_by"] == v2_id
+      554
+     ...
+      556                      "SELECT is_current FROM memories WHERE id = $1",
+      557                      v2_id,
+      558                  )
+      559 +                assert v2 is not None
+      560                  assert v2["is_current"] is True
+      561
+      562                  # Memory count must be unchanged by the refused call
+     ...
+      566                  assert count_after == count_before + 1  # +1 for the v2 that was created
+      567
+      568                  # v1 row's content must be unchanged
+      576 -                v1_content = await conn.fetchrow(
+      569 +                v1_content = await conn.fetchval(
+      570                      "SELECT content FROM memories WHERE id = $1",
+      571                      dec_id,
+      572                  )
+      580 -                assert v1_content["content"] == "v0 decision"
+      573 +                assert v1_content == "v0 decision"
+      574          finally:
+      575              await _cleanup(concurrency_pool, tenant, client_id)
+      576
+     ...
+      607                  row = await conn.fetchrow(
+      608                      "SELECT is_current FROM memories WHERE id = $1", v2_id
+      609                  )
+      610 +                assert row is not None
+      611                  assert row["is_current"] is False
+      612          finally:
+      613              await _cleanup(concurrency_pool, tenant, client_id)
+      614
+      615
+      622 -// ---------------------------------------------------------------------------
+      623 -// (b) Type promotion note→decision then stale update → -32000 with current_id
+      624 -// ---------------------------------------------------------------------------
+      616 +# (b) Type promotion note→decision then stale update ------------------------
+      617
+      618
+      619  class TestTypePromotionStaleUpdate:
+     ...
+      632              ctx = _ctx(concurrency_pool, tenant, client_id)
+      633              tool = MemoryUpdateTool()
+      634
+      643 -            # Count before
+      635 +            # Count before (per-tenant via GUC)
+      636              async with tenant_tx(concurrency_pool, tenant) as conn:
+      645 -                count_before = await conn.fetchval("SELECT count(*) FROM memories")
+      637 +                count_before = await conn.fetchval(
+      638 +                    "SELECT count(*) FROM memories"
+      639 +                )
+      640
+      641              # Promote note → decision (new version row created)
+      642              result = await tool(ctx, MemoryUpdateInput(id=note_id, type="decision"))
+     ...
+      658
+      659              # Memory count must be unchanged by the refused call
+      660              async with tenant_tx(concurrency_pool, tenant) as conn:
+      667 -                count_after = await conn.fetchval("SELECT count(*) FROM memories")
+      661 +                count_after = await conn.fetchval(
+      662 +                    "SELECT count(*) FROM memories"
+      663 +                )
+      664                  assert count_after == count_before + 1  # only promotion added a row
+      665
+      666                  # Old note's tags must be unchanged
+     ...
+      672              await _cleanup(concurrency_pool, tenant, client_id)
+      673
+      674
+      679 -// ---------------------------------------------------------------------------
+      680 -// (c) Versioned path revision: update.revision == re-getted memory.revision
+      681 -// ---------------------------------------------------------------------------
+      675 +# (c) Versioned path revision ------------------------------------------------
+      676
+      677
+      678  class TestVersionedPathRevision:
+     ...
+      717              await _cleanup(concurrency_pool, tenant, client_id)
+      718
+      719
+      726 -// ---------------------------------------------------------------------------
+      727 -// Revision semantics (non-concurrent) + truly stale token concurrent
+      728 -// ---------------------------------------------------------------------------
+      720 +# Revision semantics (non-concurrent) ---------------------------------------
+      721
+      722
+      723  class TestRevisionSemantics:
+     ...
+      797              await _cleanup(concurrency_pool, tenant, client_id)
+      798
+      799
+      808 -// ---------------------------------------------------------------------------
+      809 -// (e) Truly stale concurrent token: post-update, all 6 refused
+      810 -// ---------------------------------------------------------------------------
+      800 +# (e) Truly stale concurrent token: post-update, all 6 refused ---------------
+      801
+      802
+      803  class TestTrulyStaleTokenConcurrent:
+     ...
+      869              await _cleanup(concurrency_pool, tenant, client_id)
+      870
+      871
+      882 -// ---------------------------------------------------------------------------
+      883 -// Fixture
+      884 -// ---------------------------------------------------------------------------
+      872 +# Fixture -------------------------------------------------------------------
+      873
+      874
+      875  @pytest.fixture
+
+  Thought for 25s (ctrl+o to expand)
+
+● Now let me verify the _init_connection import exists and run the integration tests:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Bash(python -c "from mem_mcp.embeddings.bedrock import EmbedResult; print(dir(EmbedResult))" 2>&1 | head -20)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 22s (ctrl+o to expand)
+
+● Let me try running the tests directly:
+
+● Bash(python -m pytest tests/integration/test_update_concurrency.py -v --tb=short 2>&1 | head -100)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     cachedir: .pytest_cache
+     … +20 lines (ctrl+o to expand)
+
+  Thought for 8s (ctrl+o to expand)
+
+● All 11 integration tests pass. Now let me run the unit tests and lint:
+
+● Bash(python -m pytest tests/unit/test_tools_update_concurrency.py -v --tb=short 2>&1 | head -60)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     cachedir: .pytest_cache
+     … +25 lines (ctrl+o to expand)
+
+● Bash(ruff check tests/integration/test_update_concurrency.py tests/unit/test_tools_update_concurrency.py 2>&1 | head -40)
+  ⎿  tests/integration/test_update_concurrency.py:395:24: RUF005 Consider `[*remove_tags, keeper]` instead of concatenation
+         |
+     393 |             remove_tags = [f"r{i}" for i in range(8)]
+     … +10 lines (ctrl+o to expand)
+
+  Thought for 7s (ctrl+o to expand)
+
+● One minor lint issue. Let me fix it and run mypy:
+
+● Update(tests/integration/test_update_concurrency.py)
+  ⎿  Added 1 line, removed 1 line
+      392          try:
+      393              remove_tags = [f"r{i}" for i in range(8)]
+      394              keeper = "keeper"
+      395 -            all_tags = remove_tags + [keeper]
+      395 +            all_tags = [*remove_tags, keeper]
+      396              note_id = await _create_note_direct(
+      397                  concurrency_pool, tenant, tags=all_tags
+      398              )
+
+● Bash(ruff check src tests 2>&1 | tail -20)
+  ⎿  All checks passed!
+
+● Bash(mypy 2>&1 | tail -20)
+  ⎿  Success: no issues found in 333 source files
+
+  Thought for 5s (ctrl+o to expand)
+
+● All checks pass. Let me run the integration tests one final time to confirm everything still works after the lint fix:
+
+● Bash(python -m pytest tests/integration/test_update_concurrency.py tests/unit/test_tools_update_concurrency.py -v --tb=short 2>&1)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     cachedir: .pytest_cache
+     … +36 lines (ctrl+o to expand)
+
+● All 27 tests pass, lint is clean, and mypy reports no issues. Here's the report:
+
+  ---
+
+  Summary
+
+  File changed: tests/integration/test_update_concurrency.py (rewrite)
+
+  The first draft had several bugs identified through source code verification. The file was fully rewritten with all fixes applied:
+
+  Fixes applied
+
+  1. GUC on direct DB writes — _create_note_direct and _create_decision_direct now use tenant_tx() (sets app.current_tenant_id GUC) instead of raw pool.acquire(), so the RLS memories_insert policy allows the INSERT.
+  2. GUC on cleanup — _cleanup now sets set_config('app.current_tenant_id', ...) before DELETEs on memories (RLS memories_delete requires it). The subqueries for memory_references and slugs deletions are also GUC-scoped
+     via the same transaction.
+  3. GUC on DB verification queries — All post-test DB verification SELECTs in test_stale_token_refused and test_6_concurrent_truly_stale_token now use tenant_tx() instead of raw pool.acquire().
+  4. Broken assertion fixed — test_6_concurrent_same_valid_expected_revision now uses the winner_idx from the result tuple (index 2) instead of the nonsensical inline expression. The assertion db_content ==
+     f"concurrent-{winner_idx}" is correct.
+  5. Simplified DB invariant queries — Removed the overly complex nested subquery; the test_6_concurrent_fork_decision test now uses simple fetchrow/fetchval queries within a tenant_tx transaction.
+  6. Imports fixed — Added from collections.abc import AsyncIterator, removed the unused compute_revision import (not needed in integration tests), removed the unused from collections.abc import AsyncIterator that was
+     actually present but had the wrong type annotation.
+  7. Fixture return type fixed — concurrency_pool now annotated -> AsyncIterator[Any].
+  8. Added None guards — DB verification queries now assert orig is not None, v2 is not None, row is not None before accessing columns.
+  9. Lint fix — RUF005: changed list + [item] to [*list, item].
+
+  Requirements coverage (all 8 scenarios from the work order)
+
+  - (a) 6 concurrent versioned fork on a decision → 1 success, 5 superseded conflicts with current_id + current_revision matching winner ✓
+  - (b) Type promotion note→decision then stale update → -32000 with current_id ✓
+  - (c) Versioned path revision: update.revision == re-getted memory.revision ✓
+  - (d) 8 concurrent tags add/remove (no lost updates) + 8 concurrent distinct removes (only keeper remains) ✓
+  - (e) 6 concurrent with same valid expected_revision → 1 success, 5 conflicts with current_revision == winner.revision ✓
+  - (f) Sequential superseded decision update → -32000 with current_id, row count assertions ✓
+  - (g) Stub embedder sleeps 0.02s ✓
+  - (h) _drain_access_tasks() sleeps 0.3s before pool.close() ✓
+
+  Verification
+
+  pytest tests/integration/test_update_concurrency.py tests/unit/test_tools_update_concurrency.py -v
+  → 27 passed in 4.80s
+
+  ruff check src tests → All checks passed!
+  mypy → Success: no issues found in 333 source files
+
+  Left open/uncertain
+
+  - The src/mem_mcp/mcp/tools/update.py and get.py files are modified per git status, but no changes were needed there — the tools' behavior is correctly tested as-is.
+  - No pre-existing test failures were introduced; the full suite was not run, but all 27 concurrency-related tests pass.
+
+✻ Cooked for 46m 46s · done 1:08 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+
+

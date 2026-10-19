@@ -1,0 +1,260 @@
+
+  - Each map member node has a **stored** status: `open` (default), `resolved`, or
+    `dropped`, plus the settlement details (one-line resolution summary, the
+    resolving node if any, which party resolved it, when).
+  - Status is the source of truth for "is this branch settled". It must **not** be
+    inferred from `memory_references.reference_kind` (that column is unvalidated
+    free text); an edge alone never settles a branch.
+  - Schema changes go through a **new Alembic migration** (`alembic/versions/`,
+    follow the existing naming/revision-chain conventions and constrain the new
+    values with CHECKs). The scoring harness runs `alembic upgrade head` on a fresh
+    database before running tests.
+
+  ### B. New tool `mindmap_resolve` — settle one branch without closing the map
+
+  Module `mem_mcp/mcp/tools/mindmap_resolve.py`, classes `MindmapResolveTool`
+  (name `mindmap_resolve`, scope `memory.write`), `MindmapResolveInput`,
+  `MindmapResolveOutput`; registered in `main.py`, described in
+  `mcp/tool_descriptions.py` (existing "Call when / Do not call" style).
+
+  Input:
+
+  | field | type | notes |
+  |---|---|---|
+  | `map_key` | str (1..64) | map handle, as for the other mindmap tools |
+  | `node_id` | UUID | the branch node to settle |
+  | `disposition` | `"resolved"` \| `"dropped"` | default `"resolved"` |
+  | `resolution_summary` | str (1..500), **required** | the one line every later cheap read shows instead of the branch |
+  | `resolved_by_memory_id` | UUID \| None | the node that settles it, if any |
+  | `resolved_by_party` | `"owner"` \| `"model"` | default `"model"` |
+  | `team_id` | UUID \| None | as for the other mindmap tools |
+
+  Output: `node_id`, `status` (the new status), `resolution_summary`, `cursor`
+  (see D), `request_id`.
+
+  Behaviour:
+  - Unknown map, or a node that is not a member of **this** map → `JsonRpcError`
+    -32602, nothing changed (a caller must not be able to settle a node of a
+    different map by id).
+  - Respect the map lifecycle rules of the design doc.
+  - When a resolving node is named, also record the graph edge from the resolving
+    node (source) to the settled node (target) in `memory_references`, so the graph
+    stays walkable. Use the edge kind the design doc's reference-kind vocabulary
+    prescribes for the disposition, and write it through the same code path
+    `mindmap_link` uses. No resolving node → no edge, but the branch is still
+    settled.
+  - Status change and edge are written in one transaction, and the action is
+    recorded in the map's event log (observability, as for the other map verbs).
+
+  ### C. `open_loops` fix
+
+  `open_loops` must follow the design doc's whose-turn definition **and** exclude
+  settled branches: a resolved/dropped node is never an open loop.
+
+  ### D. Cheap reads on `mindmap_get`
+
+  New input levers on `MindmapGetInput`, all defaulting to the cheap setting:
+
+  | field | values | default |
+  |---|---|---|
+  | `since` | int ≥ 0 \| None | None |
+  | `include` | `"open"` \| `"all"` | `"open"` |
+  | `depth` | `"summary"` \| `"full"` | `"summary"` |
+
+  - `cursor` (int, new output field): a position in the map's append-only event log
+    (`memory_map_events` already has a monotonically increasing id). Every read
+    returns the current cursor; a write/resolve advances it.
+  - `since=<cursor>`: return only nodes touched by map events after that cursor. If
+    nothing changed, return **no nodes** (never "everything") and the same cursor.
+  - `include="open"`: `nodes` holds only open branches; settled branches come back
+    in a separate new output list `resolved`, one compact entry per branch with
+    `memory_id`, `resolution_summary`, `status`, `resolved_by_party`.
+    `include="all"`: every member in `nodes`, each with its `status`.
+  - `depth="summary"`: node `content` longer than 200 characters is cut to at most
+    200 characters followed by a single `…`, and the node's new `truncated` flag
+    is true. Content of 200 characters or fewer is returned as-is with
+    `truncated=false`. `depth="full"` returns content whole, `truncated=false`.
+  - Each node in `nodes` also carries its `status`.
+  - Existing output fields stay (backward compatible for callers that ignore the
+    new ones).
+
+  ## Out of scope
+
+  A cross-map answer queue, map listing, `mindmap_answer`, decision criteria /
+  question nodes, and close-time guards are planned separately — don't build them.
+
+  ## Constraints
+
+  - Follow the existing mindmap layering: SQL in `mem_mcp/mindmap/service.py`,
+    tools thin; `tenant_tx`; `JsonRpcError` conventions from `mcp/errors.py`.
+  - Do not modify existing tests; add your own (unit + DB-backed through the
+    tools). The rest of the suite must not get new failures (some tests are red
+    before you start — pre-existing; leave them).
+
+  ## Running tests
+
+  `MEM_MCP_TEST_DSN` / `MEM_MCP_DB_MAINT_DSN` point at a fresh database migrated to
+  the base revision; after adding your migration run `alembic upgrade head`, then
+  e.g. `pytest -q -p no:cacheprovider tests/unit tests/integration`.
+  `tests/integration/test_mindmap_e2e.py` shows how to set up a tenant/team and
+  drive the mindmap tools against the real DB with a stub embedder.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_013VB7sZb4Gko4nMLE5Ypvms
+
+● I'll start by reading the design doc and the existing implementation.
+
+  Searched for 1 pattern, read 5 files, listed 2 directories (ctrl+o to expand)
+
+● Bash(sed -n 1,36p src/mem_mcp/teams/references.py; sed -n 133,162p src/mem_mcp/teams/references.py; grep -n "mindmap_get\|content\|open_loops" tests/integration/test…)
+  ⎿  """Reference graph helpers — validate-on-write + forward/backward graph + hard-delete protection.
+
+     Per memsys foundation 1c47bd99 + test plan e552d271 Spec 4 + amendments:
+     … +74 lines (ctrl+o to expand)
+
+● I've read the design doc and the mindmap code. Next I'm writing the first work order for the executor.
+
+● Bash(grep -n "ReferenceKind\s*=\|RefsVersion\s*=" -A4 src/mem_mcp/teams/references.py; sed -n 185,200p tests/integration/test_mindmap_e2e.py)
+  ⎿  56:ReferenceKind = str  # open-text per amendment; conventional kinds documented elsewhere
+     57:RefsVersion = Literal["pinned", "current"]
+     58-
+     … +25 lines (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/T4-A1/orders/order-1.md)
+  ⎿  Wrote 156 lines to ../orders/order-1.md
+       1 # Work order 1 — Mind-map branch status, `mindmap_resolve`, cheap `mindmap_get` reads
+       2
+       3 Read first: `CONVENTIONS.md`, `docs/mindmap-v1-build-design.md` (source of truth for map rules),
+       4 `src/mem_mcp/mindmap/service.py`, `src/mem_mcp/mcp/tools/mindmap_{get,link,close,write_node,open}.py`,
+       5 `src/mem_mcp/mcp/tools/_mindmap_common.py`, `src/mem_mcp/teams/references.py`,
+       6 `alembic/versions/0038_2026_06_19_mindmap_tables.py`, `tests/integration/test_mindmap_e2e.py`.
+       7
+       8 ## Problem
+       9 `mindmap_get` returns every node in full every time; there is no per-branch status (only `mindmap_close`
+      10 settles the whole map), so `open_loops` only grows. Build: (A) stored per-node branch status,
+     … +146 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh A T4-A1 ~/laguna-bench/runs/T4-A1/orders/order-1.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +25 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor wrote everything but couldn't run Bash. I'll review the diff myself.
+
+● Bash(git status --short && git diff -- src alembic && cat alembic/versions/0044_2026_10_15_mindmap_branch_status.py src/mem_mcp/mcp/tools/mindmap_resolve.py)
+  ⎿   A alembic/versions/0044_2026_10_15_mindmap_branch_status.py
+      M docs/mindmap-v1-build-design.md
+      M skills/mindmap-driver/SKILL.md
+     … +673 lines (ctrl+o to expand)
+
+  Read 1 file (ctrl+o to expand)
+
+● Bash(grep -rn "MindmapNode\|fetch_members\|log_event(" src tests | grep -v "^src/mem_mcp/mindmap/service.py"; git diff --stat; grep -n "def test_\|resolved_by_party\…)
+  ⎿  src/mem_mcp/identity/lifecycle.py:164:    await audit.log_event(
+     src/mem_mcp/identity/lifecycle.py:241:    await audit.log_event(
+     src/mem_mcp/identity/lifecycle.py:281:        await audit.log_event(
+     … +54 lines (ctrl+o to expand)
+
+● The code looks right. Order 2 asks for one small reordering and, mainly, for all the tests to be run.
+
+● Write(~/laguna-bench/runs/T4-A1/orders/order-2.md)
+  ⎿  Wrote 32 lines to ../orders/order-2.md
+       1 # Work order 2 — verify order 1, plus two small fixes
+       2
+       3 Good work on order 1; the design is right. Nothing has been run yet, so verification is the priority.
+       4 Bash should now be usable. If it is still denied, say so in the first line of your report and stop.
+       5
+       6 ## Fixes
+       7 1. `src/mem_mcp/mcp/tools/mindmap_resolve.py`: validate the map and node before the resolver access
+       8    check, so that an unknown map, an archived map, a non-member node, the root or an already-settled node
+       9    gets its own error even when `resolved_by_memory_id` is also given (a stray resolver id must never hide
+      10    a "wrong map" error). Suggested flow:
+     … +22 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh A T4-A1 ~/laguna-bench/runs/T4-A1/orders/order-2.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +31 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● The executor still can't run Bash, so it couldn't apply fix 1 or run any checks. I'll have it make the fix with its file tools and try the tests once more.
+
+● Write(~/laguna-bench/runs/T4-A1/orders/order-3.md)
+  ⎿  Wrote 22 lines to ../orders/order-3.md
+       1 # Work order 3 — apply fix 1 with Edit/Write, then try to verify
+       2
+       3 1. Apply fix 1 from order 2 (reorder the checks in `src/mem_mcp/mcp/tools/mindmap_resolve.py`, and add
+       4    the test "node of another map + valid resolver → -32602 path node_id, nothing changed" to
+       5    `tests/integration/test_mindmap_resolve_e2e.py`). Use the Edit/Write file tools, not Bash heredocs.
+       6    Keep the code mypy/ruff-clean by inspection: line length ≤100, typed, and no unused imports.
+       7 2. Then try each of the following as a separate, simple Bash command. Run each one exactly once, and
+       8    don't chain with `&&`. If a command is denied, note "denied" and move on to the next:
+       9    - `alembic upgrade head`
+      10    - `alembic current`
+     … +12 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh A T4-A1 ~/laguna-bench/runs/T4-A1/orders/order-3.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +25 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Bash worked this time and the mindmap tests pass. Next I'm reviewing the reordered resolve tool.
+
+● Bash(sed -n 60,240p src/mem_mcp/mcp/tools/mindmap_resolve.py; git status --short)
+  ⎿  def _bad_node(message: str) -> JsonRpcError:
+         return JsonRpcError(-32602, message, data={"errors": [{"path": "node_id", "message": message}]})
+     … +137 lines (ctrl+o to expand)
+
+● The executor built branch status, the new mindmap_resolve tool and the cheap mindmap_get reads. All the mindmap tests pass, but two checks never ran: the migration's downgrade step, and a baseline run proving the
+  suite's existing failures predate this change.
+
+  What was built:
+  - Migration 0044_2026_10_15_mindmap_branch_status, chained after 0043_backfill_personal_teams. It adds five columns to memory_map_membership: status (default open), resolution_summary, resolved_by_memory_id,
+    resolved_by_party and resolved_at.
+    - Named CHECKs limit status and resolved_by_party to the allowed values, cap the summary at 500 characters, and reject half-settled rows (an open row carries no settlement fields; a settled row must have summary,
+      party and time).
+    - It also adds an index on the event log for the cursor reads.
+  - mindmap/service.py: log_event now returns the event id, which serves as the cursor. New helpers: current_cursor, touched_since, fetch_member and settle_member. The last is a conditional update; it raises
+    NodeNotOpenError if the node is already settled, so two simultaneous resolves can't both succeed. fetch_members now returns the status fields.
+  - mindmap_resolve: registered in main.py and described in tool_descriptions.py in the house style.
+    - It first validates the request: the map must exist and be live, the node must be a member of this map, and it can't be the root or already settled. Then it checks that the resolving node is accessible, the same
+      check mindmap_link uses. Every refusal is -32602 and changes nothing.
+    - One transaction then settles the node and, if a resolving node was given, writes the edge through insert_reference, the same function mindmap_link uses. The edge kind is resolves-under for resolved and
+      dropped-under for dropped. The same transaction logs a resolve or drop event and returns its id as cursor.
+  - mindmap_get: new since, include and depth inputs with the cheap defaults. New outputs are cursor, resolved, and per-node status and truncated. Edges are cut down to those that touch a returned node, and all existing
+    fields are kept.
+    - open_loops now means: status is open and metadata.responsible_party is owner or model. It is always computed over the whole map.
+  - Docs: a "Branch status & cheap reads" section in the design doc, plus guidance in SKILL.md.
+  - Tests: a new unit file and a new end-to-end file. No existing tests were changed.
+
+  Executor round-trips: 3. In the first two the executor's Bash was denied, so nothing ran; in round 3 it worked.
+
+  Verification (round 3, as reported by the executor):
+  - alembic current shows 0044_mindmap_branch_status (head).
+  - The new unit tests, both mindmap end-to-end files and the tenant-scope lint test pass: 48 passed. The first run caught a bug in the new tests (an invalid visibility value), which was fixed.
+  - ruff check and ruff format --check are clean. mypy reports 39 errors, none in code this change added.
+  - Full suite: 38 failed, 1266 passed, 31 skipped, 15 errors. None of the failures are in mindmap code. They are teams/RBAC tests hitting hard-coded fixture emails and slug-schema tests, plus one scope test that only
+    registers the stats tool.
+
+  Remaining concerns:
+  - Pre-existing failures: the executor wasn't allowed to stash the change and rerun the suite, so "pre-existing" for those 38 failures rests on inspection, not a before-and-after run. The categories match what CLAUDE.md
+    says is already red.
+  - Downgrade untested: downgrade() was written but never run. The scoring harness only upgrades, so this matters less.
+  - Calls I made where the task was silent:
+    - Open loops: the design doc and SKILL.md disagree. The doc says open nodes with either owner or model count; the skill implies only owner. I went with the design doc, since the packet makes it the source of truth.
+    - Refusals: resolving the root, or a node that's already settled, is refused.
+    - since: it filters both nodes and resolved, but open_loops always covers the whole map.
+
+  Confidence: fairly high (about 80%) that the acceptance criteria are met. The main risks are hidden tests that read the open-loop rule as owner-only, or that expect re-settling a node to be allowed.
+
+✻ Crunched for 9m 9s · done 11:57 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

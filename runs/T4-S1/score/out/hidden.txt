@@ -1,0 +1,131 @@
+NOTICE:  database "sc_t4_h_757653" does not exist, skipping
+F.FF......F..F.F.........                                                [100%]
+=================================== FAILURES ===================================
+_____________ test_resolve_retires_open_loops_and_compacts_branch ______________
+
+env = {'client_id': 'client:mmres-3abbdae7', 'ctx': ToolContext(request_id='req-599479ca', tenant_id=UUID('42191460-85eb-445...Checker object at 0x76ebe3542330>)), 'key': 'resolve-bench', 'team': UUID('4565a170-43f7-4e90-a986-26c4cd67cb8f'), ...}
+pg_pool = <asyncpg.pool.Pool object at 0x76ebe4bc8c40>
+
+    async def test_resolve_retires_open_loops_and_compacts_branch(env: Any, pg_pool: Any) -> None:
+        asks = [await _write(env, f"Owner, pick for branch {i}?", "owner") for i in range(3)]
+        resolver = await _write(env, "A settled position. " + "reasoning " * 100, "model")
+    
+        before = await _get(env)
+        assert set(before.open_loops) == set(asks)
+    
+        out = await _resolve(
+            env,
+            asks[0],
+            disposition="resolved",
+            resolution_summary="Branch 0: went with A",
+            resolved_by_memory_id=resolver,
+            resolved_by_party="owner",
+        )
+        assert out.node_id == asks[0]
+        assert out.status == "resolved"
+        assert out.resolution_summary == "Branch 0: went with A"
+        assert isinstance(out.cursor, int)
+    
+        after = await _get(env)
+        assert set(after.open_loops) == {asks[1], asks[2]}
+        # Settled branch is compacted to a one-liner and no longer sent in full.
+>       assert asks[0] not in {n.memory_id for n in after.nodes}
+E       AssertionError: assert UUID('790c1d3a-2570-4cfa-a2c2-5b248924da8c') not in {UUID('499d620d-b6b2-4a8c-8b08-530da0a6d1cb'), UUID('790c1d3a-2570-4cfa-a2c2-5b248924da8c'), UUID('8c0d398e-3828-476d-a1aa-f5cf343c3cd3'), UUID('af582670-0ac7-4e1d-9684-5a47750ca554'), UUID('c11a9242-f085-4054-ac67-9608f5e058ab')}
+
+tests/integration/test_mindmap_resolve_and_delta.py:205: AssertionError
+__________________ test_dropped_branch_writes_design_doc_edge __________________
+
+env = {'client_id': 'client:mmres-de3eed02', 'ctx': ToolContext(request_id='req-d6e34396', tenant_id=UUID('42bbd1dd-fa84-429...Checker object at 0x76ebe3545f10>)), 'key': 'resolve-bench', 'team': UUID('e6828883-40d9-4f93-9957-d21f64d86363'), ...}
+pg_pool = <asyncpg.pool.Pool object at 0x76ebe36ca440>
+
+    async def test_dropped_branch_writes_design_doc_edge(env: Any, pg_pool: Any) -> None:
+        node = await _write(env, "Shard by region?", "owner")
+        displacing = await _write(env, "Not needed at our scale", "model")
+        out = await _resolve(
+            env,
+            node,
+            disposition="dropped",
+            resolution_summary="dropped: scale",
+            resolved_by_memory_id=displacing,
+        )
+        assert out.status == "dropped"
+        assert await _edge_kind(pg_pool, displacing, node) == ["dropped-under"]
+    
+        got = await _get(env)
+        assert node not in got.open_loops
+>       settled = {r.memory_id: r for r in got.resolved}
+                   ^^^^^^^^^^^
+E       AttributeError: 'asyncpg.pgproto.pgproto.UUID' object has no attribute 'memory_id'
+
+tests/integration/test_mindmap_resolve_and_delta.py:237: AttributeError
+____________ test_drop_without_resolver_writes_no_edge_but_settles _____________
+
+env = {'client_id': 'client:mmres-d44adf1c', 'ctx': ToolContext(request_id='req-790d38a9', tenant_id=UUID('446c45cf-8a4a-412...Checker object at 0x76ebe3544dd0>)), 'key': 'resolve-bench', 'team': UUID('c087d1d2-bafc-4baa-890b-46b5c5cfb19c'), ...}
+pg_pool = <asyncpg.pool.Pool object at 0x76ebe36ca8c0>
+
+    async def test_drop_without_resolver_writes_no_edge_but_settles(env: Any, pg_pool: Any) -> None:
+        node = await _write(env, "Gold-plate the UI?", "owner")
+        await _resolve(env, node, disposition="dropped", resolution_summary="out of scope")
+        async with pg_pool.acquire() as conn:
+            n = await conn.fetchval(
+                "SELECT count(*) FROM memory_references WHERE target_memory_id = $1", node
+            )
+        assert n == 0
+        got = await _get(env)
+        assert node not in got.open_loops
+>       assert node not in {n.memory_id for n in got.nodes}
+E       AssertionError: assert UUID('6a150c1b-d2ba-4685-a73a-bd58941f94dd') not in {UUID('6a150c1b-d2ba-4685-a73a-bd58941f94dd'), UUID('85eb49b2-1fb9-40b5-a06b-f3a3a1af91d6')}
+
+tests/integration/test_mindmap_resolve_and_delta.py:251: AssertionError
+____________________ test_summary_depth_truncates_and_flags ____________________
+
+env = {'client_id': 'client:mmres-937fbc82', 'ctx': ToolContext(request_id='req-f70f39f5', tenant_id=UUID('482e769a-83ae-492...Checker object at 0x76ebe348c590>)), 'key': 'resolve-bench', 'team': UUID('d104613e-0ab3-4e8b-aaa4-c29b08b2ca7e'), ...}
+
+    async def test_summary_depth_truncates_and_flags(env: Any) -> None:
+        long_id = await _write(env, "L" * 1500, "model")
+        edge_id = await _write(env, "E" * 200, "model")
+        short_id = await _write(env, "short", "model")
+    
+        cheap = await _get(env)
+        by_id = {n.memory_id: n for n in cheap.nodes}
+>       assert by_id[long_id].truncated is True
+E       AssertionError: assert False is True
+E        +  where False = MindmapNode(memory_id=UUID('d9328e46-f690-422e-828a-5cb03a993ee3'), node_role='position', type='position', content='LL...etime.timezone.utc), status='open', resolution_summary=None, resolved_by_party=None, resolved_at=None, truncated=False).truncated
+
+tests/integration/test_mindmap_resolve_and_delta.py:355: AssertionError
+_____________________ test_get_defaults_to_the_cheap_read ______________________
+
+    def test_get_defaults_to_the_cheap_read() -> None:
+        from mem_mcp.mcp.tools.mindmap_get import MindmapGetInput
+    
+        inp = MindmapGetInput(map_key="m")
+>       assert inp.include == "open"
+E       AssertionError: assert 'all' == 'open'
+E         
+E         - open
+E         + all
+
+tests/unit/test_mindmap_read_levers.py:15: AssertionError
+_____________________ test_get_rejects_bad_levers[kwargs0] _____________________
+
+kwargs = {'since': -1}
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"since": -1}, {"include": "everything"}, {"depth": "medium"}],
+    )
+    def test_get_rejects_bad_levers(kwargs: dict) -> None:
+        from mem_mcp.mcp.tools.mindmap_get import MindmapGetInput
+    
+>       with pytest.raises(ValidationError):
+E       Failed: DID NOT RAISE <class 'pydantic_core._pydantic_core.ValidationError'>
+
+tests/unit/test_mindmap_read_levers.py:34: Failed
+=========================== short test summary info ============================
+FAILED tests/integration/test_mindmap_resolve_and_delta.py::test_resolve_retires_open_loops_and_compacts_branch
+FAILED tests/integration/test_mindmap_resolve_and_delta.py::test_dropped_branch_writes_design_doc_edge
+FAILED tests/integration/test_mindmap_resolve_and_delta.py::test_drop_without_resolver_writes_no_edge_but_settles
+FAILED tests/integration/test_mindmap_resolve_and_delta.py::test_summary_depth_truncates_and_flags
+FAILED tests/unit/test_mindmap_read_levers.py::test_get_defaults_to_the_cheap_read
+FAILED tests/unit/test_mindmap_read_levers.py::test_get_rejects_bad_levers[kwargs0]
+6 failed, 19 passed in 1.25s

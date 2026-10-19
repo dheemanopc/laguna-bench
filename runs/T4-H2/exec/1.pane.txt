@@ -1,0 +1,260 @@
+      514
+      515          n1 = await MindmapWriteNodeTool()(
+      516              ctx,
+      517 -            MindmapWriteNodeInput(map_key=map_key, content="node", node_role="position"),
+      517 +            MindmapWriteNodeInput(
+      518 +                map_key=map_key,
+      519 +                content="node",
+      520 +                node_role="position",
+      521 +                responsible_party="owner",
+      522 +            ),
+      523          )
+      524          node_id = n1.node_id
+      525
+
+● Bash(python -m pytest tests/integration/test_mindmap_resolve_e2e.py -p no:cacheprovider -q 2>&1)
+  ⎿  ...............                                                          [100%]
+     15 passed in 1.42s
+
+● Bash(python -m pytest -q -p no:cacheprovider 2>&1 | tail -60)
+  ⎿  SKIPPED [6] tests/security/test_sqli_probes.py:65: requires --live-aws flag to run (uses live AWS resources)
+     SKIPPED [6] tests/security/test_sqli_probes.py:95: requires --live-aws flag to run (uses live AWS resources)
+     SKIPPED [6] tests/security/test_sqli_probes.py:122: requires --live-aws flag to run (uses live AWS resources)
+     … +57 lines (ctrl+o to expand)
+
+● Bash(python -m pytest tests/integration/test_mindmap_e2e.py::test_mindmap_full_lifecycle -xvs -p no:cacheprovider 2>&1 | tail -80)
+  ⎿  _________________________ test_mindmap_full_lifecycle __________________________
+
+     pg_pool = <asyncpg.pool.Pool object at 0x71ff090c8340>
+     … +77 lines (ctrl+o to expand)
+
+● Update(src/mem_mcp/mcp/tools/mindmap_get.py)
+  ⎿  Error editing file
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(src/mem_mcp/mcp/tools/mindmap_get.py)
+  ⎿  Removed 4 lines
+      119              resolved_members = []
+      120
+      121              for m in members:
+      122 -                # Skip root node.
+      123 -                if m["node_role"] == "root":
+      124 -                    continue
+      125 -
+      122                  # Apply since filter.
+      123                  if touched_ids is not None and m["memory_id"] not in touched_ids:
+      124                      continue
+
+● Bash(python -m pytest tests/integration/test_mindmap_e2e.py::test_mindmap_full_lifecycle -xvs -p no:cacheprovider 2>&1 | tail -30)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     hypothesis profile 'default'
+     … +9 lines (ctrl+o to expand)
+
+● Bash(python -m pytest tests/unit/test_mindmap_resolve_models.py tests/integration/test_mindmap_resolve_e2e.py tests/integration/test_mindmap_e2e.py -p no:cacheprovid…)
+  ⎿  ...................................                                      [100%]
+     35 passed in 1.92s
+
+● Bash(ruff check src/mem_mcp/mindmap/service.py src/mem_mcp/mindmap/__init__.py src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mcp/tools/mindmap_get.py src/mem_…)
+  ⎿  All checks passed!
+
+● Bash(ruff format --check src/mem_mcp/mindmap/service.py src/mem_mcp/mindmap/__init__.py src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mcp/tools/mindmap_get.py…)
+  ⎿  Error: Exit code 1
+     Would reformat: src/mem_mcp/mcp/tools/mindmap_get.py
+     Would reformat: src/mem_mcp/mindmap/service.py
+     2 files would be reformatted, 4 files already formatted
+
+● Bash(ruff format src/mem_mcp/mindmap/service.py src/mem_mcp/mcp/tools/mindmap_get.py 2>&1)
+  ⎿  2 files reformatted
+
+● Bash(ruff format --check src/mem_mcp/mindmap/service.py src/mem_mcp/mindmap/__init__.py src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mcp/tools/mindmap_get.py…)
+  ⎿  6 files already formatted
+
+● Bash(mypy src/mem_mcp/mindmap/service.py src/mem_mcp/mindmap/__init__.py src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mcp/tools/mindmap_get.py 2>&1 | head -5…)
+  ⎿  src/mem_mcp/mindmap/service.py:65: error: Returning Any from function declared to return "UUID | None"  [no-any-return]
+     src/mem_mcp/mindmap/service.py:76: error: Returning Any from function declared to return "UUID | None"  [no-any-return]
+     Found 2 errors in 1 file (checked 4 source files)
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(src/mem_mcp/mindmap/service.py)
+  ⎿  Added 2 lines, removed 1 line
+      62
+      63  async def resolve_map_root(conn: asyncpg.Connection, *, team_id: UUID, map_key: str) -> UUID | None:
+      64      """Resolve a map key (the root memory's 'map' slug) to its root_memory_id."""
+      65 -    return await conn.fetchval(
+      65 +    val = await conn.fetchval(
+      66          "SELECT memory_id FROM slugs WHERE team_id = $1 AND resource_type = 'map' AND slug = $2",
+      67          team_id,
+      68          map_key,
+      69      )
+      70 +    return val if val is None else UUID(str(val))
+      71
+      72
+      73  async def find_live_map_seeded_from(
+
+● Update(src/mem_mcp/mindmap/service.py)
+  ⎿  Added 2 lines, removed 1 line
+      74      conn: asyncpg.Connection, *, seed_spec_memory_id: UUID
+      75  ) -> UUID | None:
+      76      """from_spec dedup guard: an existing LIVE map seeded from this spec node."""
+      77 -    return await conn.fetchval(
+      77 +    val = await conn.fetchval(
+      78          """
+      79          SELECT root_memory_id FROM memory_maps
+      80          WHERE seed_spec_memory_id = $1 AND state = 'live'
+     ...
+      82          """,
+      83          seed_spec_memory_id,
+      84      )
+      85 +    return val if val is None else UUID(str(val))
+      86
+      87
+      88  async def insert_membership(
+
+● Bash(mypy src/mem_mcp/mindmap/service.py src/mem_mcp/mindmap/__init__.py src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mcp/tools/mindmap_get.py 2>&1)
+  ⎿  Success: no issues found in 4 source files
+
+● Bash(python -m pytest tests/unit/test_mindmap_resolve_models.py tests/integration/test_mindmap_resolve_e2e.py tests/integration/test_mindmap_e2e.py -p no:cacheprovid…)
+  ⎿  ...................................                                      [100%]
+     35 passed in 1.91s
+
+● Bash(alembic current && echo "---" && alembic downgrade -1 && alembic upgrade head && alembic current)
+  ⎿  0044_mindmap_branch_status (head)
+     ---
+     0044_mindmap_branch_status (head)
+
+● Bash(python -m pytest tests/unit/test_lint_tenant_scope.py -p no:cacheprovider -q 2>&1)
+  ⎿  ..............                                                           [100%]
+     14 passed in 0.22s
+
+● Perfect! Let me run one final comprehensive test to ensure there are no regressions:
+
+● Bash(python -m pytest tests/integration/test_mindmap_e2e.py tests/unit/test_mindmap_resolve_models.py tests/integration/test_mindmap_resolve_e2e.py -v -p no:cachepro…)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     hypothesis profile 'default'
+     … +43 lines (ctrl+o to expand)
+
+● Bash(python -c "from mem_mcp.mcp.tools.mindmap_resolve import MindmapResolveTool; print(f'Tool name: {MindmapResolveTool.name}'); print(f'Scope: {MindmapResolveTool.…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Excellent! All tests pass. Let me create a final summary of the implementation:
+
+  Implementation Summary
+
+  I've successfully implemented the full work order for mind-map branch status tracking, with cheap reads and the open_loops fix. Here are the changes:
+
+  A. Database Migration ✓
+
+  File: alembic/versions/0044_2026_10_15_mindmap_branch_status.py
+  - Added status column (TEXT, CHECK: 'open'|'resolved'|'dropped')
+  - Added resolution_summary (TEXT, max 500 chars)
+  - Added resolved_by_memory_id (FK to memories)
+  - Added resolved_by_party (owner|model|NULL)
+  - Added resolved_at (TIMESTAMPTZ)
+  - Added consistency CHECK: when status='open', all resolution fields are NULL; when settled, summary/party/resolved_at are NOT NULL
+  - Real downgrade function
+  - ✅ Verified roundtrip: alembic downgrade -1 && alembic upgrade head
+
+  B. Service Layer ✓
+
+  File: src/mem_mcp/mindmap/service.py
+  - fetch_membership() - get membership row for a memory_id in a specific map
+  - settle_branch() - UPDATE to settle a branch with status/summary/resolver
+  - current_cursor() - get max event id for delta tracking
+  - fetch_touched_since() - get distinct memory_ids with events id > since
+  - Updated log_event() to return the inserted event id (for cursor reporting)
+  - Updated fetch_members() to return status, resolution_summary, resolved_by_party, resolved_at
+  - All queries explicitly tenant-scoped (lint_tenant_scope clean)
+
+  C. New Tool mindmap_resolve ✓
+
+  File: src/mem_mcp/mcp/tools/mindmap_resolve.py
+  - Validates inputs (summary 1..500, disposition/party literals, defaults)
+  - Resolves map + checks state=live
+  - Validates node is member of this map (not root, not another map)
+  - Checks not already settled
+  - Validates resolved_by_memory_id accessibility
+  - Settles branch in transaction + creates resolves-under/dropped-under edge if resolver provided
+  - Logs event with minimal payload (no content/summary text)
+  - Returns cursor (new max event id)
+
+  D. Updated mindmap_get with Cheap Reads ✓
+
+  File: src/mem_mcp/mcp/tools/mindmap_get.py
+  - New input fields:
+    - since: int | None (≥0) - delta mode: only members with events id > since
+    - include: Literal["open","all"] (default "open") - filter settled nodes to resolved list or keep in nodes
+    - depth: Literal["summary","full"] (default "summary") - truncate >200 chars
+  - New output:
+    - cursor: int - current max event id
+    - Added status, truncated to MindmapNode
+    - New resolved: list[MindmapResolvedBranch] for settled branches with summaries
+  - New helper function _truncate_content() for 200-char truncation with "…"
+  - Fixed open_loops to only include status=open nodes with responsible_party in {owner, model}
+  - Edges restricted to members in result set; when since is set, also include edges from/to touched members
+  - Module docstring and tool description updated
+
+  E. Constants ✓
+
+  File: src/mem_mcp/mindmap/__init__.py
+  - SUMMARY_CONTENT_CHARS = 200
+  - RESOLVES_UNDER_KIND = "resolves-under"
+  - DROPPED_UNDER_KIND = "dropped-under"
+
+  F. Tool Registration ✓
+
+  File: src/mem_mcp/main.py
+  - Imported MindmapResolveTool
+  - Registered in tools list
+
+  G. Tool Descriptions ✓
+
+  File: src/mem_mcp/mcp/tool_descriptions.py
+  - Updated mindmap_get description with cheap-read parameters
+  - Added mindmap_resolve description with settle semantics and example
+
+  H. Tests ✓
+
+  File: tests/unit/test_mindmap_resolve_models.py (18 tests)
+  - Content truncation: 199/200/201 chars, full depth
+  - Input validation: required fields, length bounds, literal types, extra=forbid, defaults
+
+  File: tests/integration/test_mindmap_resolve_e2e.py (15 tests)
+  - Resolve with resolver → status/summary/party stored, edge created, event logged
+  - Drop without resolver → no edge, status dropped
+  - Drop with resolver → dropped-under edge
+  - Error cases: unknown map, node of different map, root node, already settled, archived map
+  - Link alone does NOT settle branch
+  - open_loops: owner/model responsibility tracked; root excluded
+  - Resolved node removed from open_loops
+  - mindmap_get: settled node in resolved list with include="open", in nodes with include="all"
+  - since parameter: delta mode with touched members only
+  - depth parameter: truncation at 200 chars
+
+  Test Results ✓
+
+  tests/integration/test_mindmap_e2e.py::test_mindmap_full_lifecycle PASSED
+  tests/integration/test_mindmap_resolve_e2e.py: 15 tests PASSED
+  tests/unit/test_mindmap_resolve_models.py: 18 tests PASSED
+  ---
+  35/35 tests passing
+  Lint (ruff check): CLEAN
+  Format (ruff format): CLEAN
+  Type checking (mypy): CLEAN
+  lint_tenant_scope.py: CLEAN
+
+  No regressions in existing mindmap tests.
+
+✻ Sautéed for 7m 39s · done 11:25 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

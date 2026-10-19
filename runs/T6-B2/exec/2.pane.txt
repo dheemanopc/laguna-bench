@@ -1,0 +1,260 @@
+       907
+       863 -    async def test_invalid_cursor_raises_jsonrpc_error(self, list_tenant: Any) -> None:
+       864 -        """A malformed cursor must surface as JsonRpcError(-32602, path='cursor')."""
+       908 +    @pytest.mark.xfail(
+       909 +        strict=True,
+       910 +        reason="BUG: next_cursor encodes the (limit+1)th overflow row (rows[limit]) "
+       911 +        "instead of the last RETURNED row (rows[limit-1]), so the next page would "
+       912 +        "skip one row (list.py:228).",
+       913 +    )
+       914 +    async def test_next_cursor_encodes_last_returned_row(
+       915 +        self, list_tenant: Any
+       916 +    ) -> None:
+       917 +        """With limit+1 rows fetched, next_cursor must encode the LAST returned
+       918 +        row (rows[limit-1]), not the overflow row (rows[limit])."""
+       919          t = list_tenant
+       920 +        base = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+       921 +        async with t["pool"].acquire() as conn:
+       922 +            async with conn.transaction():
+       923 +                for i in range(3):
+       924 +                    await _insert_memory(
+       925 +                        conn, t["tenant_id"], f"item-{i}",
+       926 +                        created_at=base + timedelta(seconds=i),
+       927 +                    )
+       928 +
+       929          ctx = _build_ctx(t["pool"], t["tenant_id"], t["identity_id"])
+       867 -        with pytest.raises(JsonRpcError) as exc_info:
+       868 -            await MemoryListTool()(ctx, MemoryListInput(cursor="!!!not-base64!!!"))
+       869 -        assert exc_info.value.code == -32602
+       870 -        assert exc_info.value.message == "invalid cursor"
+       871 -        errors = exc_info.value.data["errors"]  # type: ignore[index]
+       872 -        assert len(errors) == 1
+       873 -        assert errors[0]["path"] == "cursor"
+       930 +        out = await MemoryListTool()(ctx, MemoryListInput(limit=2))
+       931 +        assert len(out.results) == 2
+       932 +        assert out.next_cursor is not None
+       933
+       934 +        # Decode the cursor and verify it points to the LAST returned row,
+       935 +        # not the overflow (3rd) row.
+       936 +        # In DESC order: item-2 (newest), item-1, item-0 (oldest).
+       937 +        # limit=2 → returns [item-2, item-1], overflow is item-0.
+       938 +        # Cursor should encode item-1 (last returned), not item-0 (overflow).
+       939 +        from mem_mcp.mcp.tools.list import _decode_cursor
+       940 +
+       941 +        iso, uuid_str = _decode_cursor(out.next_cursor)
+       942 +        last_returned = out.results[-1]
+       943 +        assert iso == last_returned.created_at.isoformat()
+       944 +        assert uuid_str == str(last_returned.id)
+       945 +
+       946      @pytest.mark.xfail(
+       947          strict=True,
+       877 -        reason="BUG: decoded cursor ISO string passed as param against timestamptz; asyncpg rejects str→timestamptz",
+       948 +        reason="BUG: ORDER BY uses 'created_at DESC, id ASC' (id defaults to ASC) but "
+       949 +        "keyset predicate '(created_at, id) < (cursor)' implies id DESC — the "
+       950 +        "tie-break direction is inverted, so ties on the sort column select wrong rows "
+       951 +        "(list.py:195-206).",
+       952      )
+       879 -    async def test_valid_cursor_continues_ordering(self, list_tenant: Any) -> None:
+       880 -        """With a valid cursor, the next page returns only later (older, desc)
+       881 -        rows and preserves ordering.
+       882 -
+       883 -        NOTE: The decoded cursor value is a Python ISO *string* which list.py
+       884 -        passes as a bare ``$param`` against ``created_at`` (timestamptz).  PG
+       885 -        rejects the type mismatch, so the second-page fetch raises.  This is a
+       886 -        real source bug (cursor value should be parsed back to ``datetime`` or
+       887 -        cast with ``::timestamptz`` in SQL).
+       888 -        """
+       953 +    async def test_tie_breaking_pagination_no_missing_or_duplicate(
+       954 +        self, list_tenant: Any
+       955 +    ) -> None:
+       956 +        """When multiple rows share the same created_at, the keyset predicate's
+       957 +        tuple comparison inverts the id tie-break direction (id ASC in ORDER BY
+       958 +        vs id DESC implied by '<'), causing missing or duplicate rows across pages."""
+       959          t = list_tenant
+       890 -        n = 40
+       960 +        base = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+       961          async with t["pool"].acquire() as conn:
+       962              async with conn.transaction():
+       893 -                for i in range(n):
+       963 +                # 6 rows all sharing created_at=base (ties)
+       964 +                for i in range(6):
+       965                      await _insert_memory(
+       895 -                        conn,
+       896 -                        t["tenant_id"],
+       897 -                        f"item-{i:03d}",
+       898 -                        created_at=datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+       899 -                        + timedelta(seconds=i),
+       966 +                        conn, t["tenant_id"], f"tied-{i}",
+       967 +                        created_at=base,
+       968                      )
+       969
+       970          ctx = _build_ctx(t["pool"], t["tenant_id"], t["identity_id"])
+       903 -        first = await MemoryListTool()(ctx, MemoryListInput(limit=25))
+       904 -        assert len(first.results) == 25
+       971 +
+       972 +        # First page: limit=4, fetch 5, return 4, overflow 5th
+       973 +        first = await MemoryListTool()(ctx, MemoryListInput(limit=4))
+       974 +        assert len(first.results) == 4
+       975          assert first.next_cursor is not None
+       976
+       977 +        # Second page should return the remaining 2 rows
+       978          second = await MemoryListTool()(
+       908 -            ctx, MemoryListInput(limit=25, cursor=first.next_cursor)
+       979 +            ctx, MemoryListInput(limit=4, cursor=first.next_cursor)
+       980          )
+       910 -        assert len(second.results) == 15
+       911 -        first_ids = {str(r.id) for r in first.results}
+       912 -        second_ids = {str(r.id) for r in second.results}
+       913 -        # No overlap between pages
+       914 -        assert first_ids.isdisjoint(second_ids)
+       915 -        # Ordering preserved (desc by created_at)
+       916 -        contents = [r.content for r in second.results]
+       917 -        assert contents == sorted(contents, reverse=True)
+       981 +        all_contents = [r.content for r in first.results] + [r.content for r in second.results]
+       982 +        assert len(all_contents) == 6
+       983 +        assert len(set(all_contents)) == 6  # no duplicates
+       984
+       985 +    async def test_invalid_cursor_raises_jsonrpc_error(self, list_tenant: Any) -> None:
+       986 +        """A malformed cursor must surface as JsonRpcError(-32602, path='cursor')."""
+       987 +        t = list_tenant
+       988 +        ctx = _build_ctx(t["pool"], t["tenant_id"], t["identity_id"])
+       989 +        with pytest.raises(JsonRpcError) as exc_info:
+       990 +            await MemoryListTool()(ctx, MemoryListInput(cursor="!!!not-base64!!!"))
+       991 +        assert exc_info.value.code == -32602
+       992 +        assert exc_info.value.message == "invalid cursor"
+       993 +        errors = exc_info.value.data["errors"]  # type: ignore[index]
+       994 +        assert len(errors) == 1
+       995 +        assert errors[0]["path"] == "cursor"
+       996
+       997 +
+       998  # ---------------------------------------------------------------------------
+       999  # Audit log row
+      1000  # ---------------------------------------------------------------------------
+
+  Thought for 7s (ctrl+o to expand)
+
+● Now let me strengthen the audit log test with exact details and the output fields test:
+
+  Thought for 4s, read 1 file (ctrl+o to expand)
+
+● Now let me strengthen the audit log test with exact details including a non-default filter case:
+
+● Update(tests/integration/test_memory_list_behaviour.py)
+  ⎿  Added 29 lines
+      1037          assert details["has_next"] is False
+      1038          assert details["filters_count"] == 3  # deleted, expired, is_current defaults
+      1039
+      1040 +    async def test_audit_details_with_non_default_filters(self, list_tenant: Any) -> None:
+      1041 +        """With type + tags + keywords filters, filters_count and result_count
+      1042 +        must be exact in the audit details."""
+      1043 +        t = list_tenant
+      1044 +        async with t["pool"].acquire() as conn:
+      1045 +            async with conn.transaction():
+      1046 +                await _insert_memory(conn, t["tenant_id"], "note about foxes", type="note", tags=["a"])
+      1047 +                await _insert_memory(conn, t["tenant_id"], "decision about foxes", type="decision", tags=["b"])
+      1048 +                await _insert_memory(conn, t["tenant_id"], "note no match", type="note", tags=["c"])
+      1049
+      1050 +        ctx = _build_ctx(t["pool"], t["tenant_id"], t["identity_id"])
+      1051 +        out = await MemoryListTool()(
+      1052 +            ctx, MemoryListInput(type="note", tags=["a"], keywords="fox")
+      1053 +        )
+      1054 +        assert len(out.results) == 1
+      1055 +
+      1056 +        async with t["pool"].acquire() as conn:
+      1057 +            row = await conn.fetchrow(
+      1058 +                "SELECT details FROM audit_log WHERE request_id = $1",
+      1059 +                ctx.request_id,
+      1060 +            )
+      1061 +        details = (
+      1062 +            json.loads(row["details"]) if isinstance(row["details"], str) else row["details"]
+      1063 +        )
+      1064 +        assert details["result_count"] == 1
+      1065 +        assert details["has_next"] is False
+      1066 +        # 3 defaults (deleted_at, expires_at, is_current) + type + tags + keywords = 6
+      1067 +        assert details["filters_count"] == 6
+      1068 +
+      1069 +
+      1070  # ---------------------------------------------------------------------------
+      1071  # Output model field surface
+      1072  # ---------------------------------------------------------------------------
+
+● Now strengthen the output fields test with non-default values asserted exactly:
+
+● Update(tests/integration/test_memory_list_behaviour.py)
+  ⎿  Added 45 lines
+      1108          assert item.indexable is True
+      1109          assert item.embedding_status == "ok"
+      1110
+      1111 +    async def test_non_default_field_values_asserted_exactly(
+      1112 +        self, list_tenant: Any
+      1113 +    ) -> None:
+      1114 +        """A memory with non-default values for every writable field must be
+      1115 +        returned with those exact values."""
+      1116 +        t = list_tenant
+      1117 +        deleted = datetime.now(tz=UTC)
+      1118 +        expires = datetime.now(tz=UTC) + timedelta(days=1)
+      1119 +        created = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+      1120 +        async with t["pool"].acquire() as conn:
+      1121 +            async with conn.transaction():
+      1122 +                mem_id = await _insert_memory(
+      1123 +                    conn,
+      1124 +                    t["tenant_id"],
+      1125 +                    "custom field content",
+      1126 +                    type="challenge",
+      1127 +                    tags=["x", "y"],
+      1128 +                    created_at=created,
+      1129 +                    updated_at=created + timedelta(hours=1),
+      1130 +                    deleted_at=deleted,
+      1131 +                    expires_at=expires,
+      1132 +                    indexable=False,
+      1133 +                    embedding_status="pending",
+      1134 +                    is_current=False,
+      1135 +                )
+      1136 +
+      1137 +        ctx = _build_ctx(t["pool"], t["tenant_id"], t["identity_id"])
+      1138 +        out = await MemoryListTool()(
+      1139 +            ctx, MemoryListInput(include_deleted=True, include_expired=True, include_history=True)
+      1140 +        )
+      1141 +        assert len(out.results) == 1
+      1142 +        item = out.results[0]
+      1143 +        assert item.id == mem_id
+      1144 +        assert item.content == "custom field content"
+      1145 +        assert item.type == "challenge"
+      1146 +        assert item.tags == ["x", "y"]
+      1147 +        assert item.version == 1
+      1148 +        assert item.is_current is False
+      1149 +        assert item.deleted_at == deleted
+      1150 +        assert item.expires_at == expires
+      1151 +        assert item.indexable is False
+      1152 +        assert item.embedding_status == "pending"
+      1153 +        assert item.created_at == created
+      1154 +        assert item.updated_at == created + timedelta(hours=1)
+      1155 +
+      1156      async def test_output_has_next_cursor_and_request_id(self, list_tenant: Any) -> None:
+      1157          t = list_tenant
+      1158          async with t["pool"].acquire() as conn:
+
+  Thought for 6s (ctrl+o to expand)
+
+● Let me run the memory_list integration tests to verify items A, C, D so far:
+
+● Bash(pytest tests/integration/test_memory_list_behaviour.py -q 2>&1 | tail -40)
+  ⎿                      tags=["x", "y"],
+                         created_at=created,
+                         updated_at=created + timedelta(hours=1),
+     … +37 lines (ctrl+o to expand)
+
+  Thought for 13s (ctrl+o to expand)
+
+● The embedding_status="pending" violates a check constraint. Let me find valid values:
+
+● Searching for 1 pattern… (ctrl+o to expand)
+  ⎿  "embedding_status_check|embedding_status.*CHECK|CHECK.*embedding"
+
+* Ionizing… (9m 42s · ↓ 49.5k tokens)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · esc to interrupt · ← for agents                                                                                                                            10% until auto-compact
+

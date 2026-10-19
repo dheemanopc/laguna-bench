@@ -1,0 +1,11 @@
+{
+  "key": "wp2-t6-peer",
+  "status": "ok",
+  "compactions": 0,
+  "rc": 0,
+  "session_id": "7a51fbcc-5d75-433f-8d0f-f66adcf710e4",
+  "wall_s": 20,
+  "ctx_max": 36612,
+  "result": "VERDICT: ISSUES\n1. `src/mem_mcp/mcp/tools/mindmap_workflow_signoff.py:50-57` (also `mindmap_workflow_cancel_move.py:46-52`): the tools pass `tenant_id=ctx.tenant_id` and `signatory_tenant_id=ctx.tenant_id` / `actor_tenant_id=ctx.tenant_id`. `sign_workflow_move` documents `tenant_id` as the team's tenant and the RLS scope, and the signatory as a different tenant. Requests and work items live under the team owner's tenant. A member in another tenant therefore opens `tenant_tx` under their own tenant and cannot see the request. Distinct-signatory sign-off and non-owner cancel don't work as designed.\n2. `tests/integration/test_mindmap_workflow_signoff_remap_e2e.py:219-228`: the \"proposer cannot sign\" check calls the tool with `env.member`'s tenant context, so RLS probably hides the request. The `-32602` is then most likely request-not-found, not the proposer-exclusion rule. The test passes for the wrong reason and doesn't prove owner/proposer exclusion or the role restriction.\n3. `tests/integration/test_mindmap_workflow_signoff_remap_e2e.py:241-257`: the `signoff_min=2` test never gets a second distinct signatory, so it never checks that two distinct signatories commit the move. No test covers owner/assignee exclusion from the count, or `signoff_roles` restriction (`role_restricted` / `not_eligible` codes).\n4. `tests/integration/test_mindmap_workflow_signoff_remap_e2e.py:260-300`: the cancel test doesn't cover the acceptance. The \"proposer may cancel own request\" case is cancelled by the owner, and a team admin (`env.admin`) is never used. The non-proposer, non-admin denial is asserted with `code in (-32602, -32603)` and is likely an RLS not-found, not the permission check. It doesn't check the code.\n5. `src/mem_mcp/mcp/tools/mindmap_workflow_remap.py:42-49`: `map_key` is accepted and written to the audit log, but never validated or used. `remap_workflow_stages` has no map parameter, so the remap runs across the whole team's items. The plan lists \"-32602 map not found\", and that error can't be raised. The test never uses a second map, so it doesn't catch this.",
+  "stderr_tail": ""
+}

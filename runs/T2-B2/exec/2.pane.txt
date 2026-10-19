@@ -1,0 +1,260 @@
+      402 +                    tenant_id=owner["tenant"],
+      403 +                    team_id=shared_team,
+      404 +                    visibility="team",
+      405 +                )
+      406
+      404 -            # Before assign_role: member has no UETA for shared_team -> denied,
+      405 -            # even though team_role_assignments says it's a member.
+      406 -            with pytest.raises(ReferenceTargetNotFoundError):
+      407 -                await resolve_reference_target(
+      407 +                # Before assign_role: member has no UETA for shared_team -> denied,
+      408 +                # even though team_role_assignments says it's a member.
+      409 +                with pytest.raises(ReferenceTargetNotFoundError):
+      410 +                    await resolve_reference_target(
+      411 +                        conn, target_uuid=m_shared, caller_user_id=member["tenant"]
+      412 +                    )
+      413 +
+      414 +                # assign_role materialises the UETA row -> now resolvable.
+      415 +                # member_kind='user' sync-refreshes UETA immediately.
+      416 +                await assign_role(
+      417 +                    conn,
+      418 +                    parent_team_id=shared_team,
+      419 +                    member_kind="user",
+      420 +                    member_id=member["tenant"],
+      421 +                    role_key="member",
+      422 +                    assigned_by_user_id=owner["tenant"],
+      423 +                )
+      424 +                resolved = await resolve_reference_target(
+      425                      conn, target_uuid=m_shared, caller_user_id=member["tenant"]
+      426                  )
+      427 +                assert UUID(str(resolved["memory_id"])) == m_shared
+      428 +                assert resolved["team_id"] == shared_team
+      429 +    finally:
+      430 +        await _cleanup(
+      431 +            pg_pool,
+      432 +            [owner["tenant"], member["tenant"]],
+      433 +            [owner["team"], member["team"], shared_team],
+      434 +        )
+      435
+      411 -            # assign_role materialises the UETA row -> now resolvable.
+      412 -            await assign_role(
+      413 -                conn,
+      414 -                parent_team_id=shared_team,
+      415 -                member_kind="user",
+      416 -                member_id=member["tenant"],
+      417 -                role_key="member",
+      418 -                assigned_by_user_id=owner["tenant"],
+      419 -            )
+      420 -            resolved = await resolve_reference_target(
+      421 -                conn, target_uuid=m_shared, caller_user_id=member["tenant"]
+      422 -            )
+      423 -            assert UUID(str(resolved["memory_id"])) == m_shared
+      424 -            assert resolved["team_id"] == shared_team
+      425 -            # Fixture left in place; rows are UUID-suffixed and tolerated per
+      426 -            # CONVENTIONS §Tests ("shared DB, tolerate leftovers").
+      436
+      428 -
+      437  # ── Case 5: check_hard_delete filtered citers, owner sees own citer ──────────
+      438
+      439
+
+  Thought for 6s (ctrl+o to expand)
+
+● Now neutralizing the remaining "WO-1:" labels in the Case 1 (uuid), Case 1 (slug), and Case 2 docstrings.
+
+● Update(tests/integration/test_references_owner_access.py)
+  ⎿  Added 1 line, removed 1 line
+      182
+      183
+      184  async def test_resolve_own_memory_uuid_path(pg_pool: Any, sdk_client_factory: Any) -> None:
+      185 -    """WO-1: a raw-SQL-provisioned owner resolves its OWN memory by UUID
+      185 +    """A raw-SQL-provisioned owner resolves its OWN memory by UUID
+      186      (the exact repro path: sdk.write -> sdk.get -> the write tool's internal
+      187      resolve_reference_target succeeds)."""
+      188      async with pg_pool.acquire() as conn:
+
+● Update(tests/integration/test_references_owner_access.py)
+  ⎿  Added 1 line, removed 1 line
+      211
+      212
+      213  async def test_resolve_own_memory_slug_tuple_path(pg_pool: Any, sdk_client_factory: Any) -> None:
+      214 -    """WO-1: a raw-SQL-provisioned owner resolves its OWN decision memory by slug-tuple."""
+      214 +    """A raw-SQL-provisioned owner resolves its OWN decision memory by slug-tuple."""
+      215      async with pg_pool.acquire() as conn:
+      216          async with conn.transaction():
+      217              setup = await _provision_user(conn, "wo1-own-slug")
+
+● Update(tests/integration/test_references_owner_access.py)
+  ⎿  Added 1 line, removed 1 line
+      250
+      251
+      252  async def test_cross_tenant_denial_matches_miss(pg_pool: Any, sdk_client_factory: Any) -> None:
+      253 -    """WO-1: a different tenant referencing an owner's personal-team memory is
+      253 +    """A different tenant referencing an owner's personal-team memory is
+      254      denied with the SAME message as a random-UUID miss (IT-08 opacity)."""
+      255      async with pg_pool.acquire() as conn:
+      256          async with conn.transaction():
+
+  Thought for 6s (ctrl+o to expand)
+
+● Let me check for any remaining "WO-1" references and scan for lines exceeding 100 chars in the test file.
+
+  Thought for 7s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Bash is blanket-denied. I'll neutralize the remaining "WO-1" labels and verify line lengths by re-reading the file (I authored it, so I can check the long lines directly).
+
+● Update(tests/integration/test_references_owner_access.py)
+  ⎿  Added 1 line, removed 1 line
+      438
+      439
+      440  async def test_hard_delete_sees_own_citer_counts_stranger(pg_pool: Any) -> None:
+      441 -    """WO-1: check_hard_delete_with_filtered_citers, for an owner with NO UETA:
+      441 +    """check_hard_delete_with_filtered_citers, for an owner with NO UETA:
+      442      own citer is accessible; a stranger's citer is counted only (inaccessible).
+      443
+      444      The HardDeleteBlockedError is allowed to propagate out of the transaction
+
+● Update(tests/integration/test_references_owner_access.py)
+  ⎿  Added 1 line, removed 1 line
+      501  async def test_refs_in_out_filter_inaccessible_keep_owner(
+      502      pg_pool: Any, sdk_client_factory: Any
+      503  ) -> None:
+      504 -    """WO-1: for a raw-SQL-provisioned owner, refs_out drops edges whose target is
+      504 +    """For a raw-SQL-provisioned owner, refs_out drops edges whose target is
+      505      an inaccessible other-tenant memory, and refs_in drops edges whose source is,
+      506      while still returning the owner's own edges."""
+      507      async with pg_pool.acquire() as conn:
+
+● Update(tests/integration/test_references_owner_access.py)
+  ⎿  Added 1 line, removed 1 line
+      581  async def test_deleted_target_rejected_opaquely(
+      582      pg_pool: Any, sdk_client_factory: Any
+      583  ) -> None:
+      584 -    """WO-1: soft-deleting the owned target must still surface as the opaque
+      584 +    """Soft-deleting the owned target must still surface as the opaque
+      585      'not found or not accessible' error at both the domain and SDK layers."""
+      586      async with pg_pool.acquire() as conn:
+      587          async with conn.transaction():
+
+  Thought for 4s (ctrl+o to expand)
+
+● Let me re-read the full test file to verify line lengths and overall coherence.
+
+  Thought for 1m 59s, read 1 file (ctrl+o to expand)
+
+● The file is coherent. I spotted two lines that exceed ruff's 100-char limit: the module docstring line 1 (124 chars) and Case 7's _insert_memory_direct call kwargs (line 590, ~103 chars). Also, I should match the
+  existing test-annotation convention for pg_pool/sdk_client_factory rather than Any. Let me check how existing tests annotate these fixtures.
+
+  Thought for 14s, searched for 2 patterns (ctrl+o to expand)
+
+● Existing tests use pg_pool: Any — my annotations match. Let me confirm how sdk_client_factory is annotated elsewhere to match exactly, then fix the two over-length lines.
+
+  Thought for 48s, searched for 1 pattern (ctrl+o to expand)
+
+● Both confirmed: sdk_client_factory: Any is the convention (matches conftest.py and the repro test). Now fixing the two over-length lines — the module docstring summary (line 1) and Case 7's kwargs (line 590).
+
+● Update(tests/integration/test_references_owner_access.py)
+  ⎿  Added 1 line, removed 1 line
+      1 -"""Regression tests for the reference-access incident: memory_not_accessible on a raw-SQL-provisioned user's own memory.
+      1 +"""Reference-access incident: a raw-SQL-provisioned owner is denied its own memory.
+      2
+      3  A user provisioned the "natural" backfill way (tenant + personal team + owner
+      4  assignment + primary identity, with NO `assign_role` call and therefore NO
+
+● Update(tests/integration/test_references_owner_access.py)
+  ⎿  Added 4 lines, removed 1 line
+      587          async with conn.transaction():
+      588              owner = await _provision_user(conn, "wo1-del-target")
+      589              target = await _insert_memory_direct(
+      590 -                conn, tenant_id=owner["tenant"], team_id=owner["team"], content="target soon deleted"
+      590 +                conn,
+      591 +                tenant_id=owner["tenant"],
+      592 +                team_id=owner["team"],
+      593 +                content="target soon deleted",
+      594              )
+      595
+      596      sdk_owner = sdk_client_factory(tenant_id=owner["tenant"], plugin_id=_PLUGIN_ID)
+
+  Thought for 1m 1s (ctrl+o to expand)
+
+● Before finalizing, I need to resolve a discrepancy: work order #2's verification references tests/integration/test_references_own_memory_repro.py, but the starting git status only listed
+  test_references_owner_access.py. Let me check whether the repro file exists (possibly as an unmodified tracked baseline file) or is missing.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Bash(git -C ~/laguna-bench/runs/T2-B2/repo ls-files tests/integration/ | grep -i repro; echo "---"; git -C ~/laguna-bench/runs/T2-B2/repo show HE…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 12s (ctrl+o to expand)
+
+● The Glob confirms test_references_own_memory_repro.py exists on disk (a pre-existing tracked baseline file, unmodified, hence absent from git status). Good — I don't create it. Bash remains denied. Let me read the
+  repro to confirm my fix addresses its exact provisioning scenario.
+
+  Thought for 20s, read 1 file (ctrl+o to expand)
+
+● The repro confirms my fix targets its exact scenario (raw backfill provisioning, NO UETA → owner branch now resolves). It needs no changes.
+
+  One real risk to verify: my _insert_memory_direct omits source_client_id. If that column is NOT NULL without a default, those direct inserts would fail. Let me check the memories schema and re-read the final migration
+  file.
+
+  Searched for 2 patterns (ctrl+o to expand)
+
+● Bash is unavailable (permission denied)
+
+  Bash is denied in this sandbox ("don't ask mode"), so I could not execute alembic upgrade head, pytest, ruff check, or mypy. I attempted and it was refused. I proceeded to make the code fixes anyway (per the order).
+
+  Code fixes (all applied)
+
+  1. Migration docstring (alembic/versions/0035_.../0035_2026_06_01_memory_accessible_to.py): "PL/pgSQL" → "SQL" (the function is LANGUAGE sql), and dropped the "Incident WO-1" label — now "Reference-access incident: …".
+  Confirmed down_revision="0034_safe_current_tenant_id", GRANT EXECUTE … TO mem_app, and that memory_accessible_to is only invoked at the four intended call sites.
+
+  2. Test file (tests/integration/test_references_owner_access.py):
+  - Module docstring first line shortened to ≤100 chars (was 124 — an E501).
+  - Case 3 (test_null_team_memory_not_referenceable_cross_tenant): removed the unused sdk_owner (F841) and dropped the now-unneeded sdk_client_factory fixture param.
+  - Case 4: wrapped the whole body in try/finally with await _cleanup(pg_pool, [owner["tenant"], member["tenant"]], [owner["team"], member["team"], shared_team]), so it no longer leaks fixtures.
+  - _cleanup now explicitly deletes user_effective_team_access WHERE resource_team_id = ANY($1) (robust regardless of FK cascade) and all await conn.execute(...) lines are wrapped to ≤100 chars.
+  - Replaced every "WO-1" label in docstrings/comments with a neutral description.
+  - Case 7's over-length kwargs line wrapped to ≤100.
+  - Annotations kept as pg_pool: Any, sdk_client_factory: Any, matching conftest.py / test_references_own_memory_repro.py.
+
+  Verification status
+
+  Could not run (Bash denied). I cannot produce the exact pytest/ruff/mypy output the order asks for. What verification I performed is static:
+
+  - tests/integration/test_references_own_memory_repro.py exists on disk (tracked baseline, unmodified) — its test_citing_my_own_readable_memory_succeeds is exactly the scenario my fix targets: raw-backfill provisioning
+    (no UETA) → sdk.write citing own memory. With resolve_reference_target now using memory_accessible_to($2, id) where m.tenant_id = p_user_id (owner branch), M1 resolves and the cite write succeeds. The repo's only
+    _provision_user_like_backfill reference is in this repro (confirmed unique).
+  - source_client_id is nullable (0001 schema: source_client_id TEXT REFERENCES oauth_clients(id) with no NOT NULL), and the unit _seed helper inserts memories with the identical column list my _insert_memory_direct uses
+    — so direct inserts in cases 2/3/5/7 are valid.
+  - write.py (unchanged) already passes caller_user_id=ctx.tenant_id to resolve_reference_target (confirmed at line 286) and does not call check_hard_delete_with_filtered_citers anywhere in src/ — so making that
+    parameter required breaks no call site.
+  - tests/unit/test_references_helpers.py is call-site-compatible: it passes caller_user_id=… to resolve_reference_target and check_hard_delete_with_filtered_citers, and calls get_inbound_refs/get_outbound_refs without
+    caller_user_id (the backwards-compatible no-caller branch I preserved).
+  - teams/references.py remains on the lint_tenant_scope.py exemption; refs_in.py/refs_out.py now contain zero per-tenant SQL (they delegate to the helpers with an explicit caller_user_id).
+
+  Remaining runtime steps (require Bash — for you/grader)
+
+  MEM_MCP_DB_MAINT_DSN="$MEM_MCP_DB_MAINT_DSN" python -m alembic upgrade head
+  alembic current                       # expect 0035_memory_accessible_to (head)
+  MEM_MCP_TEST_DSN="$MEM_MCP_TEST_DSN" python -m pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py
+  MEM_MCP_TEST_DSN="$MEM_MCP_TEST_DSN" python -m pytest -q -p no:cacheprovider tests/integration/test_references_owner_access.py tests/integration/test_references_integration.py
+  tests/integration/test_plugin_memory_client_it08.py tests/unit/test_references_helpers.py tests/unit/test_lint_tenant_scope.py tests/unit/test_spec2_slug_lookup.py
+  MEM_MCP_TEST_DSN="$MEM_MCP_TEST_DSN" python -m pytest -q -p no:cacheprovider tests     # (4) full suite
+  git stash -u && MEM_MCP_TEST_DSN="$MEM_MCP_TEST_DSN" python -m pytest -q -p no:cacheprovider tests; git stash pop   # (5) baseline
+  ruff check src tests && mypy      # (6)
+
+  Until alembic upgrade head runs, the four call sites raise function memory_accessible_to(uuid, uuid) does not exist. I did not modify write.py (opaque envelope byte-identical) and did not touch any pre-existing test.
+
+  Files changed: alembic/versions/0035_2026_06_01_memory_accessible_to.py (docstring word fix), tests/integration/test_references_owner_access.py (the fixes above). The order-1 changes to references.py, refs_in.py,
+  refs_out.py, and the migration body remain as delivered.
+
+✻ Sautéed for 13m 0s · done 11:50 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+

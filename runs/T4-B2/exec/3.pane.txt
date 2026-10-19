@@ -1,0 +1,260 @@
+      77          # --- Phase 1: validation reads (read-only tenant_tx). -------------------
+      78          # Resolve team + map, assert live, validate node membership. A failure
+
+● Update(src/mem_mcp/mcp/tools/mindmap_resolve.py)
+  ⎿  Error editing file
+
+  Thought for 10s (ctrl+o to expand)
+
+● Phase-1 block didn't match (line numbers shifted after Edit A). Re-read the current file:
+
+  Thought for 8s, read 1 file (ctrl+o to expand)
+
+● Now I see the exact content (the # Resolving node… comment sat between the assert and the if). Re-applying the Phase-1 edit with exact text:
+
+● Update(src/mem_mcp/mcp/tools/mindmap_resolve.py)
+  ⎿  Added 3 lines, removed 5 lines
+      128                          ]
+      129                      },
+      130                  )
+      131 -            will_resolve_with_edge = inp.resolved_by_memory_id is not None
+      132 -            if will_resolve_with_edge:
+      133 -                assert inp.resolved_by_memory_id is not None
+      131 +            if resolver_id is not None:
+      132                  # Resolving node must be a distinct member of the same map.
+      135 -                if inp.resolved_by_memory_id == inp.node_id:
+      133 +                if resolver_id == inp.node_id:
+      134                      raise JsonRpcError(
+      135                          -32602,
+      136                          "resolved_by_memory_id must differ from node_id",
+     ...
+      138                      )
+      139                  resolver_mem = await service.get_membership(
+      140                      conn,
+      143 -                    memory_id=inp.resolved_by_memory_id,
+      141 +                    memory_id=resolver_id,
+      142                      root_memory_id=root_id,
+      143                      tenant_id=ctx.tenant_id,
+      144                  )
+
+  Thought for 9s (ctrl+o to expand)
+
+● Phase-1 done. Re-read Phase 2 + Phase 3 to get current exact text for the remaining edits:
+
+  Thought for 42s, read 1 file (ctrl+o to expand)
+
+● Now the four remaining will_resolve_with_edge references — Phase 2 guard, Phase-3 block A (re-check), Phase-3 block B (edge write), and the payload reference_kind. These are independent, non-overlapping string matches,
+  so I'll batch them:
+
+● Update(src/mem_mcp/mcp/tools/mindmap_resolve.py)
+  ⎿  Added 1 line, removed 1 line
+      153          # Mirror mindmap_link: resolve the edge target to get its team_id,
+      154          # mapping ReferenceTargetNotFoundError opaquely. May run before the
+      155          # write tx.
+      156 -        if will_resolve_with_edge:
+      156 +        if resolver_id is not None:
+      157              async with system_tx(ctx.db_pool) as sys_conn:
+      158                  try:
+      159                      resolved = await resolve_reference_target(
+
+● Update(src/mem_mcp/mcp/tools/mindmap_resolve.py)
+  ⎿  Added 3 lines, removed 4 lines
+      196                      data={"code": "map_not_live"},
+      197                  )
+      198              # Resolver, if given, must still be a distinct member of this map.
+      199 -            if will_resolve_with_edge:
+      200 -                assert inp.resolved_by_memory_id is not None
+      201 -                if inp.resolved_by_memory_id == inp.node_id:
+      199 +            if resolver_id is not None:
+      200 +                if resolver_id == inp.node_id:
+      201                      raise JsonRpcError(
+      202                          -32602,
+      203                          "resolved_by_memory_id must differ from node_id",
+     ...
+      205                      )
+      206                  resolver_mem = await service.get_membership(
+      207                      conn,
+      209 -                    memory_id=inp.resolved_by_memory_id,
+      208 +                    memory_id=resolver_id,
+      209                      root_memory_id=root_id,
+      210                      tenant_id=ctx.tenant_id,
+      211                  )
+
+● Update(src/mem_mcp/mcp/tools/mindmap_resolve.py)
+  ⎿  Added 3 lines, removed 2 lines
+      241                          ]
+      242                      },
+      243                  )
+      244 -            if will_resolve_with_edge:
+      244 +            if resolver_id is not None:
+      245 +                assert resolver_id is not None
+      246                  assert edge_target_memory_id is not None
+      247                  assert edge_target_team_id is not None
+      248                  await insert_reference(
+      249                      conn,
+      249 -                    source_memory_id=inp.resolved_by_memory_id,
+      250 +                    source_memory_id=resolver_id,
+      251                      target_memory_id=edge_target_memory_id,
+      252                      target_team_id=edge_target_team_id,
+      253                      reference_kind=edge_kind,
+
+● Update(src/mem_mcp/mcp/tools/mindmap_resolve.py)
+  ⎿  Added 1 line, removed 1 line
+      264                      "resolved_by_memory_id": str(inp.resolved_by_memory_id)
+      265                      if inp.resolved_by_memory_id
+      266                      else None,
+      267 -                    "reference_kind": edge_kind if will_resolve_with_edge else None,
+      267 +                    "reference_kind": edge_kind if resolver_id is not None else None,
+      268                  },
+      269              )
+      270
+
+  Thought for 48s (ctrl+o to expand)
+
+● Verifying no stray will_resolve_with_edge remains and resolver_id is consistent:
+
+  Thought for 33s, searched for 1 pattern (ctrl+o to expand)
+
+● Only the descriptive comment at line 74 mentions the old name — all code paths use resolver_id. Now Work Order 3, item 2 — attempt the verification commands once (direct executables, which worked earlier for
+  pytest/alembic):
+
+● Bash(ruff check src tests 2>&1 | tail -30; echo "=== RUFF EXIT ${PIPESTATUS[0]} ===")
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Bash(ruff format --check src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mindmap/service.py tests/integration/test_mindmap_resolve_e2e.py alembic/versions/0044_…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Bash(mypy 2>&1 | tail -30; echo "=== MYPY EXIT ${PIPESTATUS[0]} ===")
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Bash(pytest -q -p no:cacheprovider tests/unit/test_mindmap_resolve_unit.py tests/integration/test_mindmap_resolve_e2e.py tests/integration/test_mindmap_e2e.py tests/…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 41s (ctrl+o to expand)
+
+● All four commands refused by the sandbox (don't-ask mode blocks external-executable Bash; only builtins like echo run). Per Work Order 3 item 2's fallback, I'll do the manual static review. First, scan all touched
+  files for lines >100 cols and any leftover type: ignore / unused imports:
+
+  Thought for 7s, searched for 4 patterns (ctrl+o to expand)
+
+● No long lines anywhere. Now check for any type: ignore comments in touched src files and confirm the import block is clean:
+
+  Thought for 34s, searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● mindmap_resolve.py has no type:ignore/unused imports; service.py only retains the pre-existing baseline import asyncpg  # type: ignore[import-untyped] (needed — no stubs). Now check the migration 0044 CHECK formatting
+  against ruff format style — alembic ran it fine, but format --check may want consistent indentation. Re-read the migration's long CHECK constraints to match their style:
+
+  Thought for 7s, read 1 file (ctrl+o to expand)
+
+● Migration formatting is consistent (12-space indented adjacent string literals, matching the neighboring CHECK constraints). Final read of the full Phase-2/Phase-3 to confirm coherence after all edits:
+
+  Thought for 47s, read 1 file (ctrl+o to expand)
+
+● The Phase-2/Phase-3 flow is coherent and behavior-preserving after the resolver_id refactor: resolved is only referenced inside its own if resolver_id is not None: block (lines 170–171), so it can never be unbound;
+  resolver_id is always guarded by is not None (+ the assert at 245 for post-call mypy narrowing); edge_target_* are gated by asserts in the same block. No will_resolve_with_edge remains in code (only the descriptive
+  comment at line 74).
+
+  The sandbox's don't-ask mode is now blocking all external-executable Bash (even the direct pytest/ruff/mypy invocations that ran earlier this session), and only shell builtins execute — so I cannot re-execute the
+  gates. Per Work Order 3's instruction not to spend turns retrying, here is the final state.
+
+  ---
+
+  Work Order 3 — final report
+
+  Changes this turn
+
+  src/mem_mcp/mcp/tools/mindmap_resolve.py — P1/P2/P3 type-narrowing refactor (WO3 item 1):
+  - Replaced the will_resolve_with_edge = inp.resolved_by_memory_id is not None bool (a UUID | None value that mypy can't carry across the Phase-3 insert_reference call site) with a single local resolver_id: UUID | None
+    = inp.resolved_by_memory_id declared at the top of __call__, and branched on if resolver_id is not None: in all four sites (Phase-1 validator, Phase-2 resolver, Phase-3 re-check, Phase-3 edge write, payload
+    reference_kind).
+  - insert_reference(source_memory_id=...) now receives the narrowed resolver_id: UUID (guarded by if … is not None: plus an assert resolver_id is not None for post-set_branch_status-call mypy narrowing), instead of the
+    UUID | None inp.resolved_by_memory_id that previously produced the :139 arg-type class of error.
+  - Removed the now-redundant assert inp.resolved_by_memory_id is not None in Phase 1 and Phase-3 block A (the if resolver_id is not None: narrows). Phase-1 fail-fast checks preserved; race-safe Phase-3 lock/re-check
+    (from WO2) preserved.
+  - resolved (Phase 2) is only ever referenced inside its own if resolver_id is not None: block → cannot be referenced unbound.
+
+  Static review (ruff/mypy/pytest could not be executed — see below)
+
+  Manual scan of every file created/changed, per WO3 item 2's fallback:
+
+  ┌────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │             Check              │                                                                                       Result                                                                                       │
+  ├────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Lines >100 cols (^.{101,}      │ none                                                                                                                                                                               │
+  │ across all 4 files)            │                                                                                                                                                                                    │
+  ├────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │                                │ none — mindmap_resolve.py imports: ClassVar, Literal, UUID, BaseModel, ConfigDict, Field, system_tx, tenant_tx, JsonRpcError, TOOL_DESCRIPTIONS, BaseTool, ToolContext,            │
+  │ Unused imports (ruff F401)     │ resolve_team_id, BRANCH_STATUS_DROPPED, REFERENCE_KIND_DROPPED_UNDER, REFERENCE_KIND_RESOLVES_UNDER, service, ReferenceTargetNotFoundError, insert_reference,                      │
+  │                                │ resolve_reference_target — all referenced; 4 new tests reuse already-imported names (no new imports)                                                                               │
+  ├────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Import sorting (isort: stdlib  │                                                                                                                                                                                    │
+  │ / third-party / first-party    │ correct on all touched files (e.g. mindmap_resolve.py: typing/uuid → pydantic → mem_mcp.{db,mcp,teams})                                                                            │
+  │ mem_mcp)                       │                                                                                                                                                                                    │
+  ├────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ UUID | None passed where UUID  │ none — resolver_id is always guarded before insert_reference/get_membership; edge_target_* gated by asserts; set_branch_status(resolved_by_memory_id=…) already accepts UUID |     │
+  │ required                       │ None                                                                                                                                                                               │
+  ├────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ Unused # type: ignore          │ none — mindmap_resolve.py has zero; service.py retains only the pre-existing baseline import asyncpg  # type: ignore[import-untyped] (needed: asyncpg has no stubs)                │
+  └────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Mypy accounting (baseline 5 → now 3, reasoned): the two fixes from WO2 remain in place — mindmap_resolve.py:139 arg-type (resolved via the Phase-1 assert/now the if resolver_id is not None: narrowing) and
+  mindmap_get.py:75 assignment (the _INCLUDE_OPEN: Literal["open"] annotation). The three remaining are pre-existing no-any-return on asyncpg fetchval in service.resolve_map_root (:65), service.find_live_map_seeded_from
+  (:76), and _mindmap_common.resolve_team_id (:36) — code outside this work order that the prior session's silencing ignores were reverted from (per WO2's "don't touch pre-existing code to silence pre-existing mypy
+  errors"). The new code (lock_map_state isinstance-narrowed, set_branch_status → bool via bool(...) mirroring current_cursor's int(...) idiom, the Phase-3 str|None→str narrowing after the is None guard) introduces no
+  new errors and no new type: ignore. Baseline 5 → now 3.
+
+  Ruff format --check: migration 0044's split resolution_summary_len CHECK now uses 12-space-indented adjacent string literals, matching the neighboring status_check / status_consistency CHECK blocks exactly (lines
+  91–102). No format divergence introduced.
+
+  What executed (sandbox-permitted, in this session, post all Round-2/3 edits)
+
+  ┌───────────────────────────────────────────────────────────────────────────────┬───────────┐
+  │                                    Command                                    │  Result   │
+  ├───────────────────────────────────────────────────────────────────────────────┼───────────┤
+  │ alembic upgrade head                                                          │ exit 0    │
+  ├───────────────────────────────────────────────────────────────────────────────┼───────────┤
+  │ mindmap subset (unit resolve + e2e resolve + e2e mindmap + lint-tenant-scope) │ 52 passed │
+  ├───────────────────────────────────────────────────────────────────────────────┼───────────┤
+  │ 4 new WO3-tests in isolation                                                  │ 4 passed  │
+  └───────────────────────────────────────────────────────────────────────────────┴───────────┘
+
+  That 52-passed subset run was before the final resolver_id refactor in this turn; the refactor is strictly behavior-preserving (will_resolve_with_edge ≡ resolver_id is not None, with resolver_id bound to exactly
+  inp.resolved_by_memory_id once), and the only added statement is a runtime-never-firing assert inside an already-true guard, so the green result holds.
+
+  What could NOT execute (sandbox don't-ask mode)
+
+  After the subset green run, the sandbox escalated to denying all external-executable Bash (ruff check src tests, ruff format --check …, mypy, and pytest …); only shell builtins (echo) still run. I attempted each once
+  directly (not just via python -m, which is also blocked) and each was refused, so exact ruff/mypy/full-suite output is unavailable this turn. Per WO3's instruction not to spend turns retrying under a hard refusal, I
+  stopped and completed the manual static review above. To get exact counts, run in your non-don't-ask environment:
+  ruff check src tests
+  ruff format --check src/mem_mcp/mcp/tools/mindmap_resolve.py src/mem_mcp/mindmap/service.py tests/integration/test_mindmap_resolve_e2e.py alembic/versions/0044_2026_10_15_mindmap_branch_status.py
+  mypy
+  pytest -q -p no:cacheprovider            # confirm pre-existing failure set unchanged, zero mindmap tests failing
+
+  Left open / assumptions
+
+  - The full-suite "failing set contains no mindmap test" claim rests on the 52/52 green mindmap subset (the entire mindmap surface: resolve unit, resolve e2e incl. the 4 new tests, mindmap e2e, tenant-scope lint) plus
+    the fact that no non-mindmap code was modified this turn (only mindmap_resolve.py, service.py, migration 0044, and the resolve e2e test file).
+  - The three residual mypy no-any-return sites are intentionally left as pre-existing; fixing them would touch code outside the work order's scope and the WO2 directive was to report rather than silence.
+
+  Files changed this turn: src/mem_mcp/mcp/tools/mindmap_resolve.py (the resolver_id refactor).
+
+✻ Worked for 14m 24s · done 12:21 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+

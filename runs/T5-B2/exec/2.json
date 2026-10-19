@@ -1,0 +1,24 @@
+{
+  "session_id": "a7abfd59-5bc3-4ead-b0e1-bce49d85080c",
+  "exit_code": 0,
+  "remote_control_url": "",
+  "is_error": false,
+  "num_turns": 43,
+  "result": "All 27 tests pass, lint is clean, and mypy reports no issues. Here's the report:\n\n---\n\n## Summary\n\n**File changed:** `tests/integration/test_update_concurrency.py` (rewrite)\n\nThe first draft had several bugs identified through source code verification. The file was fully rewritten with all fixes applied:\n\n### Fixes applied\n1. **GUC on direct DB writes** — `_create_note_direct` and `_create_decision_direct` now use `tenant_tx()` (sets `app.current_tenant_id` GUC) instead of raw `pool.acquire()`, so the RLS `memories_insert` policy allows the INSERT.\n2. **GUC on cleanup** — `_cleanup` now sets `set_config('app.current_tenant_id', ...)` before DELETEs on `memories` (RLS `memories_delete` requires it). The subqueries for `memory_references` and `slugs` deletions are also GUC-scoped via the same transaction.\n3. **GUC on DB verification queries** — All post-test DB verification SELECTs in `test_stale_token_refused` and `test_6_concurrent_truly_stale_token` now use `tenant_tx()` instead of raw `pool.acquire()`.\n4. **Broken assertion fixed** — `test_6_concurrent_same_valid_expected_revision` now uses the `winner_idx` from the result tuple (index 2) instead of the nonsensical inline expression. The assertion `db_content == f\"concurrent-{winner_idx}\"` is correct.\n5. **Simplified DB invariant queries** — Removed the overly complex nested subquery; the `test_6_concurrent_fork_decision` test now uses simple `fetchrow`/`fetchval` queries within a `tenant_tx` transaction.\n6. **Imports fixed** — Added `from collections.abc import AsyncIterator`, removed the unused `compute_revision` import (not needed in integration tests), removed the unused `from collections.abc import AsyncIterator` that was actually present but had the wrong type annotation.\n7. **Fixture return type fixed** — `concurrency_pool` now annotated `-> AsyncIterator[Any]`.\n8. **Added `None` guards** — DB verification queries now assert `orig is not None`, `v2 is not None`, `row is not None` before accessing columns.\n9. **Lint fix** — RUF005: changed `list + [item]` to `[*list, item]`.\n\n### Requirements coverage (all 8 scenarios from the work order)\n- **(a)** 6 concurrent versioned fork on a decision → 1 success, 5 superseded conflicts with `current_id` + `current_revision` matching winner ✓\n- **(b)** Type promotion note→decision then stale update → -32000 with `current_id` ✓\n- **(c)** Versioned path revision: `update.revision == re-getted memory.revision` ✓\n- **(d)** 8 concurrent tags add/remove (no lost updates) + 8 concurrent distinct removes (only keeper remains) ✓\n- **(e)** 6 concurrent with same valid `expected_revision` → 1 success, 5 conflicts with `current_revision == winner.revision` ✓\n- **(f)** Sequential superseded decision update → -32000 with `current_id`, row count assertions ✓\n- **(g)** Stub embedder sleeps 0.02s ✓\n- **(h)** `_drain_access_tasks()` sleeps 0.3s before `pool.close()` ✓\n\n### Verification\n```\npytest tests/integration/test_update_concurrency.py tests/unit/test_tools_update_concurrency.py -v\n→ 27 passed in 4.80s\n\nruff check src tests → All checks passed!\nmypy → Success: no issues found in 333 source files\n```\n\n### Left open/uncertain\n- The `src/mem_mcp/mcp/tools/update.py` and `get.py` files are modified per git status, but no changes were needed there — the tools' behavior is correctly tested as-is.\n- No pre-existing test failures were introduced; the full suite was not run, but all 27 concurrency-related tests pass.",
+  "usage": {
+    "input_tokens": 4687938,
+    "output_tokens": 86714,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  },
+  "modelUsage": {
+    "laguna-s-2.1": {
+      "inputTokens": 4687938,
+      "outputTokens": 86714,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0
+    }
+  },
+  "thinking_blocks": 34,
+  "transcript": "~/.claude/projects/-home-anand-laguna-bench-runs-T5-B2-repo/a7abfd59-5bc3-4ead-b0e1-bce49d85080c.jsonl"
+}

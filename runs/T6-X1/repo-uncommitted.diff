@@ -1,0 +1,4959 @@
+diff --git a/tests/integration/test_memory_list_behaviour.py b/tests/integration/test_memory_list_behaviour.py
+new file mode 100644
+index 0000000..76f4ed1
+--- /dev/null
++++ b/tests/integration/test_memory_list_behaviour.py
+@@ -0,0 +1,1953 @@
++# mypy: disable-error-code="attr-defined"
++# BaseTool.__call__ is declared to return BaseModel, so mypy cannot see the
++# concrete output models' fields. Suppressed at module level; the assertions
++# themselves are what give these tests value.
++"""Behaviour integration tests for memory_list tool.
++
++These tests exercise the real Postgres database with tenant isolation,
++verifying filtering, pagination, and output behavior.
++
++Uses the pg_pool fixture and sets up tenant + team + identity + oauth_client
++per test following the test_mindmap_e2e.py pattern.
++"""
++
++from __future__ import annotations
++
++from collections.abc import AsyncIterator
++from datetime import UTC, datetime, timedelta
++from typing import Any
++from unittest.mock import MagicMock
++from uuid import UUID, uuid4
++
++import pytest
++
++from mem_mcp.audit.logger import NoopAuditLogger
++from mem_mcp.db.tenant_tx import system_tx
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tools._base import ToolContext
++from mem_mcp.mcp.tools._deps import NoopQuotas, ToolDeps
++from mem_mcp.mcp.tools.list import MemoryListInput, MemoryListTool
++
++# --------------------------------------------------------------------------
++# Test helpers
++# --------------------------------------------------------------------------
++
++
++class RecordingAuditLogger:
++    """Audit logger that records calls for verification."""
++
++    def __init__(self) -> None:
++        self.calls: list[dict[str, Any]] = []
++
++    async def audit(
++        self,
++        conn: Any,
++        *,
++        action: str,
++        result: str,
++        tenant_id: UUID,
++        identity_id: str | None = None,
++        client_id: str | None = None,
++        target_id: Any = None,
++        target_kind: str | None = None,
++        ip_address: str | None = None,
++        user_agent: str | None = None,
++        request_id: str | None = None,
++        error_code: str | None = None,
++        details: dict[str, Any] | None = None,
++    ) -> None:
++        self.calls.append(
++            {
++                "action": action,
++                "result": result,
++                "tenant_id": tenant_id,
++                "identity_id": identity_id,
++                "client_id": client_id,
++                "target_id": target_id,
++                "target_kind": target_kind,
++                "ip_address": ip_address,
++                "user_agent": user_agent,
++                "request_id": request_id,
++                "error_code": error_code,
++                "details": details,
++            }
++        )
++
++
++def _build_ctx(
++    pool: Any,
++    tenant_id: UUID,
++    identity_id: UUID,
++    request_id: str,
++    client_id: str = "test-client",
++    deps: ToolDeps | None = None,
++) -> ToolContext:
++    """Build a ToolContext with real DB pool."""
++    if deps is None:
++        deps = ToolDeps(
++            embeddings=MagicMock(),
++            audit=NoopAuditLogger(),
++            quotas=NoopQuotas(),
++        )
++    return ToolContext(
++        request_id=request_id,
++        tenant_id=tenant_id,
++        identity_id=identity_id,
++        client_id=client_id,
++        scopes=frozenset(["memory.read"]),
++        db_pool=pool,
++        deps=deps,
++    )
++
++
++async def insert_memory(
++    pool: Any,
++    tenant_id: UUID,
++    content: str,
++    team_id: UUID | None = None,
++    created_at: datetime | None = None,
++    updated_at: datetime | None = None,
++    type: str = "note",
++    tags: list[str] | None = None,
++    indexable: bool = True,
++    parent_id: UUID | None = None,
++) -> UUID:
++    """Insert a memory row for testing. Returns the new memory ID."""
++    now = datetime.now(tz=UTC)
++    created = created_at or now
++    updated = updated_at or now
++    tag_list = tags or []
++    parent_val = parent_id
++
++    async with system_tx(pool) as conn:
++        mem_id = await conn.fetchval(
++            """
++            INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, tags, created_at, updated_at, visibility, indexable, parent_id)
++            VALUES ($1, $2, $3, encode(digest($3, 'sha256'), 'hex'), array_fill(0::real, ARRAY[1024])::vector, 'api', $4, $5, $6, $7, 'team', $8, $9)
++            RETURNING id
++            """,
++            tenant_id,
++            team_id,
++            content,
++            type,
++            tag_list,
++            created,
++            updated,
++            indexable,
++            parent_val,
++        )
++    assert mem_id is not None
++    return UUID(str(mem_id))
++
++
++# --------------------------------------------------------------------------
++# Test fixtures
++# --------------------------------------------------------------------------
++
++
+<email>
++async def list_setup(pg_pool: Any) -> AsyncIterator[dict[str, Any]]:
++    """Set up tenant, team, identity, and oauth_client for testing."""
++    from mem_mcp.teams.assignments import assign_role
++
++    tenant_id = uuid4()
++    team_id = uuid4()
++    identity_id = uuid4()
++    client_id = f"client:tenant-{tenant_id.hex[:8]}"
++
++    async with system_tx(pg_pool) as conn:
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            tenant_id,
++            f"tenant-test-{tenant_id.hex[:8]}@test.invalid",
++        )
++        await conn.execute(
++            "INSERT INTO teams (id, name, created_by_tenant_id) VALUES ($1, $2, $3)",
++            team_id,
++            f"team-test-{tenant_id.hex[:8]}",
++            tenant_id,
++        )
++        await assign_role(
++            conn,
++            parent_team_id=team_id,
++            member_kind="user",
++            member_id=tenant_id,
++            role_key="member",
++            assigned_by_user_id=tenant_id,
++        )
++        await conn.execute(
++            """
++            INSERT INTO tenant_identities
++            (id, tenant_id, cognito_sub, provider, email, is_primary, default_team_id)
++            VALUES ($1, $2, $3, $4, $5, true, $6)
++            """,
++            identity_id,
++            tenant_id,
++            f"sub-{tenant_id.hex[:8]}",
++            "cognito",
++            f"tenant-test-{identity_id.hex[:8]}@test.invalid",
++            team_id,
++        )
++        await conn.execute(
++            """
++            INSERT INTO oauth_clients
++            (id, redirect_uris, scope, registration_payload, review_status)
++            VALUES ($1, ARRAY[]::text[], 'memory.read memory.write', '{}'::jsonb, 'auto_allowed')
++            """,
++            client_id,
++        )
++
++    yield {
++        "tenant_id": tenant_id,
++        "team_id": team_id,
++        "identity_id": identity_id,
++        "client_id": client_id,
++    }
++
++    # Cleanup
++    async with system_tx(pg_pool) as conn:
++        await conn.execute("DELETE FROM memories WHERE tenant_id = $1", tenant_id)
++        await conn.execute(
++            "DELETE FROM team_role_assignments WHERE parent_team_id = $1", team_id
++        )
++        await conn.execute(
++            "DELETE FROM tenant_identities WHERE tenant_id = $1", tenant_id
++        )
++        await conn.execute("DELETE FROM teams WHERE id = $1", team_id)
++        await conn.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
++        await conn.execute("DELETE FROM oauth_clients WHERE id = $1", client_id)
++
++
++# --------------------------------------------------------------------------
++# Tenant isolation tests
++# --------------------------------------------------------------------------
++
++
++class TestTenantIsolation:
++    """Test that memories are isolated by tenant."""
++
++    @pytest.mark.asyncio
++    async def test_tenant_filter_isolation(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Memories from different tenants should not mix."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert memory in tenant A
++        mem_a = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="tenant A memory", team_id=team_id
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-tenant-iso"
++        )
++
++        result = await tool(ctx, MemoryListInput(limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert mem_a in result_ids
++
++
++# --------------------------------------------------------------------------
++# Tags filter tests (AND semantics)
++# --------------------------------------------------------------------------
++
++
++class TestTagsFilter:
++    """Test tags filtering with AND semantics."""
++
++    @pytest.mark.asyncio
++    async def test_single_tag_filter(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Memories with the requested tag should be returned."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="Memories with the requested tag should be returned.",
++            team_id=team_id,
++            tags=["important"],
++        )
++        await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="Memories without the tag should not be returned.",
++            team_id=team_id,
++            tags=["other"],
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-tag-filter"
++        )
++
++        result = await tool(ctx, MemoryListInput(tags=["important"], limit=10))
++
++        assert len(result.results) == 1
++        assert "requested tag" in result.results[0].content
++
++    @pytest.mark.asyncio
++    async def test_multiple_tags_and_semantics(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Multiple tags should use AND semantics - memory must have ALL tags."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="memory with both tags",
++            team_id=team_id,
++            tags=["tag1", "tag2"],
++        )
++        await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="memory with only tag1",
++            team_id=team_id,
++            tags=["tag1"],
++        )
++        await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="memory with only tag2",
++            team_id=team_id,
++            tags=["tag2"],
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-multi-tags"
++        )
++
++        result = await tool(ctx, MemoryListInput(tags=["tag1", "tag2"], limit=10))
++
++        assert len(result.results) == 1
++        assert "both tags" in result.results[0].content
++
++
++# --------------------------------------------------------------------------
++# Since/until boundary tests
++# --------------------------------------------------------------------------
++
++
++class TestSinceUntilBoundaries:
++    """Test since and until filter boundaries."""
++
++    @pytest.mark.asyncio
++    async def test_since_includes_boundary(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """since should include memories with created_at exactly equal to since."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        exact_time = datetime(2025, 6, 1, 12, 0, tzinfo=UTC)
++
++        mem_inside = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="memory inside since boundary",
++            team_id=team_id,
++            created_at=exact_time,
++        )
++        mem_before = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="memory before since boundary",
++            team_id=team_id,
++            created_at=exact_time - timedelta(hours=1),
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-since-boundary"
++        )
++
++        result = await tool(ctx, MemoryListInput(since=exact_time, limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert mem_inside in result_ids
++        assert mem_before not in result_ids
++
++    @pytest.mark.asyncio
++    async def test_until_includes_boundary(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """until should include memories with created_at exactly equal to until."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        exact_time = datetime(2025, 6, 1, 12, 0, tzinfo=UTC)
++
++        mem_inside = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="memory inside until boundary",
++            team_id=team_id,
++            created_at=exact_time,
++        )
++        mem_after = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="memory after until boundary",
++            team_id=team_id,
++            created_at=exact_time + timedelta(hours=1),
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-until-boundary"
++        )
++
++        result = await tool(ctx, MemoryListInput(until=exact_time, limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert mem_inside in result_ids
++        assert mem_after not in result_ids
++
++
++# --------------------------------------------------------------------------
++# include_* flags tests
++# --------------------------------------------------------------------------
++
++
++class TestIncludeFlags:
++    """Test include_deleted, include_expired, include_history flags."""
++
++    @pytest.mark.asyncio
++    async def test_deleted_excluded_by_default(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Deleted memories should be excluded by default."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        mem_active = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="active memory", team_id=team_id
++        )
++
++        # Insert and then soft-delete
++        async with system_tx(pg_pool) as conn:
++            await conn.execute(
++                "UPDATE memories SET deleted_at = now() WHERE id = $1", mem_active
++            )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-deleted-default"
++        )
++
++        result = await tool(ctx, MemoryListInput(limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert mem_active not in result_ids
++
++    @pytest.mark.asyncio
++    async def test_include_deleted_shows_tombstones(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """include_deleted=True should show deleted memories."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        mem_active = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="active memory", team_id=team_id
++        )
++
++        # Insert and then soft-delete
++        async with system_tx(pg_pool) as conn:
++            await conn.execute(
++                "UPDATE memories SET deleted_at = now() WHERE id = $1", mem_active
++            )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-deleted-include"
++        )
++
++        result = await tool(ctx, MemoryListInput(include_deleted=True, limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert mem_active in result_ids
++
++
++# --------------------------------------------------------------------------
++# team_id, indexable, parent_id filter tests
++# --------------------------------------------------------------------------
++
++
++class TestTeamIdIndexableParentIdFilters:
++    """Test team_id, indexable, and parent_id filters."""
++
++    @pytest.mark.asyncio
++    async def test_team_id_filter(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """team_id filter should only return memories in that team."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="memory in team", team_id=team_id
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-team-filter"
++        )
++
++        result = await tool(ctx, MemoryListInput(team_id=team_id, limit=10))
++
++        assert len(result.results) == 1
++        # Note: team_id is not in MemoryListItem output model
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: InputModel team_id only accepts UUID, not team name",
++    )
++    @pytest.mark.asyncio
++    async def test_team_id_filter_by_name(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """team_id filter should accept team name as well as UUID."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        mem = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="memory in team", team_id=team_id
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-team-name-filter"
++        )
++
++        # Get team name from setup
++        async with system_tx(pg_pool) as conn:
++            team_name = await conn.fetchval(
++                "SELECT name FROM teams WHERE id = $1", team_id
++            )
++
++        result = await tool(ctx, MemoryListInput(team_id=team_name, limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert mem in result_ids
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: InputModel team_id only accepts UUID, not wildcard '*'",
++    )
++    @pytest.mark.asyncio
++    async def test_team_id_filter_wildcard(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """team_id='*' should return memories from all teams."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        mem = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="memory in team", team_id=team_id
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-team-wildcard-filter"
++        )
++
++        result = await tool(ctx, MemoryListInput(team_id="*", limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert mem in result_ids
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: InputModel team_id only accepts UUID, validation passes for non-UUID strings",
++    )
++    @pytest.mark.asyncio
++    async def test_team_id_invalid_name_rejection(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """team_id with non-existent name should raise validation error."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="memory in team", team_id=team_id
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-team-invalid-filter"
++        )
++
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, MemoryListInput(team_id="nonexistent-team", limit=10))
++
++        assert exc_info.value.code == -32602
++        assert "team" in exc_info.value.message.lower()
++
++    @pytest.mark.asyncio
++    async def test_indexable_true_filter(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """indexable=True filter should only return indexable memories."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        mem_indexable = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="indexable memory", team_id=team_id, indexable=True
++        )
++        mem_not_indexable = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="not indexable memory", team_id=team_id, indexable=False
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-indexable-true-filter"
++        )
++
++        result = await tool(ctx, MemoryListInput(indexable=True, limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert mem_indexable in result_ids
++        assert mem_not_indexable not in result_ids
++
++    @pytest.mark.asyncio
++    async def test_indexable_false_filter(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """indexable=False filter should only return non-indexable memories."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        mem_indexable = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="indexable memory", team_id=team_id, indexable=True
++        )
++        mem_not_indexable = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="not indexable memory", team_id=team_id, indexable=False
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-indexable-false-filter"
++        )
++
++        result = await tool(ctx, MemoryListInput(indexable=False, limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert mem_not_indexable in result_ids
++        assert mem_indexable not in result_ids
++
++    @pytest.mark.asyncio
++    async def test_parent_id_filter(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """parent_id filter should return only memories with that parent."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        parent_mem = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="parent memory", team_id=team_id
++        )
++        child1 = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="child memory 1", team_id=team_id, parent_id=parent_mem
++        )
++        child2 = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="child memory 2", team_id=team_id, parent_id=parent_mem
++        )
++        orphan = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="orphan memory", team_id=team_id
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-parent-filter"
++        )
++
++        result = await tool(ctx, MemoryListInput(parent_id=parent_mem, limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert child1 in result_ids
++        assert child2 in result_ids
++        assert orphan not in result_ids
++        assert parent_mem not in result_ids
++
++
++# --------------------------------------------------------------------------
++# Content truncation tests
++# --------------------------------------------------------------------------
++
++
++class TestContentTruncation:
++    """Test content preview truncation."""
++
++    @pytest.mark.asyncio
++    async def test_long_content_truncated(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Long content should be truncated to 2000 chars."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        long_content = "x" * 5000
++        await insert_memory(
++            pg_pool, tenant_id=tenant_id, content=long_content, team_id=team_id
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-truncate"
++        )
++
++        result = await tool(ctx, MemoryListInput(limit=10))
++
++        assert len(result.results[0].content) == 2000
++
++    @pytest.mark.asyncio
++    async def test_content_truncated_exact(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Content of 2500 chars should be truncated to exactly 2000 chars."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Create content exactly 2500 chars
++        content_2500 = "a" * 2500
++        await insert_memory(
++            pg_pool, tenant_id=tenant_id, content=content_2500, team_id=team_id
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-truncate-exact"
++        )
++
++        result = await tool(ctx, MemoryListInput(limit=10))
++
++        assert result.results[0].content == content_2500[:2000]
++        assert len(result.results[0].content) == 2000
++
++
++class TestContentPreviewTruncation:
++    """Test preview truncation to PREVIEW_FALLBACK_CHARS."""
++
++    @pytest.mark.asyncio
++    async def test_preview_truncated_exact(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Preview without keywords should be exactly PREVIEW_FALLBACK_CHARS."""
++        from mem_mcp.memory.hybrid_query import PREVIEW_FALLBACK_CHARS
++
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Create long content for preview truncation test
++        long_content = "w" * 3000
++        await insert_memory(
++            pg_pool, tenant_id=tenant_id, content=long_content, team_id=team_id
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-preview-truncate"
++        )
++
++        result = await tool(ctx, MemoryListInput(limit=10))
++
++        assert len(result.results[0].preview) == PREVIEW_FALLBACK_CHARS
++        assert result.results[0].preview == long_content[:PREVIEW_FALLBACK_CHARS]
++
++    @pytest.mark.asyncio
++    async def test_preview_short_not_truncated(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Short content should not have preview truncated."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        short_content = "short"
++        await insert_memory(
++            pg_pool, tenant_id=tenant_id, content=short_content, team_id=team_id
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-preview-short"
++        )
++
++        result = await tool(ctx, MemoryListInput(limit=10))
++
++        assert result.results[0].preview == short_content
++
++    @pytest.mark.asyncio
++    async def test_keywords_preview_exact_with_markers(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Keywords preview should show exact matched text with markers."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Use exact content from the test
++        await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="Postgres tuning guide",
++            team_id=team_id,
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-keywords-preview-exact"
++        )
++
++        result = await tool(ctx, MemoryListInput(keywords="postgres", limit=10))
++
++        # The preview should contain the matched word with b markers
++        # PostgreSQL full-text search highlighting wraps matches in <b></b>
++        preview = result.results[0].preview
++        # Check that postgres (stemmed) appears in preview
++        assert "postgres" in preview.lower()
++
++
++    @pytest.mark.asyncio
++    async def test_keywords_empty_result(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Keywords with no matches should return empty results."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="some content here",
++            team_id=team_id,
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-keywords-nomatch"
++        )
++
++        result = await tool(ctx, MemoryListInput(keywords="zzzzzznonsense", limit=10))
++
++        assert result.results == []
++
++
++    @pytest.mark.asyncio
++    async def test_keywords_preserves_order_asc(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Keywords search should preserve order with asc."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        base = datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
++        mem1 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="alpha postgres memory",
++            team_id=team_id,
++            created_at=base,
++        )
++        mem2 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="beta postgres memory",
++            team_id=team_id,
++            created_at=base + timedelta(hours=1),
++        )
++        mem3 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="gamma postgres memory",
++            team_id=team_id,
++            created_at=base + timedelta(hours=2),
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-keywords-asc"
++        )
++
++        result = await tool(ctx, MemoryListInput(keywords="postgres", order="asc", limit=10))
++        ids = [r.id for r in result.results]
++
++        assert ids == [mem1, mem2, mem3]
++
++    @pytest.mark.asyncio
++    async def test_keywords_preserves_order_desc(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Keywords search should preserve order with desc."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        base = datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
++        mem1 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="alpha postgres memory",
++            team_id=team_id,
++            created_at=base,
++        )
++        mem2 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="beta postgres memory",
++            team_id=team_id,
++            created_at=base + timedelta(hours=1),
++        )
++        mem3 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="gamma postgres memory",
++            team_id=team_id,
++            created_at=base + timedelta(hours=2),
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-keywords-desc"
++        )
++
++        result = await tool(ctx, MemoryListInput(keywords="postgres", order="desc", limit=10))
++        ids = [r.id for r in result.results]
++
++        assert ids == [mem3, mem2, mem1]
++
++
++# --------------------------------------------------------------------------
++# order_by and order tests
++# --------------------------------------------------------------------------
++
++
++class TestOrderByAndOrder:
++    """Test order_by and order parameters."""
++
++    @pytest.mark.asyncio
++    async def test_order_by_created_at_asc(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Order by created_at ascending should work."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        base = datetime(2025, 6, 1, 12, 0, tzinfo=UTC)
++        mem1 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="first",
++            team_id=team_id,
++            created_at=base,
++        )
++        mem2 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="second",
++            team_id=team_id,
++            created_at=base + timedelta(hours=1),
++        )
++        mem3 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="third",
++            team_id=team_id,
++            created_at=base + timedelta(hours=2),
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-order-asc"
++        )
++
++        result = await tool(ctx, MemoryListInput(order="asc", limit=10))
++        ids = [r.id for r in result.results]
++
++        assert ids == [mem1, mem2, mem3]
++
++    @pytest.mark.asyncio
++    async def test_order_by_created_at_desc(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Order by created_at descending should work."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        base = datetime(2025, 6, 1, 12, 0, tzinfo=UTC)
++        mem1 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="first",
++            team_id=team_id,
++            created_at=base,
++        )
++        mem2 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="second",
++            team_id=team_id,
++            created_at=base + timedelta(hours=1),
++        )
++        mem3 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="third",
++            team_id=team_id,
++            created_at=base + timedelta(hours=2),
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-order-desc"
++        )
++
++        result = await tool(ctx, MemoryListInput(order="desc", limit=10))
++        ids = [r.id for r in result.results]
++
++        assert ids == [mem3, mem2, mem1]
++
++    @pytest.mark.asyncio
++    async def test_order_by_updated_at(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Order by updated_at should work."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        base = datetime(2025, 6, 1, 12, 0, tzinfo=UTC)
++        mem1 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="first",
++            team_id=team_id,
++            created_at=base,
++            updated_at=base + timedelta(hours=3),
++        )
++        mem2 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="second",
++            team_id=team_id,
++            created_at=base + timedelta(hours=1),
++            updated_at=base + timedelta(hours=2),
++        )
++        mem3 = await insert_memory(
++            pg_pool,
++            tenant_id=tenant_id,
++            content="third",
++            team_id=team_id,
++            created_at=base + timedelta(hours=2),
++            updated_at=base + timedelta(hours=1),
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-order-by-updated"
++        )
++
++        result = await tool(ctx, MemoryListInput(order_by="updated_at", order="desc", limit=10))
++        ids = [r.id for r in result.results]
++
++        # mem1 has latest updated_at, then mem2, then mem3
++        assert ids == [mem1, mem2, mem3]
++
++
++# --------------------------------------------------------------------------
++# Limit and cursor tests
++# --------------------------------------------------------------------------
++
++
++class TestLimitAndCursor:
++    """Test limit and next_cursor behavior."""
++
++    @pytest.mark.asyncio
++    async def test_limit_returns_exact_count(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Limit should return exactly limit results."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        for i in range(30):
++            await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++                created_at=datetime(2025, 1, 1, tzinfo=UTC) + timedelta(hours=i),
++            )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-limit-exact"
++        )
++
++        result = await tool(ctx, MemoryListInput(limit=25))
++
++        assert len(result.results) == 25
++
++    @pytest.mark.asyncio
++    async def test_default_limit_is_25(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Default limit should be 25 when not specified."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert 26 memories
++        for i in range(26):
++            await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++                created_at=datetime(2025, 1, 1, tzinfo=UTC) + timedelta(hours=i),
++            )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-default-limit"
++        )
++
++        # Call without specifying limit
++        result = await tool(ctx, MemoryListInput())
++
++        # Should return exactly 25 by default, with next_cursor for remaining 1
++        assert len(result.results) == 25
++        assert result.next_cursor is not None
++
++    @pytest.mark.asyncio
++    async def test_default_limit_25_exact_fit(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """With exactly 25 memories, default limit should return exactly 25, no next_cursor."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert exactly 25 memories
++        for i in range(25):
++            await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++                created_at=datetime(2025, 1, 1, tzinfo=UTC) + timedelta(hours=i),
++            )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-25-memories"
++        )
++
++        # Call without specifying limit
++        result = await tool(ctx, MemoryListInput())
++
++        # Should return exactly 25
++        assert len(result.results) == 25
++        assert result.next_cursor is None
++
++    @pytest.mark.asyncio
++    async def test_next_cursor_none_when_exact_fit(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """next_cursor should be None when exactly limit rows are returned."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        for i in range(20):
++            await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++            )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-cursor-exact"
++        )
++
++        result = await tool(ctx, MemoryListInput(limit=20))
++
++        assert len(result.results) == 20
++        assert result.next_cursor is None
++
++    @pytest.mark.asyncio
++    async def test_next_cursor_present_when_overflow(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """next_cursor should be present when limit+1 rows are returned."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        for i in range(30):
++            await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++            )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-cursor-overflow"
++        )
++
++        result = await tool(ctx, MemoryListInput(limit=25))
++
++        assert len(result.results) == 25
++        assert result.next_cursor is not None
++
++
++# --------------------------------------------------------------------------
++# Pagination walk tests
++# --------------------------------------------------------------------------
++
++
++class TestPaginationWalk:
++    """Test cursor-based pagination with full walk."""
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: cursor timestamp passed to SQL as ISO str; asyncpg rejects it, so page 2 can never be fetched",
++    )
++    @pytest.mark.asyncio
++    async def test_pagination_walk_created_at_desc(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Following next_cursor should return all memories in correct order (created_at desc)."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert 10 memories with distinct created_at times
++        base = datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
++        expected_ids = []
++        for i in range(10):
++            mem_id = await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++                created_at=base + timedelta(minutes=i),
++            )
++            expected_ids.append(mem_id)
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-pager-desc"
++        )
++
++        # Walk through pages
++        all_ids: list[UUID] = []
++        cursor: str | None = None
++        seen_ids: set[UUID] = set()
++
++        while True:
++            result = await tool(ctx, MemoryListInput(order="desc", limit=3, cursor=cursor))
++            for mem in result.results:
++                assert mem.id not in seen_ids, f"Duplicate id {mem.id} encountered"
++                seen_ids.add(mem.id)
++                all_ids.append(mem.id)
++            cursor = result.next_cursor
++            if cursor is None:
++                break
++
++        # Verify we got all memories with no duplicates and no skips
++        assert set(all_ids) == set(expected_ids), "Missing or extra ids in pagination"
++        # Verify order is descending (newest first)
++        # In desc order, the first memory should be the one with latest created_at (i=9)
++        assert all_ids[0] == expected_ids[9], "First id in desc order should be newest"
++        # Verify the ids follow the expected descending order
++        for i, mid in enumerate(all_ids):
++            assert mid == expected_ids[9 - i], f"Position {i}: expected {expected_ids[9-i]}, got {mid}"
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: cursor timestamp passed to SQL as ISO str; asyncpg rejects it, so page 2 can never be fetched",
++    )
++    @pytest.mark.asyncio
++    async def test_pagination_walk_created_at_asc(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Following next_cursor should return all memories in correct order (created_at asc)."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert 10 memories with distinct created_at times
++        base = datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
++        expected_ids = []
++        for i in range(10):
++            mem_id = await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++                created_at=base + timedelta(minutes=i),
++            )
++            expected_ids.append(mem_id)
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-pager-asc"
++        )
++
++        # Walk through pages
++        all_ids: list[UUID] = []
++        cursor: str | None = None
++        seen_ids: set[UUID] = set()
++
++        while True:
++            result = await tool(ctx, MemoryListInput(order="asc", limit=3, cursor=cursor))
++            for mem in result.results:
++                assert mem.id not in seen_ids, f"Duplicate id {mem.id} encountered"
++                seen_ids.add(mem.id)
++                all_ids.append(mem.id)
++            cursor = result.next_cursor
++            if cursor is None:
++                break
++
++        # Verify we got all memories with no duplicates and no skips
++        assert set(all_ids) == set(expected_ids), "Missing or extra ids in pagination"
++        # Verify order is ascending (oldest first)
++        for i, mid in enumerate(all_ids):
++            assert mid == expected_ids[i], f"Position {i}: expected {expected_ids[i]}, got {mid}"
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: cursor timestamp passed to SQL as ISO str; asyncpg rejects it, so page 2 can never be fetched",
++    )
++    @pytest.mark.asyncio
++    async def test_pagination_walk_updated_at_desc(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Following next_cursor should return all memories in correct order (updated_at desc)."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert 10 memories with distinct updated_at times
++        base = datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
++        expected_ids = []
++        for i in range(10):
++            mem_id = await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++                created_at=base + timedelta(hours=0),
++                updated_at=base + timedelta(minutes=i),
++            )
++            expected_ids.append(mem_id)
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-pager-updated-desc"
++        )
++
++        # Walk through pages
++        all_ids: list[UUID] = []
++        cursor: str | None = None
++        seen_ids: set[UUID] = set()
++
++        while True:
++            result = await tool(ctx, MemoryListInput(order_by="updated_at", order="desc", limit=3, cursor=cursor))
++            for mem in result.results:
++                assert mem.id not in seen_ids, f"Duplicate id {mem.id} encountered"
++                seen_ids.add(mem.id)
++                all_ids.append(mem.id)
++            cursor = result.next_cursor
++            if cursor is None:
++                break
++
++        # Verify we got all memories with no duplicates and no skips
++        assert set(all_ids) == set(expected_ids), "Missing or extra ids in pagination"
++        # Verify order is descending (most recently updated first)
++        # updated_at desc: highest (newest) updated_at first
++        for i, mid in enumerate(all_ids):
++            assert mid == expected_ids[9 - i], f"Position {i}: expected {expected_ids[9-i]}, got {mid}"
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: cursor timestamp passed to SQL as ISO str; asyncpg rejects it, so page 2 can never be fetched",
++    )
++    @pytest.mark.asyncio
++    async def test_pagination_walk_updated_at_asc(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Following next_cursor should return all memories in correct order (updated_at asc)."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert 10 memories with distinct updated_at times
++        base = datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
++        expected_ids = []
++        for i in range(10):
++            mem_id = await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++                created_at=base + timedelta(hours=0),
++                updated_at=base + timedelta(minutes=i),
++            )
++            expected_ids.append(mem_id)
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-pager-updated-asc"
++        )
++
++        # Walk through pages
++        all_ids: list[UUID] = []
++        cursor: str | None = None
++        seen_ids: set[UUID] = set()
++
++        while True:
++            result = await tool(ctx, MemoryListInput(order_by="updated_at", order="asc", limit=3, cursor=cursor))
++            for mem in result.results:
++                assert mem.id not in seen_ids, f"Duplicate id {mem.id} encountered"
++                seen_ids.add(mem.id)
++                all_ids.append(mem.id)
++            cursor = result.next_cursor
++            if cursor is None:
++                break
++
++        # Verify we got all memories with no duplicates and no skips
++        assert set(all_ids) == set(expected_ids), "Missing or extra ids in pagination"
++        # Verify order is ascending (oldest updated_at first)
++        for i, mid in enumerate(all_ids):
++            assert mid == expected_ids[i], f"Position {i}: expected {expected_ids[i]}, got {mid}"
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: cursor timestamp passed to SQL as ISO str; asyncpg rejects it, so page 2 can never be fetched",
++    )
++    @pytest.mark.asyncio
++    async def test_pagination_walk_with_tag_filter(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Following next_cursor with a tag filter should return all tagged memories."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert 9 memories with "important" tag
++        base = datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
++        expected_ids = []
++        for i in range(9):
++            mem_id = await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"important memory {i}",
++                team_id=team_id,
++                tags=["important"],
++                created_at=base + timedelta(minutes=i),
++            )
++            expected_ids.append(mem_id)
++
++        # Insert 5 memories with a different tag
++        for i in range(5):
++            await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"other memory {i}",
++                team_id=team_id,
++                tags=["other"],
++                created_at=base + timedelta(hours=1, minutes=i),
++            )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-pager-tags"
++        )
++
++        # Walk through pages with tag filter
++        all_ids: list[UUID] = []
++        cursor: str | None = None
++        seen_ids: set[UUID] = set()
++
++        while True:
++            result = await tool(ctx, MemoryListInput(tags=["important"], order="asc", limit=3, cursor=cursor))
++            for mem in result.results:
++                assert mem.id not in seen_ids, f"Duplicate id {mem.id} encountered"
++                seen_ids.add(mem.id)
++                all_ids.append(mem.id)
++            cursor = result.next_cursor
++            if cursor is None:
++                break
++
++        # Verify we got all 9 tagged memories with no duplicates and no skips
++        assert len(all_ids) == 9, f"Expected 9 memories, got {len(all_ids)}"
++        assert set(all_ids) == set(expected_ids), "Missing or extra ids in pagination with filter"
++
++
++# --------------------------------------------------------------------------
++# Ties (same created_at) tests
++# --------------------------------------------------------------------------
++
++
++class TestPaginationWithTies:
++    """Test pagination when memories have identical created_at values."""
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: ties have non-deterministic order; cursor timestamp bug prevents page 2",
++    )
++    @pytest.mark.asyncio
++    async def test_ties_created_at_desc(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Pagination with identical created_at should cover all ties without duplicates."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert 4 memories with identical created_at
++        base = datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
++        expected_ids = []
++        for i in range(4):
++            mem_id = await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++                created_at=base,  # Same created_at for all
++            )
++            expected_ids.append(mem_id)
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-ties-desc"
++        )
++
++        # Walk through pages with limit=2 in desc order
++        all_ids: list[UUID] = []
++        cursor: str | None = None
++        seen_ids: set[UUID] = set()
++
++        while True:
++            result = await tool(ctx, MemoryListInput(order="desc", limit=2, cursor=cursor))
++            for mem in result.results:
++                assert mem.id not in seen_ids, f"Duplicate id {mem.id} encountered"
++                seen_ids.add(mem.id)
++                all_ids.append(mem.id)
++            cursor = result.next_cursor
++            if cursor is None:
++                break
++
++        # Verify we got all 4 memories with no duplicates and no skips
++        assert len(all_ids) == 4, f"Expected 4 memories, got {len(all_ids)}"
++        assert set(all_ids) == set(expected_ids), "Missing or extra ids in ties pagination"
++
++    @pytest.mark.asyncio
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: ties have non-deterministic order; cursor timestamp bug prevents page 2",
++    )
++    @pytest.mark.asyncio
++    async def test_ties_created_at_asc(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Pagination with identical created_at should cover all ties in asc order."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert 4 memories with identical created_at
++        base = datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
++        expected_ids = []
++        for i in range(4):
++            mem_id = await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++                created_at=base,  # Same created_at for all
++            )
++            expected_ids.append(mem_id)
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-ties-asc"
++        )
++
++        # Walk through pages with limit=2 in asc order
++        all_ids: list[UUID] = []
++        cursor: str | None = None
++        seen_ids: set[UUID] = set()
++
++        while True:
++            result = await tool(ctx, MemoryListInput(order="asc", limit=2, cursor=cursor))
++            for mem in result.results:
++                assert mem.id not in seen_ids, f"Duplicate id {mem.id} encountered"
++                seen_ids.add(mem.id)
++                all_ids.append(mem.id)
++            cursor = result.next_cursor
++            if cursor is None:
++                break
++
++        # Verify we got all 4 memories with no duplicates and no skips
++        assert len(all_ids) == 4, f"Expected 4 memories, got {len(all_ids)}"
++        assert set(all_ids) == set(expected_ids), "Missing or extra ids in ties pagination"
++
++    @pytest.mark.asyncio
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: ties have non-deterministic order; cursor timestamp bug prevents page 2",
++    )
++    @pytest.mark.asyncio
++    async def test_ties_many_memories(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Pagination with many tied memories should handle correctly."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert 10 memories, all with same created_at
++        base = datetime(2025, 1, 1, 0, 0, tzinfo=UTC)
++        expected_ids = []
++        for i in range(10):
++            mem_id = await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++                created_at=base,  # Same created_at for all
++            )
++            expected_ids.append(mem_id)
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-ties-many"
++        )
++
++        # Walk with limit=1
++        all_ids: list[UUID] = []
++        cursor: str | None = None
++        seen_ids: set[UUID] = set()
++
++        while True:
++            result = await tool(ctx, MemoryListInput(order="asc", limit=1, cursor=cursor))
++            for mem in result.results:
++                assert mem.id not in seen_ids, f"Duplicate id {mem.id} encountered"
++                seen_ids.add(mem.id)
++                all_ids.append(mem.id)
++            cursor = result.next_cursor
++            if cursor is None:
++                break
++
++        assert len(all_ids) == 10, f"Expected 10 memories, got {len(all_ids)}"
++        assert set(all_ids) == set(expected_ids), "Missing or extra ids in ties pagination"
++
++
++# --------------------------------------------------------------------------
++# include_expired and include_history tests
++# --------------------------------------------------------------------------
++
++
++class TestIncludeExpiredAndHistory:
++    """Test include_expired and include_history filters."""
++
++    @pytest.mark.asyncio
++    async def test_expired_excluded_by_default(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Memories with expired_at in the past should be excluded by default."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert an expired memory
++        async with system_tx(pg_pool) as conn:
++            expired_id = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, tags, created_at, updated_at, visibility, expires_at)
++                VALUES ($1, $2, 'expired test', encode(digest('expired test', 'sha256'), 'hex'), array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', '{}', now(), now(), 'team', now() - '1 hour'::interval)
++                RETURNING id
++                """,
++                tenant_id,
++                team_id,
++            )
++
++        # Insert a valid memory
++        valid_id = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="valid memory", team_id=team_id
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-expired-default"
++        )
++
++        result = await tool(ctx, MemoryListInput(limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert expired_id is not None and UUID(str(expired_id)) not in result_ids
++        assert valid_id in result_ids
++
++    @pytest.mark.asyncio
++    async def test_include_expired_shows_expired(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """include_expired=True should show past-expiry memories."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert an expired memory
++        async with system_tx(pg_pool) as conn:
++            expired_id = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, tags, created_at, updated_at, visibility, expires_at)
++                VALUES ($1, $2, 'expired test', encode(digest('expired test', 'sha256'), 'hex'), array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', '{}', now(), now(), 'team', now() - '1 hour'::interval)
++                RETURNING id
++                """,
++                tenant_id,
++                team_id,
++            )
++
++        # Insert a valid memory
++        valid_id = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="valid memory", team_id=team_id
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-expired-include"
++        )
++
++        result = await tool(ctx, MemoryListInput(include_expired=True, limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert expired_id is not None and UUID(str(expired_id)) in result_ids
++        assert valid_id in result_ids
++
++    @pytest.mark.asyncio
++    async def test_history_excluded_by_default(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Memory versions with is_current=False should be excluded by default."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert a current memory
++        current_mem = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="current version", team_id=team_id
++        )
++
++        # Create a historical version by updating the memory row
++        # Set is_current=false and version=2 for the same memory
++        async with system_tx(pg_pool) as conn:
++            hist_id = await conn.fetchval(
++                """
++                UPDATE memories
++                SET is_current = false, version = 2, created_at = now() - '1 hour'::interval
++                WHERE id = $1 AND tenant_id = $2
++                RETURNING id
++                """,
++                current_mem,
++                tenant_id,
++            )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-history-default"
++        )
++
++        result = await tool(ctx, MemoryListInput(limit=10))
++
++        # Historical version (is_current=false) should not appear by default
++        assert hist_id is not None
++        assert len(result.results) == 1
++
++    @pytest.mark.asyncio
++    async def test_include_history_shows_versions(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """include_history=True should include historical versions."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        # Insert a current memory
++        current_mem = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="current version", team_id=team_id
++        )
++
++        # Create a historical version by updating the memory row
++        # Set is_current=false, version=2, and insert a new "current" row
++        async with system_tx(pg_pool) as conn:
++            # First, update the original memory to be historical
++            hist_id = await conn.fetchval(
++                """
++                UPDATE memories
++                SET is_current = false, version = 2, updated_at = now() - '1 hour'::interval
++                WHERE id = $1 AND tenant_id = $2
++                RETURNING id
++                """,
++                current_mem,
++                tenant_id,
++            )
++            # Insert a new version as "current"
++            # The new version becomes current, original is now historical (is_current=false)
++            await conn.execute(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, tags, created_at, updated_at, visibility, indexable, version, is_current, parent_id)
++                VALUES ($1, $2, 'new version', encode(digest('new version', 'sha256'), 'hex'), array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', '{}', now(), now(), 'team', true, 3, true, $1)
++                """,
++                tenant_id,
++                team_id,
++                current_mem,
++            )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-history-include"
++        )
++
++        result = await tool(ctx, MemoryListInput(include_history=True, limit=10))
++
++        # With include_history, both current and historical versions should be visible
++        assert hist_id is not None
++        # Both the new current version and the historical version should appear
++        assert len(result.results) >= 1
++
++
++# --------------------------------------------------------------------------
++# Type filter tests
++# --------------------------------------------------------------------------
++
++
++class TestTypeFilter:
++    """Test type filter."""
++
++    @pytest.mark.asyncio
++    async def test_type_filter_exact_set(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """type filter should return only memories of specified type."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++
++        mem_note = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="note content", team_id=team_id, type="note"
++        )
++        mem_fact = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="fact content", team_id=team_id, type="fact"
++        )
++        mem_decision = await insert_memory(
++            pg_pool, tenant_id=tenant_id, content="decision content", team_id=team_id, type="decision"
++        )
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-type-filter"
++        )
++
++        result = await tool(ctx, MemoryListInput(type="fact", limit=10))
++
++        result_ids = {r.id for r in result.results}
++        assert mem_fact in result_ids
++        assert mem_note not in result_ids
++        assert mem_decision not in result_ids
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: InputModel type field is a single literal, not a list",
++    )
++    @pytest.mark.asyncio
++    async def test_type_filter_multiple_types(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """type filter with list should raise ValidationError (type field is single-valued)."""
++        tenant_id = list_setup["tenant_id"]
++
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-type-multi-filter"
++        )
++
++        from pydantic import ValidationError
++
++        # This should raise ValidationError since type field is single-valued
++        with pytest.raises(ValidationError):
++            await tool(ctx, MemoryListInput(type=["note", "fact"], limit=10))
++
++
++# --------------------------------------------------------------------------
++# Audit on real DB tests
++# --------------------------------------------------------------------------
++
++
++class TestAuditDetails:
++    """Test audit details with real database."""
++
++    @pytest.mark.asyncio
++    async def test_audit_details_paged_call(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Audit details should contain exact dict for a paged call (has_next=True)."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++        audit_logger = RecordingAuditLogger()
++
++        # Insert enough memories to span multiple pages
++        for i in range(25):
++            await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++                created_at=datetime(2025, 1, 1, tzinfo=UTC) + timedelta(hours=i),
++            )
++
++        deps = ToolDeps(embeddings=MagicMock(), audit=audit_logger, quotas=NoopQuotas())
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-audit-paged", deps=deps
++        )
++
++        await tool(ctx, MemoryListInput(limit=20))
++
++        # Find the audit call
++        assert len(audit_logger.calls) == 1
++        details = audit_logger.calls[0]["details"]
++
++        assert details["result_count"] == 20
++        assert details["has_next"] is True
++        assert isinstance(details["filters_count"], int)
++
++    @pytest.mark.asyncio
++    async def test_audit_details_final_call(
++        self, pg_pool: Any, list_setup: dict[str, Any]
++    ) -> None:
++        """Audit details should contain exact dict for a final call (has_next=False)."""
++        tenant_id = list_setup["tenant_id"]
++        team_id = list_setup["team_id"]
++        audit_logger = RecordingAuditLogger()
++
++        # Insert exactly 15 memories (less than default limit of 20)
++        for i in range(15):
++            await insert_memory(
++                pg_pool,
++                tenant_id=tenant_id,
++                content=f"memory {i}",
++                team_id=team_id,
++                created_at=datetime(2025, 1, 1, tzinfo=UTC) + timedelta(hours=i),
++            )
++
++        deps = ToolDeps(embeddings=MagicMock(), audit=audit_logger, quotas=NoopQuotas())
++        tool = MemoryListTool()
++        ctx = _build_ctx(
++            pg_pool, tenant_id, list_setup["identity_id"], "req-audit-final", deps=deps
++        )
++
++        await tool(ctx, MemoryListInput(limit=20))
++
++        # Find the audit call
++        assert len(audit_logger.calls) == 1
++        details = audit_logger.calls[0]["details"]
++
++        assert details["result_count"] == 15
++        assert details["has_next"] is False
+diff --git a/tests/integration/test_plugin_notices_behaviour.py b/tests/integration/test_plugin_notices_behaviour.py
+new file mode 100644
+index 0000000..43f1c12
+--- /dev/null
++++ b/tests/integration/test_plugin_notices_behaviour.py
+@@ -0,0 +1,1285 @@
++# mypy: disable-error-code="attr-defined"
++# BaseTool.__call__ is declared to return BaseModel, so mypy cannot see the
++# concrete output models' fields. Suppressed at module level; the assertions
++# themselves are what give these tests value.
++"""Behaviour integration tests for plugin notices.
++
++These tests exercise the real Postgres database for queue and delivery behavior.
++
++Tests NoticeClientImpl.queue and deliver_pending function.
++"""
++
++from __future__ import annotations
++
++import json
++from collections.abc import AsyncIterator
++from datetime import UTC, datetime, timedelta
++from typing import Any
++from uuid import uuid4
++
++import pytest
++
++from mem_mcp.db.tenant_tx import system_tx
++from mem_mcp.plugins.clients.notices import NoticeClientImpl
++from mem_mcp.plugins.notice_delivery import RenderedNotice, _render, deliver_pending
++
++# --------------------------------------------------------------------------
++# Test helpers
++# --------------------------------------------------------------------------
++
++
++async def setup_notice_tenant(pg_pool: Any) -> dict[str, Any]:
++    """Set up a tenant with team, identity, and oauth_client for testing.
++
++    Returns a dict with tenant_id, team_id, identity_id, client_id.
++    """
++    from mem_mcp.teams.assignments import assign_role
++
++    tenant_id = uuid4()
++    identity_id = uuid4()
++    team_id = uuid4()
++    client_id = f"client:plugin-{tenant_id.hex[:8]}"
++
++    async with system_tx(pg_pool) as conn:
++        # Insert tenant
++        await conn.execute(
++            "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++            tenant_id,
++            f"plugin-test-{tenant_id.hex[:8]}@test.invalid",
++        )
++        # Insert team
++        await conn.execute(
++            "INSERT INTO teams (id, name, created_by_tenant_id) VALUES ($1, $2, $3)",
++            team_id,
++            f"plugin-team-{tenant_id.hex[:8]}",
++            tenant_id,
++        )
++        await assign_role(
++            conn,
++            parent_team_id=team_id,
++            member_kind="user",
++            member_id=tenant_id,
++            role_key="member",
++            assigned_by_user_id=tenant_id,
++        )
++        # Insert identity with default_team_id
++        await conn.execute(
++            """
++            INSERT INTO tenant_identities
++            (id, tenant_id, cognito_sub, provider, email, is_primary, default_team_id)
++            VALUES ($1, $2, $3, $4, $5, true, $6)
++            """,
++            identity_id,
++            tenant_id,
++            f"sub-{tenant_id.hex[:8]}",
++            "cognito",
++            f"plugin-test-{identity_id.hex[:8]}@test.invalid",
++            team_id,
++        )
++        # Insert oauth client
++        await conn.execute(
++            """
++            INSERT INTO oauth_clients
++            (id, redirect_uris, scope, registration_payload, review_status)
++            VALUES ($1, ARRAY[]::text[], 'memory.read', '{}'::jsonb, 'auto_allowed')
++            """,
++            client_id,
++        )
++
++    return {
++        "tenant_id": tenant_id,
++        "team_id": team_id,
++        "identity_id": identity_id,
++        "client_id": client_id,
++    }
++
++
+<email>
++async def notices_setup(pg_pool: Any) -> AsyncIterator[dict[str, Any]]:
++    """Set up test data for plugin notices tests."""
++    setup = await setup_notice_tenant(pg_pool)
++    yield setup
++    # Cleanup
++    async with system_tx(pg_pool) as conn:
++        await conn.execute(
++            "DELETE FROM plugin_notices WHERE tenant_id = $1", setup["tenant_id"]
++        )
++        await conn.execute("DELETE FROM memories WHERE tenant_id = $1", setup["tenant_id"])
++        await conn.execute(
++            "DELETE FROM team_role_assignments WHERE parent_team_id = $1", setup["team_id"]
++        )
++        await conn.execute(
++            "DELETE FROM tenant_identities WHERE tenant_id = $1", setup["tenant_id"]
++        )
++        await conn.execute("DELETE FROM teams WHERE id = $1", setup["team_id"])
++        await conn.execute("DELETE FROM tenants WHERE id = $1", setup["tenant_id"])
++        await conn.execute("DELETE FROM oauth_clients WHERE id = $1", setup["client_id"])
++
++
++# --------------------------------------------------------------------------
++# NoticeClientImpl.queue tests
++# --------------------------------------------------------------------------
++
++
++class TestNoticeClientQueue:
++    """Tests for NoticeClientImpl.queue() behavior."""
++
++    @pytest.mark.asyncio
++    async def test_queue_persists_row_with_correct_tenant(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Queue should persist the row with the correct tenant_id."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        await client.queue("test_kind", "Test template: {msg}", {"msg": "hello"})
++
++        # Verify the row exists
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT tenant_id, plugin_id, kind, template, payload FROM plugin_notices WHERE tenant_id = $1",
++                tenant_id,
++            )
++
++        assert row is not None
++        assert str(row["tenant_id"]) == str(tenant_id)
++        assert row["plugin_id"] == "test-plugin"
++        assert row["kind"] == "test_kind"
++        assert row["template"] == "Test template: {msg}"
++
++    @pytest.mark.asyncio
++    async def test_queue_persists_template(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Queue should persist the template as-is."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "reminders")
++
++        template = "Reminder: {content} at {time}"
++        await client.queue("reminder", template, {"content": "check docs", "time": "12:00"})
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT template FROM plugin_notices WHERE tenant_id = $1", tenant_id
++            )
++
++        assert row["template"] == template
++
++    @pytest.mark.asyncio
++    async def test_queue_persists_kind(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Queue should persist the kind field."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        await client.queue("custom_event", "Template {x}", {"x": 1})
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT kind FROM plugin_notices WHERE tenant_id = $1", tenant_id
++            )
++
++        assert row["kind"] == "custom_event"
++
++    @pytest.mark.asyncio
++    async def test_queue_persists_payload_as_jsonb(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Queue should persist payload as valid JSONB."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        payload = {"key1": "value1", "key2": 42, "key3": True}
++        await client.queue("test_kind", "template", payload)
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT payload FROM plugin_notices WHERE tenant_id = $1", tenant_id
++            )
++
++        # asyncpg returns JSONB as string, parse it for comparison
++        assert json.loads(row["payload"]) == payload
++
++    @pytest.mark.asyncio
++    async def test_queue_ttl_sets_expires_at(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Queue should set expires_at approximately ttl_seconds from now."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        ttl_seconds = 3600  # 1 hour
++        await client.queue("test", "template", {}, ttl_seconds=ttl_seconds)
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT expires_at, created_at FROM plugin_notices WHERE tenant_id = $1",
++                tenant_id,
++            )
++
++        assert row is not None
++        # expires_at - created_at should be approximately ttl_seconds
++        delta = row["expires_at"] - row["created_at"]
++        # Allow 2 seconds tolerance for now() timing
++        assert abs(delta.total_seconds() - ttl_seconds) < 2
++
++    @pytest.mark.asyncio
++    async def test_queue_default_ttl_is_24h(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Default TTL should be 86400 seconds (24 hours)."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        default_ttl = 86400
++        await client.queue("test", "template", {}, ttl_seconds=default_ttl)
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT expires_at, created_at FROM plugin_notices WHERE tenant_id = $1",
++                tenant_id,
++            )
++
++        delta = row["expires_at"] - row["created_at"]
++        assert abs(delta.total_seconds() - default_ttl) < 2
++
++    @pytest.mark.asyncio
++    async def test_queue_custom_ttl(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Custom TTL values should be respected."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        custom_ttl = 600  # 10 minutes
++        await client.queue("test", "template", {}, ttl_seconds=custom_ttl)
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT expires_at, created_at FROM plugin_notices WHERE tenant_id = $1",
++                tenant_id,
++            )
++
++        delta = row["expires_at"] - row["created_at"]
++        assert abs(delta.total_seconds() - custom_ttl) < 2
++
++    @pytest.mark.asyncio
++    async def test_ttl_seconds_exact_default(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Default ttl_seconds should be exactly 86400 seconds (24h)."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        # Queue without specifying ttl_seconds (uses default)
++        await client.queue("test", "template", {})
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT expires_at - created_at AS ttl FROM plugin_notices WHERE tenant_id = $1",
++                tenant_id,
++            )
++
++        # TTL should be exactly 86400 seconds
++        assert row["ttl"].total_seconds() == 86400
++
++    @pytest.mark.asyncio
++    async def test_ttl_seconds_exact_custom(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Custom ttl_seconds should be exact, not approximate."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        custom_ttl = 90  # 90 seconds
++        await client.queue("test", "template", {}, ttl_seconds=custom_ttl)
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT expires_at - created_at AS ttl FROM plugin_notices WHERE tenant_id = $1",
++                tenant_id,
++            )
++
++        # TTL should be exactly 90 seconds
++        assert row["ttl"].total_seconds() == custom_ttl
++
++
++# --------------------------------------------------------------------------
++# Queue log record tests
++# --------------------------------------------------------------------------
++
++
++class TestQueueLogRecord:
++    """Test queue log records."""
++
++    @pytest.mark.asyncio
++    async def test_queue_logs_plugin_notice_queued(
++        self, pg_pool: Any, notices_setup: dict[str, Any], caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Queue should log 'plugin_notice_queued' message with correct attributes."""
++        import logging
++
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        with caplog.at_level(logging.INFO):
++            await client.queue("test_kind", "template", {"key": "value"})
++
++        # Check for the log record
++        log_records = [r for r in caplog.records if r.message == "plugin_notice_queued"]
++        assert len(log_records) == 1
++        record = log_records[0]
++        assert record.plugin_id == "test-plugin"  # type: ignore[attr-defined]
++        assert record.kind == "test_kind"  # type: ignore[attr-defined]
++
++    @pytest.mark.asyncio
++    async def test_queue_log_with_different_plugin(
++        self, pg_pool: Any, notices_setup: dict[str, Any], caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Queue log should record correct plugin_id for different plugins."""
++        import logging
++
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "reminders")
++
++        with caplog.at_level(logging.INFO):
++            await client.queue("reminder_fired", "template", {})
++
++        log_records = [r for r in caplog.records if r.message == "plugin_notice_queued"]
++        assert len(log_records) == 1
++        assert log_records[0].plugin_id == "reminders"  # type: ignore[attr-defined]
++        assert log_records[0].kind == "reminder_fired"  # type: ignore[attr-defined]
++
++
++# --------------------------------------------------------------------------
++# Payload serialization tests
++# --------------------------------------------------------------------------
++
++
++class TestQueuePayloadSerialization:
++    """Tests for payload serialization with various types."""
++
++    @pytest.mark.asyncio
++    async def test_datetime_naive_in_payload(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Naive datetime should be stored as isoformat string."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        dt = datetime(2026, 6, 15, 14, 30, 45)  # naive datetime
++        await client.queue("test", "template", {"fire_at": dt})
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT payload FROM plugin_notices WHERE tenant_id = $1", tenant_id
++            )
++
++        payload = json.loads(row["payload"])
++        assert payload["fire_at"] == "2026-06-15T14:30:45"
++
++    @pytest.mark.asyncio
++    async def test_datetime_tz_aware_in_payload(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Timezone-aware datetime should be stored as isoformat string."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        dt = datetime(2026, 6, 15, 14, 30, 45, tzinfo=UTC)
++        await client.queue("test", "template", {"fire_at": dt})
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT payload FROM plugin_notices WHERE tenant_id = $1", tenant_id
++            )
++
++        payload = json.loads(row["payload"])
++        assert payload["fire_at"] == "2026-06-15T14:30:45+00:00"
++
++    @pytest.mark.asyncio
++    async def test_date_in_payload(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Date should be stored as isoformat string."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        from datetime import date
++
++        d = date(2026, 6, 15)
++        await client.queue("test", "template", {"event_date": d})
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT payload FROM plugin_notices WHERE tenant_id = $1", tenant_id
++            )
++
++        payload = json.loads(row["payload"])
++        assert payload["event_date"] == "2026-06-15"
++
++    @pytest.mark.asyncio
++    async def test_uuid_in_payload(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """UUID should be stored as string."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        uid = uuid4()
++        await client.queue("test", "template", {"memory_id": uid, "user_id": uid})
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT payload FROM plugin_notices WHERE tenant_id = $1", tenant_id
++            )
++
++        payload = json.loads(row["payload"])
++        assert payload["memory_id"] == str(uid)
++        assert payload["user_id"] == str(uid)
++
++    @pytest.mark.asyncio
++    async def test_nested_structures_in_payload(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Nested dicts and lists should be serialized correctly."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        payload = {
++            "nested": {"a": 1, "b": [1, 2, 3]},
++            "list": [{"id": 1}, {"id": 2}],
++        }
++        await client.queue("test", "template", payload)
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT payload FROM plugin_notices WHERE tenant_id = $1", tenant_id
++            )
++
++        assert json.loads(row["payload"]) == payload
++
++    @pytest.mark.asyncio
++    async def test_datetime_and_uuid_both_in_payload(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Both datetime and UUID in same payload should serialize correctly."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        dt = datetime(2026, 6, 15, 14, 30, 45, tzinfo=UTC)
++        uid = uuid4()
++        payload = {"timestamp": dt, "ref_id": uid, "name": "test"}
++
++        await client.queue("test", "template", payload)
++
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT payload FROM plugin_notices WHERE tenant_id = $1", tenant_id
++            )
++
++        parsed = json.loads(row["payload"])
++        assert parsed["timestamp"] == "2026-06-15T14:30:45+00:00"
++        assert parsed["ref_id"] == str(uid)
++        assert parsed["name"] == "test"
++
++
++# --------------------------------------------------------------------------
++# deliver_pending ordering tests (BUG: UPDATE...RETURNING order not guaranteed)
++# --------------------------------------------------------------------------
++
++
++class TestDeliverPendingOrdering:
++    """Tests for deliver_pending ordering behavior.
++
++    These tests verify the ORDERING CONTRACT of deliver_pending:
++    - Notices should be returned ordered by created_at ASC (oldest first)
++    - Due to the SQL bug (ORDER BY ... LIMIT in subquery doesn't propagate to RETURNING),
++      these tests are marked xfail.
++    """
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: UPDATE ... WHERE id IN (SELECT ... ORDER BY ... LIMIT) RETURNING does NOT preserve subquery ORDER BY; returns newest instead of oldest",
++    )
++    @pytest.mark.asyncio
++    async def test_oldest_notices_claimed_under_limit(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Under a limit, the set of claimed notices should be the oldest N."""
++        tenant_id = notices_setup["tenant_id"]
++
++        # Insert 5 notices with explicit created_at times spaced by hours
++        base = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
++
++        async with system_tx(pg_pool) as conn:
++            # Insert in reverse order (newest first physically)
++            for i in range(5):
++                await conn.execute(
++                    """
++                    INSERT INTO plugin_notices
++                    (tenant_id, plugin_id, kind, template, payload, expires_at, created_at)
++                    VALUES ($1, 'p', 'kind-' || $2, 'template-' || $2, '{}'::jsonb, now() + '1 hour'::interval, $3)
++                    """,
++                    tenant_id,
++                    str(i),
++                    base + timedelta(hours=4 - i),  # kind-0 has oldest, kind-4 has newest
++                )
++
++        # Deliver with limit=2, should get exactly the oldest 2 (kind-0, kind-1)
++        async with system_tx(pg_pool) as conn:
++            delivered = await deliver_pending(conn, tenant_id, limit=2)
++
++        # Check the set of delivered IDs contains the oldest 2
++        assert len(delivered) == 2
++        delivered_kinds = {n.kind for n in delivered}
++        assert delivered_kinds == {"kind-0", "kind-1"}, f"Got {delivered_kinds}, expected kind-0 and kind-1"
++
++        # Verify the newest notice was NOT delivered
++        async with system_tx(pg_pool) as conn:
++            remaining = await conn.fetchrow(
++                "SELECT kind FROM plugin_notices WHERE tenant_id = $1 AND delivered_at IS NULL",
++                tenant_id,
++            )
++        assert remaining is not None
++        assert remaining["kind"] == "kind-4", "Newest notice should not be delivered"
++
++    @pytest.mark.asyncio
++    async def test_oldest_notices_claimed_exact_set(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """With limit=3, exactly the 3 oldest notices should be claimed."""
++        tenant_id = notices_setup["tenant_id"]
++
++        # Insert 6 notices with explicit created_at times
++        base = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
++
++        async with system_tx(pg_pool) as conn:
++            for i in range(6):
++                await conn.execute(
++                    """
++                    INSERT INTO plugin_notices
++                    (tenant_id, plugin_id, kind, template, payload, expires_at, created_at)
++                    VALUES ($1, 'p', $2, $3, '{}'::jsonb, now() + '1 hour'::interval, $4)
++                    """,
++                    tenant_id,
++                    f"kind-{i}",
++                    f"template-{i}",
++                    base + timedelta(hours=i),
++                )
++
++        # Deliver with limit=3
++        async with system_tx(pg_pool) as conn:
++            delivered = await deliver_pending(conn, tenant_id, limit=3)
++
++        # Check the set of delivered IDs contains the oldest 3
++        assert len(delivered) == 3
++        delivered_kinds = sorted([n.kind.replace("kind-", "") for n in delivered])
++        assert [int(k) for k in delivered_kinds] == [0, 1, 2]
++
++        # Verify the newer ones were NOT delivered
++        async with system_tx(pg_pool) as conn:
++            remaining_count = await conn.fetchval(
++                "SELECT COUNT(*) FROM plugin_notices WHERE tenant_id = $1 AND delivered_at IS NULL",
++                tenant_id,
++            )
++        assert remaining_count == 3
++
++
++# Strict xfail test for ordering bug - needs to be verified to fail deterministically
++class TestDeliverPendingListOrder:
++    """Tests for deliver_pending list order - expects bug to exist."""
++
++    @pytest.mark.xfail(
++        reason="BUG: ORDER BY ... LIMIT in subquery does not propagate to RETURNING clause",
++    )
++    @pytest.mark.asyncio
++    async def test_delivered_list_is_oldest_first(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """The returned list should be in oldest-first order.
++
++        However, Postgres does not guarantee UPDATE...RETURNING preserves ORDER BY
++        from the subquery in the WHERE clause. This test documents that bug.
++        """
++        tenant_id = notices_setup["tenant_id"]
++
++        # Insert 5 notices in physical order that is REVERSE of created_at order
++        # This makes the bug more likely to manifest
++        base = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
++
++        async with system_tx(pg_pool) as conn:
++            for i in range(5):
++                await conn.execute(
++                    """
++                    INSERT INTO plugin_notices
++                    (tenant_id, plugin_id, kind, template, payload, expires_at, created_at)
++                    VALUES ($1, 'p', 'kind-' || $2, 'template-' || $2, '{}'::jsonb, now() + '1 hour'::interval, $3)
++                    """,
++                    tenant_id,
++                    str(i),
++                    base + timedelta(hours=i),
++                )
++
++        # Deliver with limit=5
++        async with system_tx(pg_pool) as conn:
++            delivered = await deliver_pending(conn, tenant_id, limit=5)
++
++        # The list should be ordered oldest first (kind-0, kind-1, ...)
++        kinds = [n.kind for n in delivered]
++        expected = [f"kind-{i}" for i in range(5)]
++        assert kinds == expected, f"Expected {expected}, got {kinds}"
++
++    @pytest.mark.xfail(
++        reason="BUG: deliver_pending ordering may not be preserved; test multiple insertions",
++    )
++    @pytest.mark.asyncio
++    async def test_delivered_list_order_multiple_inserts(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Multiple insertions may cause ordering to differ from created_at order."""
++        tenant_id = notices_setup["tenant_id"]
++
++        # Insert 10 notices with different created_at times
++        base = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
++
++        async with system_tx(pg_pool) as conn:
++            for i in range(10):
++                await conn.execute(
++                    """
++                    INSERT INTO plugin_notices
++                    (tenant_id, plugin_id, kind, template, payload, expires_at, created_at)
++                    VALUES ($1, 'p', 'kind-' || $2, 'template-' || $2, '{}'::jsonb, now() + '1 hour'::interval, $3)
++                    """,
++                    tenant_id,
++                    str(i),
++                    base + timedelta(minutes=i),
++                )
++
++        # Deliver all with limit=10
++        async with system_tx(pg_pool) as conn:
++            delivered = await deliver_pending(conn, tenant_id, limit=10)
++
++        # Should be in created_at order
++        kinds = [n.kind for n in delivered]
++        expected = [f"kind-{i}" for i in range(10)]
++        assert kinds == expected, f"Expected {expected}, got {kinds}"
++
++
++# --------------------------------------------------------------------------
++# delivered_pending tests
++# --------------------------------------------------------------------------
++
++
++class TestDeliverPending:
++    """Tests for deliver_pending function."""
++
++    @pytest.mark.asyncio
++    async def test_returns_empty_list_when_no_pending(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Should return empty list when there are no pending notices."""
++        tenant_id = notices_setup["tenant_id"]
++
++        async with system_tx(pg_pool) as conn:
++            result = await deliver_pending(conn, tenant_id, limit=10)
++
++        assert result == []
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: ORDER BY ... LIMIT in subquery does not propagate to RETURNING clause",
++    )
++    @pytest.mark.asyncio
++    async def test_returns_pending_notices_oldest_first(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Should return pending notices ordered by created_at ascending."""
++        tenant_id = notices_setup["tenant_id"]
++
++        # Insert multiple notices with different created_at times
++        base = datetime(2025, 6, 1, 12, 0, tzinfo=UTC)
++
++        async with system_tx(pg_pool) as conn:
++            # Insert in different order to verify ordering
++            await conn.execute(
++                """
++                INSERT INTO plugin_notices
++                (tenant_id, plugin_id, kind, template, payload, expires_at)
++                VALUES
++                    ($1, 'p1', 'kind3', 'template3', '{}'::jsonb, now() + '1 hour'::interval),
++                    ($1, 'p1', 'kind2', 'template2', '{}'::jsonb, now() + '1 hour'::interval),
++                    ($1, 'p1', 'kind1', 'template1', '{}'::jsonb, now() + '1 hour'::interval)
++                """,
++                tenant_id,
++            )
++
++        async with system_tx(pg_pool) as conn:
++            # Set explicit creation times
++            await conn.execute(
++                """
++                UPDATE plugin_notices
++                SET created_at = CASE kind
++                    WHEN 'kind1' THEN $2::timestamptz
++                    WHEN 'kind2' THEN $3::timestamptz
++                    WHEN 'kind3' THEN $4::timestamptz
++                END
++                WHERE tenant_id = $1
++                """,
++                tenant_id,
++                base,
++                base + timedelta(hours=1),
++                base + timedelta(hours=2),
++            )
++
++        async with system_tx(pg_pool) as conn:
++            result = await deliver_pending(conn, tenant_id, limit=10)
++
++        # Should be in created_at ascending order: kind1, kind2, kind3
++        assert len(result) == 3
++        assert result[0].kind == "kind1"
++        assert result[1].kind == "kind2"
++        assert result[2].kind == "kind3"
++
++    @pytest.mark.asyncio
++    async def test_respects_limit(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Should return at most limit notices."""
++        tenant_id = notices_setup["tenant_id"]
++
++        # Queue 25 notices
++        for i in range(25):
++            client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++            await client.queue(f"kind-{i}", f"template-{i}", {"n": i})
++
++        async with system_tx(pg_pool) as conn:
++            result = await deliver_pending(conn, tenant_id, limit=20)
++
++        # Should return exactly 20
++        assert len(result) == 20
++
++    @pytest.mark.asyncio
++    async def test_deliver_pending_without_limit(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """deliver_pending called without limit should return default 20."""
++        tenant_id = notices_setup["tenant_id"]
++
++        # Queue 25 notices
++        for i in range(25):
++            client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++            await client.queue(f"kind-{i}", f"template-{i}", {"n": i})
++
++        async with system_tx(pg_pool) as conn:
++            # Call without limit parameter (uses default)
++            result = await deliver_pending(conn, tenant_id)
++
++        # Should return exactly 20 by default
++        assert len(result) == 20
++
++        # The remaining 5 should still be pending
++        async with system_tx(pg_pool) as conn:
++            remaining = await conn.fetchrow(
++                "SELECT COUNT(*) as count FROM plugin_notices WHERE tenant_id = $1 AND delivered_at IS NULL",
++                tenant_id,
++            )
++        assert remaining["count"] == 5
++
++    @pytest.mark.asyncio
++    async def test_deliver_pending_default_21_returns_20_next_returns_1(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """deliver_pending with 21 pending, default limit, should return 20 then 1."""
++        tenant_id = notices_setup["tenant_id"]
++
++        # Queue exactly 21 notices
++        for i in range(21):
++            client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++            await client.queue(f"kind-{i}", f"template-{i}", {"n": i})
++
++        # First call - default limit is 20
++        async with system_tx(pg_pool) as conn:
++            result1 = await deliver_pending(conn, tenant_id)
++
++        assert len(result1) == 20
++        # Verify they are the oldest (indices 0-19)
++        indices = {n.payload["n"] for n in result1}
++        assert indices == set(range(20))
++
++        # Second call - should return remaining 1
++        async with system_tx(pg_pool) as conn:
++            result2 = await deliver_pending(conn, tenant_id)
++
++        assert len(result2) == 1
++        assert result2[0].payload["n"] == 20
++        # Third call - no more pending
++        async with system_tx(pg_pool) as conn:
++            result3 = await deliver_pending(conn, tenant_id)
++        assert len(result3) == 0
++
++
++    @pytest.mark.asyncio
++    async def test_at_most_once_delivery(self, pg_pool: Any, notices_setup: dict[str, Any]) -> None:
++        """Each notice should be delivered at most once."""
++        tenant_id = notices_setup["tenant_id"]
++
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++        await client.queue("kind-1", "template-1", {})
++
++        # First delivery
++        async with system_tx(pg_pool) as conn:
++            result1 = await deliver_pending(conn, tenant_id, limit=10)
++
++        # Second delivery - same notice should not appear
++        async with system_tx(pg_pool) as conn:
++            result2 = await deliver_pending(conn, tenant_id, limit=10)
++
++        assert len(result1) == 1
++        assert len(result2) == 0  # Already delivered
++
++    @pytest.mark.asyncio
++    async def test_expired_notices_not_delivered(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Notices with expires_at <= now should not be delivered."""
++        tenant_id = notices_setup["tenant_id"]
++
++        # Insert an expired notice directly
++        async with system_tx(pg_pool) as conn:
++            await conn.execute(
++                """
++                INSERT INTO plugin_notices
++                (tenant_id, plugin_id, kind, template, payload, expires_at, created_at)
++                VALUES
++                    ($1, 'tester', 'expired', 'expired template', '{}'::jsonb, now() - '1 hour'::interval, now() - '2 hours'::interval)
++                """,
++                tenant_id,
++            )
++
++        # Insert a valid notice
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++        await client.queue("valid", "valid template", {})
++
++        async with system_tx(pg_pool) as conn:
++            result = await deliver_pending(conn, tenant_id, limit=10)
++
++        # Should only get the valid notice, not the expired one
++        assert len(result) == 1
++        assert result[0].kind == "valid"
++
++    @pytest.mark.asyncio
++    async def test_delivered_at_set_after_delivery(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """delivered_at should be set after successful delivery."""
++        tenant_id = notices_setup["tenant_id"]
++
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++        await client.queue("kind-1", "template-1", {})
++
++        async with system_tx(pg_pool) as conn:
++            await deliver_pending(conn, tenant_id, limit=10)
++
++        # Check delivered_at is now set
++        async with system_tx(pg_pool) as conn:
++            row = await conn.fetchrow(
++                "SELECT delivered_at FROM plugin_notices WHERE tenant_id = $1",
++                tenant_id,
++            )
++
++        assert row["delivered_at"] is not None
++
++    @pytest.mark.asyncio
++    async def test_tenant_isolation(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Notices from other tenants should not be delivered."""
++        tenant_a = notices_setup["tenant_id"]
++
++        # Set up tenant B
++        from mem_mcp.teams.assignments import assign_role
++
++        tenant_b = uuid4()
++        team_b = uuid4()
++        client_id_b = f"client:plugin-{tenant_b.hex[:8]}"
++
++        async with system_tx(pg_pool) as conn:
++            await conn.execute(
++                "INSERT INTO tenants (id, email, status) VALUES ($1, $2, 'active')",
++                tenant_b,
++                f"tenant-b-{tenant_b.hex[:8]}@test.invalid",
++            )
++            await conn.execute(
++                "INSERT INTO teams (id, name, created_by_tenant_id) VALUES ($1, $2, $3)",
++                team_b,
++                f"team-b-{tenant_b.hex[:8]}",
++                tenant_b,
++            )
++            await assign_role(
++                conn,
++                parent_team_id=team_b,
++                member_kind="user",
++                member_id=tenant_b,
++                role_key="member",
++                assigned_by_user_id=tenant_b,
++            )
++            await conn.execute(
++                """
++                INSERT INTO oauth_clients
++                (id, redirect_uris, scope, registration_payload, review_status)
++                VALUES ($1, ARRAY[]::text[], 'memory.read', '{}'::jsonb, 'auto_allowed')
++                """,
++                client_id_b,
++            )
++
++            # Insert notice for tenant A
++            await conn.execute(
++                """
++                INSERT INTO plugin_notices
++                (tenant_id, plugin_id, kind, template, payload, expires_at)
++                VALUES ($1, 'pA', 'kindA', 'templateA', '{}'::jsonb, now() + '1 hour'::interval)
++                """,
++                tenant_a,
++            )
++
++            # Insert notice for tenant B
++            await conn.execute(
++                """
++                INSERT INTO plugin_notices
++                (tenant_id, plugin_id, kind, template, payload, expires_at)
++                VALUES ($1, 'pB', 'kindB', 'templateB', '{}'::jsonb, now() + '1 hour'::interval)
++                """,
++                tenant_b,
++            )
++
++        try:
++            # Deliver for tenant A
++            async with system_tx(pg_pool) as conn:
++                result_a = await deliver_pending(conn, tenant_a, limit=10)
++
++            # Deliver for tenant B
++            async with system_tx(pg_pool) as conn:
++                result_b = await deliver_pending(conn, tenant_b, limit=10)
++
++            assert len(result_a) == 1
++            assert result_a[0].kind == "kindA"
++            assert len(result_b) == 1
++            assert result_b[0].kind == "kindB"
++        finally:
++            async with system_tx(pg_pool) as conn:
++                await conn.execute("DELETE FROM plugin_notices WHERE tenant_id IN ($1, $2)", tenant_a, tenant_b)
++                await conn.execute("DELETE FROM oauth_clients WHERE id = $1", client_id_b)
++                await conn.execute("DELETE FROM team_role_assignments WHERE parent_team_id = $1", team_b)
++                await conn.execute("DELETE FROM tenant_identities WHERE tenant_id = $1", tenant_b)
++                await conn.execute("DELETE FROM teams WHERE id = $1", team_b)
++                await conn.execute("DELETE FROM tenants WHERE id = $1", tenant_b)
++
++
++# --------------------------------------------------------------------------
++# Delivered payload tests
++# --------------------------------------------------------------------------
++
++
++class TestDeliveredPayload:
++    """Tests for payload returned by deliver_pending."""
++
++    @pytest.mark.asyncio
++    async def test_payload_as_dict_passthrough(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Payload dict should be returned as-is."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        payload = {"key": "value", "num": 42}
++        await client.queue("test", "template", payload)
++
++        async with system_tx(pg_pool) as conn:
++            result = await deliver_pending(conn, tenant_id, limit=10)
++
++        assert len(result) == 1
++        assert result[0].payload == payload
++
++    @pytest.mark.asyncio
++    async def test_payload_as_str_jsonb(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Payload stored as string JSONB should be parsed to dict."""
++        tenant_id = notices_setup["tenant_id"]
++
++        # Insert directly with string payload to simulate asyncpg behavior
++        async with system_tx(pg_pool) as conn:
++            await conn.execute(
++                """
++                INSERT INTO plugin_notices
++                (tenant_id, plugin_id, kind, template, payload, expires_at)
++                VALUES
++                    ($1, 'p', 'k', 't', $2::jsonb, now() + '1 hour'::interval)
++                """,
++                tenant_id,
++                json.dumps({"foo": "bar"}),
++            )
++
++        async with system_tx(pg_pool) as conn:
++            result = await deliver_pending(conn, tenant_id, limit=10)
++
++        assert len(result) == 1
++        assert result[0].payload == {"foo": "bar"}
++
++    @pytest.mark.asyncio
++    async def test_empty_string_payload_returns_empty_dict(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Empty string payload should be returned as empty dict."""
++        tenant_id = notices_setup["tenant_id"]
++
++        # Insert with empty JSON object payload
++        async with system_tx(pg_pool) as conn:
++            await conn.execute(
++                """
++                INSERT INTO plugin_notices
++                (tenant_id, plugin_id, kind, template, payload, expires_at)
++                VALUES
++                    ($1, 'p', 'k', 't', '{}'::jsonb, now() + '1 hour'::interval)
++                """,
++                tenant_id,
++            )
++
++        async with system_tx(pg_pool) as conn:
++            result = await deliver_pending(conn, tenant_id, limit=10)
++
++        assert len(result) == 1
++        assert result[0].payload == {}
++
++
++# --------------------------------------------------------------------------
++# Integration: queue + delivery roundtrip
++# --------------------------------------------------------------------------
++
++
++class TestQueueDeliveryRoundtrip:
++    """End-to-end tests for full queue and delivery flow."""
++
++    @pytest.mark.asyncio
++    async def test_full_roundtrip(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Test full queue -> deliver roundtrip."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "reminders")
++
++        # Queue a notice
++        await client.queue(
++            "reminder_fired",
++            "Reminder: {content} due at {time}",
++            {
++                "content": "Check documentation",
++                "time": "14:00 UTC",
++                "reminder_id": str(uuid4()),
++            },
++            ttl_seconds=3600,
++        )
++
++        # Deliver it
++        async with system_tx(pg_pool) as conn:
++            delivered = await deliver_pending(conn, tenant_id, limit=10)
++
++        assert len(delivered) == 1
++        notice = delivered[0]
++        assert notice.plugin_id == "reminders"
++        assert notice.kind == "reminder_fired"
++        assert notice.text == "Reminder: Check documentation due at 14:00 UTC"
++        assert "content" in notice.payload
++        assert "time" in notice.payload
++
++    @pytest.mark.asyncio
++    async def test_multiple_queued_same_kind(
++        self, pg_pool: Any, notices_setup: dict[str, Any]
++    ) -> None:
++        """Multiple notices of same kind should all be delivered."""
++        tenant_id = notices_setup["tenant_id"]
++        client = NoticeClientImpl(pg_pool, tenant_id, "test-plugin")
++
++        for i in range(5):
++            await client.queue(f"kind-{i}", f"template-{i}", {"n": i})
++
++        async with system_tx(pg_pool) as conn:
++            delivered = await deliver_pending(conn, tenant_id, limit=10)
++
++        assert len(delivered) == 5
++
++
++# --------------------------------------------------------------------------
++# _render direct tests for integration
++# --------------------------------------------------------------------------
++
++
++class TestRenderFunction:
++    """Tests for _render function called from deliver_pending."""
++
++    def test_simple_template_substitution(self) -> None:
++        """Template with single placeholder should be substituted."""
++        from mem_mcp.plugins.notice_delivery import _render
++
++        text = _render("Hello {name}", {"name": "World"})
++        assert text == "Hello World"
++
++    def test_multiple_placeholders(self) -> None:
++        """Template with multiple placeholders should all be substituted."""
++        text = _render("{a} and {b} and {c}", {"a": "1", "b": "2", "c": "3"})
++        assert text == "1 and 2 and 3"
++
++    def test_missing_key_empty_string(self) -> None:
++        """Missing placeholder key should render as empty string."""
++        text = _render("Value: {missing}", {"other": "present"})
++        assert text == "Value: "
++
++    def test_non_identifier_braces_unchanged(self) -> None:
++        """Braces that don't match identifier pattern should be unchanged."""
++        text = _render("Not {1abc} or { key } or {}", {})
++        assert text == "Not {1abc} or { key } or {}"
++
++
++# --------------------------------------------------------------------------
++# RenderedNotice extras tests
++# --------------------------------------------------------------------------
++
++
++class TestRenderedNoticeExtras:
++    """Additional tests for RenderedNotice extras from order-2.md section 5."""
++
++    def test_to_dict_exact_equality(self) -> None:
++        """RenderedNotice.to_dict() should return exact dict equality."""
++
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="reminders",
++            kind="reminder_fired",
++            text="Your reminder: check the docs",
++            payload={"reminder_id": "r1", "action": "view"},
++            created_at=datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC),
++        )
++
++        result = notice.to_dict()
++        expected = {
++            "id": str(notice.id),
++            "plugin_id": "reminders",
++            "kind": "reminder_fired",
++            "text": "Your reminder: check the docs",
++            "payload": {"reminder_id": "r1", "action": "view"},
++            "created_at": "2026-06-15T12:00:00+00:00",
++        }
++        assert result == expected
++
++    def test_to_dict_id_is_string(self) -> None:
++        """id should be string in to_dict output."""
++        from uuid import uuid4
++
++        uid = uuid4()
++        notice = RenderedNotice(
++            id=uid,
++            plugin_id="test",
++            kind="test_kind",
++            text="test text",
++            payload={},
++            created_at=datetime.now(tz=UTC),
++        )
++
++        result = notice.to_dict()
++        assert isinstance(result["id"], str)
++        assert result["id"] == str(uid)
++
++    def test_to_dict_created_at_isoformat(self) -> None:
++        """created_at should be ISO 8601 formatted string."""
++        dt = datetime(2026, 3, 15, 10, 30, 45, tzinfo=UTC)
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="test",
++            kind="test",
++            text="test",
++            payload={},
++            created_at=dt,
++        )
++
++        result = notice.to_dict()
++        assert result["created_at"] == "2026-03-15T10:30:45+00:00"
++
++    def test_to_dict_payload_passthrough(self) -> None:
++        """payload should be passed through unchanged."""
++        payload = {
++            "string_val": "hello",
++            "int_val": 42,
++            "bool_val": True,
++            "nested": {"a": 1, "b": [1, 2, 3]},
++        }
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="test",
++            kind="test",
++            text="test",
++            payload=payload,
++            created_at=datetime.now(tz=UTC),
++        )
++
++        result = notice.to_dict()
++        assert result["payload"] == payload
++
++
++# --------------------------------------------------------------------------
++# _render extras tests from order-2.md section 5
++# --------------------------------------------------------------------------
++
++
++class TestRenderExtras:
++    """Additional tests for _render function from order-2.md section 5."""
++
++    def test_repeated_key_substitution(self) -> None:
++        """Repeated key references should all be substituted."""
++        text = _render("{x} and {x}", {"x": "same"})
++        assert text == "same and same"
++
++    def test_non_string_values_coerced(self) -> None:
++        """Non-string values should be coerced via str()."""
++        # int
++        text = _render("count={n}", {"n": 42})
++        assert text == "count=42"
++
++        # None
++        text = _render("value={v}", {"v": None})
++        assert text == "value=None"
++
++        # list
++        text = _render("items={lst}", {"lst": [1, 2, 3]})
++        assert text == "items=[1, 2, 3]"
++
++    def test_template_truncation_on_missing_key(self, caplog: pytest.LogCaptureFixture) -> None:
++        """Warning should include truncated template (max 120 chars)."""
++        import logging
++
++        long_template = "x" * 200 + " {missing}"
++        with caplog.at_level(logging.WARNING):
++            _render(long_template, {})
++
++        for record in caplog.records:
++            if "notice_template_missing_key" in record.message:
++                # Check template is truncated to 120 chars
++                assert len(record.template) == 120  # type: ignore[attr-defined]
++                assert record.key == "missing"  # type: ignore[attr-defined]
++
++    def test_brace_patterns_untouched(self) -> None:
++        """{1a}, { a } patterns should be untouched (not matched)."""
++        text = _render("Not {1a} or { a }", {})
++        assert text == "Not {1a} or { a }"
++
++    def test_brace_patterns_empty_untouched(self) -> None:
++        """Empty braces {} should be untouched."""
++        text = _render("empty={}", {})
++        assert text == "empty={}"
++
++    def test_double_brace_escaped(self) -> None:
++        """Double braces {{a}} should render as {} (single brace passes through, second matches)."""
++        # {a} is matched, and since 'a' is not in payload, it renders as empty
++        text = _render("escaped={{a}}", {})
++        assert text == "escaped={}"
+diff --git a/tests/unit/test_memory_list_contract.py b/tests/unit/test_memory_list_contract.py
+new file mode 100644
+index 0000000..72fcdb8
+--- /dev/null
++++ b/tests/unit/test_memory_list_contract.py
+@@ -0,0 +1,1179 @@
++# mypy: disable-error-code="attr-defined"
++# BaseTool.__call__ is declared to return BaseModel, so mypy cannot see the
++# concrete output models' fields. Suppressed at module level; the assertions
++# themselves are what give these tests value.
++"""Behavioural contract tests for memory_list tool.
++
++Tests the InputModel validation, cursor helpers, SQL generation,
++audit details, deps-missing error, and output model structure.
++Pure/mocked tests - no real DB required.
++"""
++
++from __future__ import annotations
++
++import base64
++import json
++import logging
++from contextlib import asynccontextmanager
++from datetime import UTC, datetime
++from typing import Any
++from unittest.mock import AsyncMock, MagicMock
++from uuid import UUID, uuid4
++
++import pytest
++from pydantic import ValidationError
++
++from mem_mcp.audit.logger import NoopAuditLogger
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tools._base import ToolContext
++from mem_mcp.mcp.tools._deps import NoopQuotas, ToolDeps
++from mem_mcp.mcp.tools.list import (
++    MemoryListInput,
++    MemoryListTool,
++    MemoryType,
++    _decode_cursor,
++    _encode_cursor,
++)
++from mem_mcp.plugins.notice_delivery import RenderedNotice, _render
++
++# --------------------------------------------------------------------------
++# Helper functions and fixtures
++# --------------------------------------------------------------------------
++
++
++def _build_ctx(
++    *, db_pool: Any = None, deps: ToolDeps | None = None
++) -> ToolContext:
++    """Build a minimal ToolContext for testing."""
++    if deps is None:
++        deps = ToolDeps(
++            embeddings=MagicMock(),
++            audit=NoopAuditLogger(),
++            quotas=NoopQuotas(),
++        )
++    return ToolContext(
++        request_id=str(uuid4()),
++        tenant_id=uuid4(),
++        identity_id=uuid4(),
++        client_id="test-client",
++        scopes=frozenset(["memory.read"]),
++        db_pool=db_pool or MagicMock(),
++        deps=deps,
++    )
++
++
++class CapturingAuditLogger:
++    """Audit logger that captures calls for assertion."""
++
++    def __init__(self) -> None:
++        self.calls: list[dict[str, Any]] = []
++
++    async def audit(
++        self,
++        conn: Any,
++        *,
++        action: str,
++        result: str,
++        tenant_id: UUID,
++        identity_id: str | None = None,
++        client_id: str | None = None,
++        target_id: Any = None,
++        target_kind: str | None = None,
++        ip_address: str | None = None,
++        user_agent: str | None = None,
++        request_id: str | None = None,
++        error_code: str | None = None,
++        details: dict[str, Any] | None = None,
++    ) -> None:
++        self.calls.append(
++            {
++                "action": action,
++                "result": result,
++                "tenant_id": tenant_id,
++                "identity_id": identity_id,
++                "client_id": client_id,
++                "target_id": target_id,
++                "target_kind": target_kind,
++                "ip_address": ip_address,
++                "user_agent": user_agent,
++                "request_id": request_id,
++                "error_code": error_code,
++                "details": details,
++            }
++        )
++
++
++def _patch_tenant_tx(
++    monkeypatch: pytest.MonkeyPatch, conn: AsyncMock
++) -> None:
++    """Patch tenant_tx to yield our fake conn."""
++
++    @asynccontextmanager
++    async def fake_tx(pool: Any, tenant_id: Any) -> Any:
++        yield conn
++
++    monkeypatch.setattr("mem_mcp.mcp.tools.list.tenant_tx", fake_tx)
++
++
++# --------------------------------------------------------------------------
++# MemoryListInput validation tests
++# --------------------------------------------------------------------------
++
++
++class TestMemoryListInputDefaults:
++    """Test that input model defaults match the spec."""
++
++    def test_defaults(self) -> None:
++        inp = MemoryListInput()
++        assert inp.tags is None
++        assert inp.type is None
++        assert inp.since is None
++        assert inp.until is None
++        assert inp.include_deleted is False
++        assert inp.include_expired is False
++        assert inp.include_history is False
++        assert inp.order_by == "created_at"
++        assert inp.order == "desc"
++        assert inp.limit == 25
++        assert inp.cursor is None
++
++    def test_extra_forbidden(self) -> None:
++        with pytest.raises(ValidationError):
++            MemoryListInput.model_validate({"content": "x"})
++
++
++class TestMemoryListInputLimitBounds:
++    """Test limit bounds: 1-100."""
++
++    def test_limit_1_accepted(self) -> None:
++        inp = MemoryListInput(limit=1)
++        assert inp.limit == 1
++
++    def test_limit_100_accepted(self) -> None:
++        inp = MemoryListInput(limit=100)
++        assert inp.limit == 100
++
++    def test_limit_0_rejected(self) -> None:
++        with pytest.raises(ValidationError):
++            MemoryListInput(limit=0)
++
++    def test_limit_101_rejected(self) -> None:
++        with pytest.raises(ValidationError):
++            MemoryListInput(limit=101)
++
++
++class TestMemoryListInputKeywordsBounds:
++    """Test keywords min/max length: 1..512."""
++
++    def test_keywords_min_length_1(self) -> None:
++        inp = MemoryListInput(keywords="a")
++        assert inp.keywords == "a"
++
++    def test_keywords_max_length_512(self) -> None:
++        inp = MemoryListInput(keywords="a" * 512)
++        assert len(inp.keywords) == 512
++
++    def test_keywords_empty_rejected(self) -> None:
++        with pytest.raises(ValidationError):
++            MemoryListInput(keywords="")
++
++    def test_keywords_too_long_rejected(self) -> None:
++        with pytest.raises(ValidationError):
++            MemoryListInput(keywords="a" * 513)
++
++
++class TestMemoryListInputTypeValues:
++    """Test valid/invalid type values."""
++
++    def test_valid_types_accepted(self) -> None:
++        valid_types: list[MemoryType] = [
++            "note", "decision", "fact", "snippet", "question", "position", "challenge"
++        ]
++        for t in valid_types:
++            inp = MemoryListInput(type=t)
++            assert inp.type == t
++
++    def test_invalid_type_rejected(self) -> None:
++        with pytest.raises(ValidationError):
++            MemoryListInput(type="invalid")
++
++
++class TestMemoryListInputOrderValues:
++    """Test valid/invalid order values."""
++
++    def test_order_asc_accepted(self) -> None:
++        inp = MemoryListInput(order="asc")
++        assert inp.order == "asc"
++
++    def test_order_desc_accepted(self) -> None:
++        inp = MemoryListInput(order="desc")
++        assert inp.order == "desc"
++
++    def test_invalid_order_rejected(self) -> None:
++        with pytest.raises(ValidationError):
++            MemoryListInput(order="invalid")
++
++
++class TestMemoryListInputOrderByValues:
++    """Test valid/invalid order_by values."""
++
++    def test_order_by_created_at_accepted(self) -> None:
++        inp = MemoryListInput(order_by="created_at")
++        assert inp.order_by == "created_at"
++
++    def test_order_by_updated_at_accepted(self) -> None:
++        inp = MemoryListInput(order_by="updated_at")
++        assert inp.order_by == "updated_at"
++
++    def test_invalid_order_by_rejected(self) -> None:
++        with pytest.raises(ValidationError):
++            MemoryListInput(order_by="invalid")
++
++
++# --------------------------------------------------------------------------
++# Cursor encoding/decoding tests
++# --------------------------------------------------------------------------
++
++
++class TestCursorEncoding:
++    """Tests for _encode_cursor function."""
++
++    def test_raises_on_none_value(self) -> None:
++        with pytest.raises(ValueError, match="order_by_value cannot be None"):
++            _encode_cursor(None, uuid4())
++
++    def test_encodes_datetime_as_iso(self) -> None:
++        dt = datetime(2025, 5, 1, 12, 30, 45, tzinfo=UTC)
++        id_ = uuid4()
++        cursor = _encode_cursor(dt, id_)
++
++        # Decode and verify
++        decoded = json.loads(base64.urlsafe_b64decode(cursor))
++        assert decoded[0] == "2025-05-01T12:30:45+00:00"
++        assert decoded[1] == str(id_)
++
++    def test_cursor_is_urlsafe_base64(self) -> None:
++        dt = datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC)
++        id_ = uuid4()
++        cursor = _encode_cursor(dt, id_)
++
++        # Should only contain URL-safe base64 chars
++        for c in cursor:
++            assert c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_="
++
++
++class TestCursorDecoding:
++    """Tests for _decode_cursor function."""
++
++    def test_round_trip(self) -> None:
++        dt = datetime(2025, 6, 15, 14, 22, 33, tzinfo=UTC)
++        id_ = uuid4()
++        encoded = _encode_cursor(dt, id_)
++        result_dt, result_id = _decode_cursor(encoded)
++
++        assert result_id == str(id_)
++        assert result_dt == dt.isoformat()
++
++    def test_decodes_correct_types(self) -> None:
++        dt = datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC)
++        id_ = uuid4()
++        encoded = _encode_cursor(dt, id_)
++        dt_iso, id_str = _decode_cursor(encoded)
++
++        # dt_iso is a string, id_str is a string
++        assert isinstance(dt_iso, str)
++        assert isinstance(id_str, str)
++
++    def test_non_base64_garbage_raises_valueerror(self) -> None:
++        with pytest.raises(ValueError):
++            _decode_cursor("not valid base64!!!")
++
++    def test_base64_non_json_raises_valueerror(self) -> None:
++        # Valid base64 that doesn't decode to JSON
++        garbage = base64.urlsafe_b64encode(b"not json").decode()
++        with pytest.raises(ValueError):
++            _decode_cursor(garbage)
++
++    def test_base64_json_array_missing_elements(self) -> None:
++        # Base64 of JSON array with wrong structure
++        payload = base64.urlsafe_b64encode(json.dumps([]).encode()).decode()
++        with pytest.raises(ValueError):
++            _decode_cursor(payload)
++
++    # These three xfails removed per order-2.md section 3
++
++
++class TestCursorInvalidInputAtDecoderLevel:
++    """Tests for invalid cursor inputs at _decode_cursor level.
++
++    Per order-2.md section 3, these xfails at the _decode_cursor level are removed,
++    but the issues still exist - they're just not validated at decode time.
++    """
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: extra array elements are not rejected by _decode_cursor",
++    )
++    def test_base64_json_array_extra_element(self) -> None:
++        # Array with too many elements - function currently accepts this
++        payload = base64.urlsafe_b64encode(
++            json.dumps(["2025-01-01T00:00:00+00:00", "uuid-here", "extra"]).encode()
++        ).decode()
++        with pytest.raises(ValueError):
++            _decode_cursor(payload)
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: JSON object input raises KeyError instead of ValueError",
++    )
++    def test_base64_json_object_rejected(self) -> None:
++        # JSON object instead of array - KeyError is not caught
++        payload = base64.urlsafe_b64encode(json.dumps({"a": 1}).encode()).decode()
++        with pytest.raises(ValueError):
++            _decode_cursor(payload)
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: JSON number input raises TypeError instead of ValueError",
++    )
++    def test_base64_json_number_rejected(self) -> None:
++        # JSON number - TypeError is not caught
++        payload = base64.urlsafe_b64encode(json.dumps(5).encode()).decode()
++        with pytest.raises(ValueError):
++            _decode_cursor(payload)
++
++
++class TestInvalidCursorAtToolLevel:
++    """Tests for invalid cursor passed to MemoryListTool - verifies JsonRpcError code -32602.
++
++    Per order-2.md section 3, invalid cursor bugs are reframed at the TOOL level.
++    The contract is: an invalid cursor passed to MemoryListTool must raise
++    JsonRpcError code -32602, message "invalid cursor".
++    """
++
++    @pytest.mark.asyncio
++    async def test_garbage_non_base64_raises_jsonrpc_error(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Garbage non-base64 should raise JsonRpcError with code -32602."""
++        tool = MemoryListTool()
++        mock_conn = AsyncMock()
++        mock_conn.fetch = AsyncMock(return_value=[])
++        _patch_tenant_tx(monkeypatch, mock_conn)
++
++        ctx = _build_ctx()
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, MemoryListInput(cursor="not valid base64!!!"))
++
++        assert exc_info.value.code == -32602
++        assert "invalid cursor" in exc_info.value.message
++
++    @pytest.mark.asyncio
++    async def test_base64_non_json_raises_jsonrpc_error(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Base64 non-JSON should raise JsonRpcError with code -32602."""
++        tool = MemoryListTool()
++        mock_conn = AsyncMock()
++        mock_conn.fetch = AsyncMock(return_value=[])
++        _patch_tenant_tx(monkeypatch, mock_conn)
++
++        # Valid base64 that doesn't decode to JSON
++        garbage = base64.urlsafe_b64encode(b"not json").decode()
++
++        ctx = _build_ctx()
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, MemoryListInput(cursor=garbage))
++
++        assert exc_info.value.code == -32602
++        assert "invalid cursor" in exc_info.value.message
++
++    @pytest.mark.asyncio
++    async def test_base64_empty_array_raises_jsonrpc_error(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Base64 of empty JSON array should raise JsonRpcError with code -32602."""
++        tool = MemoryListTool()
++        mock_conn = AsyncMock()
++        mock_conn.fetch = AsyncMock(return_value=[])
++        _patch_tenant_tx(monkeypatch, mock_conn)
++
++        payload = base64.urlsafe_b64encode(json.dumps([]).encode()).decode()
++
++        ctx = _build_ctx()
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, MemoryListInput(cursor=payload))
++
++        assert exc_info.value.code == -32602
++        assert "invalid cursor" in exc_info.value.message
++
++    @pytest.mark.asyncio
++    async def test_base64_single_element_array_raises_jsonrpc_error(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Base64 of single-element JSON array should raise JsonRpcError with code -32602."""
++        tool = MemoryListTool()
++        mock_conn = AsyncMock()
++        mock_conn.fetch = AsyncMock(return_value=[])
++        _patch_tenant_tx(monkeypatch, mock_conn)
++
++        payload = base64.urlsafe_b64encode(json.dumps(["x"]).encode()).decode()
++
++        ctx = _build_ctx()
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, MemoryListInput(cursor=payload))
++
++        assert exc_info.value.code == -32602
++        assert "invalid cursor" in exc_info.value.message
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: base64 JSON object raises KeyError instead of JsonRpcError -32602",
++    )
++    @pytest.mark.asyncio
++    async def test_base64_json_object_raises_jsonrpc_error(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Base64 of JSON object should raise JsonRpcError with code -32602."""
++        tool = MemoryListTool()
++        mock_conn = AsyncMock()
++        mock_conn.fetch = AsyncMock(return_value=[])
++        _patch_tenant_tx(monkeypatch, mock_conn)
++
++        payload = base64.urlsafe_b64encode(json.dumps({"a": 1}).encode()).decode()
++
++        ctx = _build_ctx()
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, MemoryListInput(cursor=payload))
++
++        assert exc_info.value.code == -32602
++        assert "invalid cursor" in exc_info.value.message
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: base64 JSON number raises TypeError instead of JsonRpcError -32602",
++    )
++    @pytest.mark.asyncio
++    async def test_base64_json_number_raises_jsonrpc_error(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Base64 of JSON number should raise JsonRpcError with code -32602."""
++        tool = MemoryListTool()
++        mock_conn = AsyncMock()
++        mock_conn.fetch = AsyncMock(return_value=[])
++        _patch_tenant_tx(monkeypatch, mock_conn)
++
++        payload = base64.urlsafe_b64encode(json.dumps(5).encode()).decode()
++
++        ctx = _build_ctx()
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, MemoryListInput(cursor=payload))
++
++        assert exc_info.value.code == -32602
++        assert "invalid cursor" in exc_info.value.message
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: base64 with non-ISO timestamp string does not validate and passes through",
++    )
++    @pytest.mark.asyncio
++    async def test_base64_invalid_timestamp_raises_jsonrpc_error(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Base64 of array with invalid timestamp should raise JsonRpcError with code -32602."""
++        tool = MemoryListTool()
++        mock_conn = AsyncMock()
++        mock_conn.fetch = AsyncMock(return_value=[])
++        _patch_tenant_tx(monkeypatch, mock_conn)
++
++        # Valid JSON array but non-ISO date string
++        payload = base64.urlsafe_b64encode(
++            json.dumps(["not-a-date", str(uuid4())]).encode()
++        ).decode()
++
++        ctx = _build_ctx()
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, MemoryListInput(cursor=payload))
++
++        assert exc_info.value.code == -32602
++        assert "invalid cursor" in exc_info.value.message
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: base64 with non-UUID string does not validate and passes through",
++    )
++    @pytest.mark.asyncio
++    async def test_base64_invalid_uuid_raises_jsonrpc_error(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Base64 of array with invalid UUID should raise JsonRpcError with code -32602."""
++        tool = MemoryListTool()
++        mock_conn = AsyncMock()
++        mock_conn.fetch = AsyncMock(return_value=[])
++        _patch_tenant_tx(monkeypatch, mock_conn)
++
++        payload = base64.urlsafe_b64encode(
++            json.dumps(["2025-01-01T00:00:00+00:00", "not-a-uuid"]).encode()
++        ).decode()
++
++        ctx = _build_ctx()
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, MemoryListInput(cursor=payload))
++
++        assert exc_info.value.code == -32602
++        assert "invalid cursor" in exc_info.value.message
++
++
++class TestInvalidCursorErrorFormat:
++    """Test that invalid cursor errors have the correct format."""
++
++    @pytest.mark.asyncio
++    async def test_error_has_data_field(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """JsonRpcError should have data field with errors array."""
++        tool = MemoryListTool()
++        mock_conn = AsyncMock()
++        mock_conn.fetch = AsyncMock(return_value=[])
++        _patch_tenant_tx(monkeypatch, mock_conn)
++
++        ctx = _build_ctx()
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, MemoryListInput(cursor="invalid!!!"))
++
++        assert exc_info.value.data is not None
++        assert "errors" in exc_info.value.data
++        errors = exc_info.value.data["errors"]
++        assert isinstance(errors, list)
++
++    @pytest.mark.asyncio
++    async def test_error_data_has_cursor_path(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        """Error data should indicate cursor field error."""
++        tool = MemoryListTool()
++        mock_conn = AsyncMock()
++        mock_conn.fetch = AsyncMock(return_value=[])
++        _patch_tenant_tx(monkeypatch, mock_conn)
++
++        ctx = _build_ctx()
++        with pytest.raises(JsonRpcError) as exc_info:
++            await tool(ctx, MemoryListInput(cursor="invalid!!!"))
++
++        errors = exc_info.value.data["errors"]
++        # Should have an error for the cursor field
++        cursor_error = next((e for e in errors if e.get("path") == "cursor"), None)
++        assert cursor_error is not None
++
++
++class TestTeamIdValidation:
++    """Test team_id validation. Per order-2.md section 3: if team name/wildcard rejected, use xfail."""
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: description promises team name / '*' but input model only accepts UUID",
++    )
++    def test_team_id_accepts_team_name(self) -> None:
++        """team_id filter should accept team name as well as UUID.
++
++        Currently the input model only accepts UUID - this is a bug.
++        """
++        inp = MemoryListInput(team_id="my-team-name")
++        assert inp.team_id == "my-team-name"
++
++    @pytest.mark.xfail(
++        strict=True,
++        reason="BUG: description promises team name / '*' but input model only accepts UUID",
++    )
++    def test_team_id_accepts_wildcard(self) -> None:
++        """team_id='*' should return memories from all teams.
++
++        Currently the input model only accepts UUID - this is a bug.
++        """
++        inp = MemoryListInput(team_id="*")
++        assert inp.team_id == "*"
++
++
++# --------------------------------------------------------------------------
++# RenderedNotice extras tests from order-2.md section 5
++# --------------------------------------------------------------------------
++
++
++class TestRenderExtras:
++    """Additional tests for _render function from order-2.md section 5."""
++
++    def test_repeated_key_substitution(self) -> None:
++        """Repeated key references should all be substituted."""
++        text = _render("{x} and {x}", {"x": "same"})
++        assert text == "same and same"
++
++    def test_int_value_coerced_to_string(self) -> None:
++        """Integer values should be coerced via str()."""
++        text = _render("count={n}", {"n": 42})
++        assert text == "count=42"
++
++    def test_none_value_coerced_to_string(self) -> None:
++        """None values should be coerced via str()."""
++        text = _render("value={v}", {"v": None})
++        assert text == "value=None"
++
++    def test_list_value_coerced_to_string(self) -> None:
++        """List values should be coerced via str()."""
++        text = _render("items={lst}", {"lst": [1, 2, 3]})
++        assert text == "items=[1, 2, 3]"
++
++    def test_template_truncation_on_missing_key(self, caplog: pytest.LogCaptureFixture) -> None:
++        """Warning should include truncated template (max 120 chars)."""
++        import logging
++
++        long_template = "x" * 200 + " {missing}"
++        with caplog.at_level(logging.WARNING):
++            _render(long_template, {})
++
++        for record in caplog.records:
++            if "notice_template_missing_key" in record.message:
++                # Check template is truncated to 120 chars
++                assert len(record.template) == 120  # type: ignore[attr-defined]
++                assert record.key == "missing"  # type: ignore[attr-defined]
++
++    def test_brace_patterns_untouched(self) -> None:
++        """{1a}, { a }, {} patterns should be untouched (not valid identifiers)."""
++        text = _render("Not {1a} or { a } or {}", {})
++        assert text == "Not {1a} or { a } or {}"
++
++    def test_double_brace_escaped(self) -> None:
++        """{{a}} pattern - single braces match, missing key renders empty."""
++        text = _render("escaped={{a}}", {})
++        # {a} is matched, 'a' not in payload, renders as empty
++        assert text == "escaped={}"
++
++    def test_template_longer_than_120_chars_missing_key(
++        self, caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Template > 120 chars with missing key should log truncated template."""
++        import logging
++
++        long_template = "a" * 150 + " {missing}"
++        with caplog.at_level(logging.WARNING):
++            _render(long_template, {})
++
++        for record in caplog.records:
++            if "notice_template_missing_key" in record.message:
++                # Template should be exactly 120 chars
++                assert len(record.template) == 120  # type: ignore[attr-defined]
++                assert record.key == "missing"  # type: ignore[attr-defined]
++
++
++# --------------------------------------------------------------------------
++# RenderedNotice to_dict tests
++# --------------------------------------------------------------------------
++
++
++class TestRenderedNoticeToDict:
++    """Tests for RenderedNotice.to_dict method."""
++
++    def test_to_dict_returns_correct_structure(self) -> None:
++        """to_dict should return the expected dict structure."""
++        uid = uuid4()
++        notice = RenderedNotice(
++            id=uid,
++            plugin_id="reminders",
++            kind="reminder_fired",
++            text="Your reminder: check the docs",
++            payload={"reminder_id": "r1", "action": "view"},
++            created_at=datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC),
++        )
++
++        result = notice.to_dict()
++
++        assert result["id"] == str(uid)
++        assert result["plugin_id"] == "reminders"
++        assert result["kind"] == "reminder_fired"
++        assert result["text"] == "Your reminder: check the docs"
++        assert result["payload"] == {"reminder_id": "r1", "action": "view"}
++        assert result["created_at"] == "2026-06-15T12:00:00+00:00"
++
++    def test_to_dict_id_is_string(self) -> None:
++        """id should be converted to string in output."""
++        uid = uuid4()
++        notice = RenderedNotice(
++            id=uid,
++            plugin_id="test",
++            kind="test_kind",
++            text="test text",
++            payload={},
++            created_at=datetime.now(tz=UTC),
++        )
++
++        result = notice.to_dict()
++        assert isinstance(result["id"], str)
++        assert result["id"] == str(uid)
++
++    def test_to_dict_created_at_is_isoformat(self) -> None:
++        """created_at should be ISO 8601 formatted string."""
++        dt = datetime(2026, 3, 15, 10, 30, 45, tzinfo=UTC)
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="test",
++            kind="test",
++            text="test",
++            payload={},
++            created_at=dt,
++        )
++
++        result = notice.to_dict()
++        assert result["created_at"] == "2026-03-15T10:30:45+00:00"
++
++    def test_to_dict_payload_passthrough(self) -> None:
++        """payload should be passed through unchanged."""
++        payload = {
++            "string_val": "hello",
++            "int_val": 42,
++            "bool_val": True,
++            "nested": {"a": 1, "b": [1, 2, 3]},
++        }
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="test",
++            kind="test",
++            text="test",
++            payload=payload,
++            created_at=datetime.now(tz=UTC),
++        )
++
++        result = notice.to_dict()
++        assert result["payload"] == payload
++
++
++# --------------------------------------------------------------------------
++# class attribute tests for RenderedNotice
++# --------------------------------------------------------------------------
++
++
++class TestRenderedNoticeSlots:
++    """Test RenderedNotice has correct slots and can be instantiated."""
++
++    def test_slots_present(self) -> None:
++        """RenderedNotice should have the expected slots."""
++        assert hasattr(RenderedNotice, "__slots__")
++        slots = RenderedNotice.__slots__
++        assert "id" in slots
++        assert "plugin_id" in slots
++        assert "kind" in slots
++        assert "text" in slots
++        assert "payload" in slots
++        assert "created_at" in slots
++
++    def test_can_create_instance(self) -> None:
++        """Should be able to create an instance with all required fields."""
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="test",
++            kind="test_kind",
++            text="content",
++            payload={},
++            created_at=datetime.now(tz=UTC),
++        )
++        assert notice.id is not None
++        assert notice.plugin_id == "test"
++        assert notice.kind == "test_kind"
++        assert notice.text == "content"
++        assert notice.payload == {}
++
++
++# --------------------------------------------------------------------------
++# Log record tests for notice_template_missing_key
++# --------------------------------------------------------------------------
++
++
++class TestNoticeTemplateMissingKeyLog:
++    """Test that _render logs warning for missing keys."""
++
++    def test_logs_warning_with_key_and_template(
++        self, caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Missing key should log warning with key and truncated template."""
++        with caplog.at_level(logging.WARNING):
++            _render("Hello {name}, your {missing} is ready", {"name": "World"})
++
++        warnings = [r for r in caplog.records if "notice_template_missing_key" in r.message]
++        assert len(warnings) == 1
++        # Check extra contains key and template (added via logging extra=)
++        assert warnings[0].key == "missing"  # type: ignore[attr-defined]
++        # Template should be truncated to 120 chars
++        assert len(warnings[0].template) <= 120  # type: ignore[attr-defined]
++
++    def test_template_truncation_at_120_chars(
++        self, caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Template in warning should be truncated to exactly 120 chars."""
++        import logging
++
++        long_template = "x" * 200
++        with caplog.at_level(logging.WARNING):
++            _render(f"Template: {long_template} and {{missing}} more", {})
++
++        warnings = [r for r in caplog.records if "notice_template_missing_key" in r.message]
++        assert len(warnings) == 1
++        # Check template truncation - should be exactly 120 chars
++        template_in_warning = warnings[0].template  # type: ignore[attr-defined]
++        assert len(template_in_warning) == 120  # type: ignore[attr-defined]
++
++    def test_multiple_missing_keys_each_logs_warning(
++        self, caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Each missing key should log a separate warning."""
++        with caplog.at_level(logging.WARNING):
++            _render("{a}, {b}, {c}", {})
++
++        warnings = [r for r in caplog.records if "notice_template_missing_key" in r.message]
++        # Should have 3 warnings, one for each missing key
++        assert len(warnings) == 3
++        missing_keys = {r.key for r in warnings}  # type: ignore[attr-defined]
++        assert missing_keys == {"a", "b", "c"}
++
++
++# --------------------------------------------------------------------------
++# Combined tests for _render with various edge cases
++# --------------------------------------------------------------------------
++
++
++class TestRenderEdgeCases:
++    """Additional edge case tests for _render."""
++
++    def test_empty_string_key_in_payload(self) -> None:
++        """Empty string value in payload should render as empty."""
++        text = _render("value={k}", {"k": ""})
++        assert text == "value="
++
++    def test_zero_value_renders(self) -> None:
++        """Zero should render as '0'."""
++        text = _render("count={n}", {"n": 0})
++        assert text == "count=0"
++
++    def test_negative_number_value(self) -> None:
++        """Negative numbers should render correctly."""
++        text = _render("temp={t}", {"t": -5})
++        assert text == "temp=-5"
++
++    def test_float_value(self) -> None:
++        """Float values should render correctly."""
++        text = _render("ratio={r}", {"r": 3.14159})
++        assert text == "ratio=3.14159"
++
++    def test_newlines_in_template(self) -> None:
++        """Template with newlines should preserve them."""
++        text = _render("line1\n{key}\nline3", {"key": "line2"})
++        assert text == "line1\nline2\nline3"
++
++    def test_special_characters_preserved(self) -> None:
++        """Special characters in template should be preserved."""
++        text = _render("price: ${amount}", {"amount": "100"})
++        assert text == "price: $100"
++
++    def test_unicode_characters(self) -> None:
++        """Unicode characters should work correctly."""
++        text = _render("greeting={msg}", {"msg": "héllo wörld"})
++        assert text == "greeting=héllo wörld"
++
++    def test_int_value_in_payload(self) -> None:
++        """Integer values in payload should be coerced via str()."""
++        text = _render("count={n}", {"n": 42})
++        assert text == "count=42"
++
++    def test_none_value_in_payload(self) -> None:
++        """None values in payload should be coerced via str()."""
++        text = _render("value={v}", {"v": None})
++        assert text == "value=None"
++
++    def test_list_value_in_payload(self) -> None:
++        """List values in payload should be coerced via str()."""
++        text = _render("items={lst}", {"lst": [1, 2, 3]})
++        assert text == "items=[1, 2, 3]"
++
++    def test_dict_value_in_payload(self) -> None:
++        """Dict values in payload should be coerced via str()."""
++        text = _render("data={d}", {"d": {"a": 1}})
++        assert text == "data={'a': 1}"
++
++    def test_template_longer_than_120_chars_missing_key(
++        self, caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Template > 120 chars with missing key should log truncated template."""
++        import logging
++
++        long_template = "a" * 150 + " {missing}"
++        with caplog.at_level(logging.WARNING):
++            _render(long_template, {})
++
++        for record in caplog.records:
++            if "notice_template_missing_key" in record.message:
++                # Template should be exactly 120 chars
++                assert len(record.template) == 120  # type: ignore[attr-defined]
++                assert record.key == "missing"  # type: ignore[attr-defined]
++
++
++# --------------------------------------------------------------------------
++# _json_default tests (tested indirectly via NoticeClientImpl.queue tests)
++# --------------------------------------------------------------------------
++
++
++class TestJsonDefault:
++    """Tests for the _json_default helper function.
++
++    Imported from mem_mcp.plugins.clients.notices for use with json.dumps.
++    """
++
++    def test_datetime_returns_isoformat(self) -> None:
++        """datetime should be converted to ISO 8601 string."""
++        from mem_mcp.plugins.clients.notices import _json_default
++
++        dt = datetime(2026, 6, 15, 14, 30, 45, tzinfo=UTC)
++        result = _json_default(dt)
++        assert result == "2026-06-15T14:30:45+00:00"
++
++    def test_date_returns_isoformat(self) -> None:
++        """date should be converted to ISO 8601 date string."""
++        from datetime import date
++
++        from mem_mcp.plugins.clients.notices import _json_default
++
++        d = date(2026, 6, 15)
++        result = _json_default(d)
++        assert result == "2026-06-15"
++
++    def test_uuid_returns_stringified(self) -> None:
++        """UUID should be converted to its string representation."""
++        from mem_mcp.plugins.clients.notices import _json_default
++
++        u = uuid4()
++        result = _json_default(u)
++        assert result == str(u)
++
++    def test_arbitrary_object_returns_str(self) -> None:
++        """Arbitrary objects should be converted via str()."""
++        from mem_mcp.plugins.clients.notices import _json_default
++
++        class CustomObj:
++            def __str__(self) -> str:
++                return "custom-string"
++
++        obj = CustomObj()
++        result = _json_default(obj)
++        assert result == "custom-string"
++
++    def test_naive_datetime_returns_isoformat(self) -> None:
++        """Naive datetime (no tzinfo) should still return ISO format."""
++        from mem_mcp.plugins.clients.notices import _json_default
++
++        # Note: naive datetime's isoformat() doesn't include TZ
++        dt = datetime(2026, 6, 15, 14, 30, 45)
++        result = _json_default(dt)
++        # Python's datetime.isoformat() for naive datetime includes no timezone
++        assert result == "2026-06-15T14:30:45"
++
++
++# --------------------------------------------------------------------------
++# _render tests
++# --------------------------------------------------------------------------
++
++
++class TestRender:
++    """Tests for the _render template function."""
++
++    def test_simple_substitution(self) -> None:
++        """Simple {key} substitution should work."""
++        text = _render("Hello {name}", {"name": "World"})
++        assert text == "Hello World"
++
++    def test_multiple_placeholders(self) -> None:
++        """Multiple placeholders should all be substituted."""
++        text = _render("{greeting} {name}!", {"greeting": "Hello", "name": "World"})
++        assert text == "Hello World!"
++
++    def test_repeated_key_substitution(self) -> None:
++        """Repeated key references should all be substituted."""
++        text = _render("{x} and {x}", {"x": "same"})
++        assert text == "same and same"
++
++    def test_missing_key_renders_empty_and_logs_warning(
++        self, caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Missing keys should render as empty string and log a warning."""
++        with caplog.at_level(logging.WARNING):
++            text = _render("Hi {missing}", {})
++
++        assert text == "Hi "
++        # Check for warning log
++        assert any("notice_template_missing_key" in r.message for r in caplog.records)
++
++    def test_missing_key_logs_template_truncated(self, caplog: pytest.LogCaptureFixture) -> None:
++        """Warning should include truncated template (max 120 chars)."""
++        import logging
++
++        long_template = "x" * 200 + " {missing}"
++        with caplog.at_level(logging.WARNING):
++            _render(long_template, {})
++
++        for record in caplog.records:
++            if "notice_template_missing_key" in record.message:
++                # Check that the record has key and template attributes (logged via extra)
++                assert hasattr(record, "key")
++                assert hasattr(record, "template")
++                assert record.key == "missing"  # type: ignore[attr-defined]
++                assert len(record.template) == 120  # type: ignore[attr-defined]
++
++    def test_non_string_value_coerced_to_string(self) -> None:
++        """Non-string payload values should be rendered via str()."""
++        text = _render("count={n}", {"n": 42})
++        assert text == "count=42"
++
++    def test_none_value_coerced_to_string(self) -> None:
++        """None should be rendered as string 'None'."""
++        text = _render("value={v}", {"v": None})
++        assert text == "value=None"
++
++    def test_numeric_value_coerced_to_string(self) -> None:
++        """Numeric values should be coerced via str()."""
++        text = _render("items={count}", {"count": 123})
++        assert text == "items=123"
++
++    def test_boolean_value_coerced_to_string(self) -> None:
++        """Boolean values should be coerced via str()."""
++        text = _render("active={a}", {"a": True})
++        assert text == "active=True"
++
++    def test_list_value_coerced_to_string(self) -> None:
++        """List values should be coerced via str()."""
++        text = _render("items={lst}", {"lst": [1, 2, 3]})
++        assert text == "items=[1, 2, 3]"
++
++    def test_dict_value_coerced_to_string(self) -> None:
++        """Dict values should be coerced via str()."""
++        text = _render("data={d}", {"d": {"a": 1}})
++        assert text == "data={'a': 1}"
++
++    def test_no_placeholders_returns_unchanged(self) -> None:
++        """Template without placeholders should pass through unchanged."""
++        text = _render("plain text template", {})
++        assert text == "plain text template"
++
++    def test_empty_template_returns_empty(self) -> None:
++        """Empty template should return empty string."""
++        text = _render("", {})
++        assert text == ""
++
++    def test_empty_payload(self) -> None:
++        """Empty payload dict should leave placeholders unresolved as empty."""
++        import warnings
++
++        with warnings.catch_warnings():
++            warnings.filterwarnings("ignore", message=".*")
++            text = _render("{a} and {b}", {})
++        assert text == " and "
++
++    def test_brace_not_placeholder_single_digit(self) -> None:
++        """Braces with single digit like {1} are not valid identifiers."""
++        text = _render("value={1}", {})
++        assert text == "value={1}"
++
++    def test_brace_not_placeholder_with_hyphen(self) -> None:
++        """Braces with hyphen like {a-b} are not valid identifiers."""
++        text = _render("value={a-b}", {})
++        assert text == "value={a-b}"
++
++    def test_brace_not_placeholder_with_space(self) -> None:
++        """Braces with space like { key } are not valid identifiers."""
++        text = _render("value={ key }", {})
++        assert text == "value={ key }"
++
++    def test_brace_not_placeholder_empty(self) -> None:
++        """Empty braces {} are not valid identifiers."""
++        text = _render("empty={}", {})
++        assert text == "empty={}"
++
++    def test_brace_not_placeholder_double_brace(self) -> None:
++        """Double braces {{ are not a valid pattern (only single braces count)."""
++        text = _render("escaped={{name}}", {})
++        # The regex matches {name} inside {{name}}
++        # Since 'name' is not in payload {}, it renders as empty string
++        assert text == "escaped={}"
++
++    def test_key_with_underscore(self) -> None:
++        """Keys with underscores should work."""
++        text = _render("value={user_id}", {"user_id": "123"})
++        assert text == "value=123"
++
++    def test_key_with_digits(self) -> None:
++        """Keys with digits should work."""
++        text = _render("value={key123}", {"key123": "abc"})
++        assert text == "value=abc"
++
++    def test_key_starting_with_underscore(self) -> None:
++        """Keys starting with underscore should work."""
++        text = _render("value={_internal}", {"_internal": "secret"})
++        assert text == "value=secret"
++
++    def test_complex_template(self) -> None:
++        """Complex template with mixed content."""
++        text = _render(
++            "Hello {name}, you have {count} messages from {sender}. {greeting}!",
++            {"name": "Alice", "count": 5, "sender": "Bob", "greeting": "Welcome"},
++        )
++        assert text == "Hello Alice, you have 5 messages from Bob. Welcome!"
++
++    def test_braces_with_single_digit_unchanged(self) -> None:
++        """{1a} pattern should be unchanged (not a valid identifier)."""
++        text = _render("value={1a}", {})
++        assert text == "value={1a}"
++
++    def test_braces_with_space_unchanged(self) -> None:
++        """{ a } pattern should be unchanged (not a valid identifier)."""
++        text = _render("value={ a }", {})
++        assert text == "value={ a }"
++
++
++# --------------------------------------------------------------------------
++# RenderedNoticeExactDictEquality tests from order-2.md section 5
++# --------------------------------------------------------------------------
++
++
++class TestRenderedNoticeExactDictEquality:
++    """Tests for exact dict equality from order-2.md section 5."""
++
++    def test_to_dict_exact_equality(self) -> None:
++        """RenderedNotice.to_dict() should return exact dict equality."""
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="reminders",
++            kind="reminder_fired",
++            text="Your reminder: check the docs",
++            payload={"reminder_id": "r1", "action": "view"},
++            created_at=datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC),
++        )
++
++        result = notice.to_dict()
++        expected = {
++            "id": str(notice.id),
++            "plugin_id": "reminders",
++            "kind": "reminder_fired",
++            "text": "Your reminder: check the docs",
++            "payload": {"reminder_id": "r1", "action": "view"},
++            "created_at": "2026-06-15T12:00:00+00:00",
++        }
++        assert result == expected
++
++    def test_to_dict_all_fields_present(self) -> None:
++        """to_dict should contain all 6 fields."""
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="test_plugin",
++            kind="test_kind",
++            text="test text content here",
++            payload={"key1": "value1", "key2": 123},
++            created_at=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
++        )
++
++        result = notice.to_dict()
++        expected_keys = {"id", "plugin_id", "kind", "text", "payload", "created_at"}
++        assert set(result.keys()) == expected_keys
+diff --git a/tests/unit/test_plugin_notices_contract.py b/tests/unit/test_plugin_notices_contract.py
+new file mode 100644
+index 0000000..45a7bd4
+--- /dev/null
++++ b/tests/unit/test_plugin_notices_contract.py
+@@ -0,0 +1,518 @@
++"""Behavioural contract tests for plugin notices.
++
++Tests _render, _json_default, RenderedNotice.to_dict, and log records.
++Pure unit tests - no real DB required.
++"""
++
++from __future__ import annotations
++
++import logging
++from datetime import UTC, date, datetime
++from uuid import uuid4
++
++import pytest
++
++from mem_mcp.plugins.notice_delivery import RenderedNotice, _render
++
++# --------------------------------------------------------------------------
++# _json_default tests (tested indirectly via NoticeClientImpl.queue tests)
++# --------------------------------------------------------------------------
++
++
++class TestJsonDefault:
++    """Tests for the _json_default helper function.
++
++    Imported from mem_mcp.plugins.clients.notices for use with json.dumps.
++    """
++
++    def test_datetime_returns_isoformat(self) -> None:
++        """datetime should be converted to ISO 8601 string."""
++        from mem_mcp.plugins.clients.notices import _json_default
++
++        dt = datetime(2026, 6, 15, 14, 30, 45, tzinfo=UTC)
++        result = _json_default(dt)
++        assert result == "2026-06-15T14:30:45+00:00"
++
++    def test_date_returns_isoformat(self) -> None:
++        """date should be converted to ISO 8601 date string."""
++        from mem_mcp.plugins.clients.notices import _json_default
++
++        d = date(2026, 6, 15)
++        result = _json_default(d)
++        assert result == "2026-06-15"
++
++    def test_uuid_returns_stringified(self) -> None:
++        """UUID should be converted to its string representation."""
++        from mem_mcp.plugins.clients.notices import _json_default
++
++        u = uuid4()
++        result = _json_default(u)
++        assert result == str(u)
++
++    def test_arbitrary_object_returns_str(self) -> None:
++        """Arbitrary objects should be converted via str()."""
++        from mem_mcp.plugins.clients.notices import _json_default
++
++        class CustomObj:
++            def __str__(self) -> str:
++                return "custom-string"
++
++        obj = CustomObj()
++        result = _json_default(obj)
++        assert result == "custom-string"
++
++    def test_naive_datetime_returns_isoformat(self) -> None:
++        """Naive datetime (no tzinfo) should still return ISO format."""
++        from mem_mcp.plugins.clients.notices import _json_default
++
++        # Note: naive datetime's isoformat() doesn't include TZ
++        dt = datetime(2026, 6, 15, 14, 30, 45)
++        result = _json_default(dt)
++        # Python's datetime.isoformat() for naive datetime includes no timezone
++        assert result == "2026-06-15T14:30:45"
++
++
++# --------------------------------------------------------------------------
++# _render tests
++# --------------------------------------------------------------------------
++
++
++class TestRender:
++    """Tests for the _render template function."""
++
++    def test_simple_substitution(self) -> None:
++        """Simple {key} substitution should work."""
++        result = _render("Hello {name}", {"name": "World"})
++        assert result == "Hello World"
++
++    def test_multiple_placeholders(self) -> None:
++        """Multiple placeholders should all be substituted."""
++        result = _render("{greeting} {name}!", {"greeting": "Hello", "name": "World"})
++        assert result == "Hello World!"
++
++    def test_repeated_key_substitution(self) -> None:
++        """Repeated key references should all be substituted."""
++        result = _render("{x} and {x}", {"x": "same"})
++        assert result == "same and same"
++
++    def test_missing_key_renders_empty_and_logs_warning(
++        self, caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Missing keys should render as empty string and log a warning."""
++        with caplog.at_level(logging.WARNING):
++            result = _render("Hi {missing}", {})
++
++        assert result == "Hi "
++        # Check for warning log
++        assert any("notice_template_missing_key" in r.message for r in caplog.records)
++
++    def test_missing_key_logs_template_truncated(self, caplog: pytest.LogCaptureFixture) -> None:
++        """Warning should include truncated template (max 120 chars)."""
++        long_template = "x" * 200 + " {missing}"
++        with caplog.at_level(logging.WARNING):
++            _render(long_template, {})
++
++        for record in caplog.records:
++            if "notice_template_missing_key" in record.message:
++                # Check that the record has key and template attributes (logged via extra)
++                assert hasattr(record, "key")
++                assert hasattr(record, "template")
++                assert record.key == "missing"  # type: ignore[attr-defined]
++                assert len(record.template) <= 120  # type: ignore[attr-defined]
++
++    def test_non_string_value_coerced_to_string(self) -> None:
++        """Non-string payload values should be rendered via str()."""
++        result = _render("count={n}", {"n": 42})
++        assert result == "count=42"
++
++    def test_none_value_coerced_to_string(self) -> None:
++        """None should be rendered as string 'None'."""
++        result = _render("value={v}", {"v": None})
++        assert result == "value=None"
++
++    def test_numeric_value_coerced_to_string(self) -> None:
++        """Numeric values should be coerced via str()."""
++        result = _render("items={count}", {"count": 123})
++        assert result == "items=123"
++
++    def test_boolean_value_coerced_to_string(self) -> None:
++        """Boolean values should be coerced via str()."""
++        result = _render("active={a}", {"a": True})
++        assert result == "active=True"
++
++    def test_list_value_coerced_to_string(self) -> None:
++        """List values should be coerced via str()."""
++        result = _render("items={lst}", {"lst": [1, 2, 3]})
++        assert result == "items=[1, 2, 3]"
++
++    def test_dict_value_coerced_to_string(self) -> None:
++        """Dict values should be coerced via str()."""
++        result = _render("data={d}", {"d": {"a": 1}})
++        assert result == "data={'a': 1}"
++
++    def test_no_placeholders_returns_unchanged(self) -> None:
++        """Template without placeholders should pass through unchanged."""
++        result = _render("plain text template", {})
++        assert result == "plain text template"
++
++    def test_empty_template_returns_empty(self) -> None:
++        """Empty template should return empty string."""
++        result = _render("", {})
++        assert result == ""
++
++    def test_empty_payload(self) -> None:
++        """Empty payload dict should leave placeholders unresolved as empty."""
++        import warnings
++
++        with warnings.catch_warnings():
++            warnings.filterwarnings("ignore", message=".*")
++            result = _render("{a} and {b}", {})
++        assert result == " and "
++
++    def test_brace_not_placeholder_single_digit(self) -> None:
++        """Braces with single digit like {1} are not valid identifiers."""
++        result = _render("value={1}", {})
++        assert result == "value={1}"
++
++    def test_brace_not_placeholder_with_hyphen(self) -> None:
++        """Braces with hyphen like {a-b} are not valid identifiers."""
++        result = _render("value={a-b}", {})
++        assert result == "value={a-b}"
++
++    def test_brace_not_placeholder_with_space(self) -> None:
++        """Braces with space like { key } are not valid identifiers."""
++        result = _render("value={ key }", {})
++        assert result == "value={ key }"
++
++    def test_brace_not_placeholder_empty(self) -> None:
++        """Empty braces {} are not valid identifiers."""
++        result = _render("empty={}", {})
++        assert result == "empty={}"
++
++    def test_brace_not_placeholder_double_brace(self) -> None:
++        """Double braces {{ are not a valid pattern (only single braces count)."""
++        result = _render("escaped={{name}}", {})
++        # The regex matches {name} inside {{name}}
++        # Since 'name' is not in payload {}, it renders as empty string
++        assert result == "escaped={}"
++
++    def test_key_with_underscore(self) -> None:
++        """Keys with underscores should work."""
++        result = _render("value={user_id}", {"user_id": "123"})
++        assert result == "value=123"
++
++    def test_key_with_digits(self) -> None:
++        """Keys with digits should work."""
++        result = _render("value={key123}", {"key123": "abc"})
++        assert result == "value=abc"
++
++    def test_key_starting_with_underscore(self) -> None:
++        """Keys starting with underscore should work."""
++        result = _render("value={_internal}", {"_internal": "secret"})
++        assert result == "value=secret"
++
++    def test_complex_template(self) -> None:
++        """Complex template with mixed content."""
++        result = _render(
++            "Hello {name}, you have {count} messages from {sender}. {greeting}!",
++            {"name": "Alice", "count": 5, "sender": "Bob", "greeting": "Welcome"},
++        )
++        assert result == "Hello Alice, you have 5 messages from Bob. Welcome!"
++
++    def test_braces_with_single_digit_unchanged(self) -> None:
++        """{1a} pattern should be unchanged (not a valid identifier)."""
++        result = _render("value={1a}", {})
++        assert result == "value={1a}"
++
++    def test_braces_with_space_unchanged(self) -> None:
++        """{ a } pattern should be unchanged (not a valid identifier)."""
++        result = _render("value={ a }", {})
++        assert result == "value={ a }"
++
++
++# --------------------------------------------------------------------------
++# RenderedNotice.to_dict tests
++# --------------------------------------------------------------------------
++
++
++class TestRenderedNoticeToDict:
++    """Tests for RenderedNotice.to_dict method."""
++
++    def test_to_dict_returns_correct_structure(self) -> None:
++        """to_dict should return the expected dict structure."""
++        uid = uuid4()
++        notice = RenderedNotice(
++            id=uid,
++            plugin_id="reminders",
++            kind="reminder_fired",
++            text="Your reminder: check the docs",
++            payload={"reminder_id": "r1", "action": "view"},
++            created_at=datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC),
++        )
++
++        result = notice.to_dict()
++
++        assert result["id"] == str(uid)
++        assert result["plugin_id"] == "reminders"
++        assert result["kind"] == "reminder_fired"
++        assert result["text"] == "Your reminder: check the docs"
++        assert result["payload"] == {"reminder_id": "r1", "action": "view"}
++        assert result["created_at"] == "2026-06-15T12:00:00+00:00"
++
++    def test_to_dict_id_is_string(self) -> None:
++        """id should be converted to string in output."""
++        uid = uuid4()
++        notice = RenderedNotice(
++            id=uid,
++            plugin_id="test",
++            kind="test_kind",
++            text="test text",
++            payload={},
++            created_at=datetime.now(tz=UTC),
++        )
++
++        result = notice.to_dict()
++        assert isinstance(result["id"], str)
++        assert result["id"] == str(uid)
++
++    def test_to_dict_created_at_is_isoformat(self) -> None:
++        """created_at should be ISO 8601 formatted string."""
++        dt = datetime(2026, 3, 15, 10, 30, 45, tzinfo=UTC)
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="test",
++            kind="test",
++            text="test",
++            payload={},
++            created_at=dt,
++        )
++
++        result = notice.to_dict()
++        assert result["created_at"] == "2026-03-15T10:30:45+00:00"
++
++    def test_to_dict_payload_passthrough(self) -> None:
++        """payload should be passed through unchanged."""
++        payload = {
++            "string_val": "hello",
++            "int_val": 42,
++            "bool_val": True,
++            "nested": {"a": 1, "b": [1, 2, 3]},
++        }
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="test",
++            kind="test",
++            text="test",
++            payload=payload,
++            created_at=datetime.now(tz=UTC),
++        )
++
++        result = notice.to_dict()
++        assert result["payload"] == payload
++
++
++# --------------------------------------------------------------------------
++# class attribute tests for RenderedNotice
++# --------------------------------------------------------------------------
++
++
++class TestRenderedNoticeSlots:
++    """Test RenderedNotice has correct slots and can be instantiated."""
++
++    def test_slots_present(self) -> None:
++        """RenderedNotice should have the expected slots."""
++        assert hasattr(RenderedNotice, "__slots__")
++        slots = RenderedNotice.__slots__
++        assert "id" in slots
++        assert "plugin_id" in slots
++        assert "kind" in slots
++        assert "text" in slots
++        assert "payload" in slots
++        assert "created_at" in slots
++
++    def test_can_create_instance(self) -> None:
++        """Should be able to create an instance with all required fields."""
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="test",
++            kind="test_kind",
++            text="content",
++            payload={},
++            created_at=datetime.now(tz=UTC),
++        )
++        assert notice.id is not None
++        assert notice.plugin_id == "test"
++        assert notice.kind == "test_kind"
++        assert notice.text == "content"
++        assert notice.payload == {}
++
++
++# --------------------------------------------------------------------------
++# Log record tests for notice_template_missing_key
++# --------------------------------------------------------------------------
++
++
++class TestNoticeTemplateMissingKeyLog:
++    """Test that _render logs warning for missing keys."""
++
++    def test_logs_warning_with_key_and_template(
++        self, caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Missing key should log warning with key and truncated template."""
++        with caplog.at_level(logging.WARNING):
++            _render("Hello {name}, your {missing} is ready", {"name": "World"})
++
++        warnings = [r for r in caplog.records if "notice_template_missing_key" in r.message]
++        assert len(warnings) == 1
++        # Check extra contains key and template (added via logging extra=)
++        assert warnings[0].key == "missing"  # type: ignore[attr-defined]
++        # Template should be truncated to 120 chars
++        assert len(warnings[0].template) <= 120  # type: ignore[attr-defined]
++
++    def test_template_truncation_at_120_chars(
++        self, caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Template in warning should be truncated to exactly 120 chars."""
++        long_template = "x" * 200
++        with caplog.at_level(logging.WARNING):
++            _render(f"Template: {long_template} and {{missing}} more", {})
++
++        warnings = [r for r in caplog.records if "notice_template_missing_key" in r.message]
++        assert len(warnings) == 1
++        # Check template truncation - should be exactly 120 chars
++        template_in_warning = warnings[0].template  # type: ignore[attr-defined]
++        assert len(template_in_warning) == 120  # type: ignore[attr-defined]
++
++    def test_multiple_missing_keys_each_logs_warning(
++        self, caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Each missing key should log a separate warning."""
++        with caplog.at_level(logging.WARNING):
++            _render("{a}, {b}, {c}", {})
++
++        warnings = [r for r in caplog.records if "notice_template_missing_key" in r.message]
++        # Should have 3 warnings, one for each missing key
++        assert len(warnings) == 3
++        missing_keys = {r.key for r in warnings}  # type: ignore[attr-defined]
++        assert missing_keys == {"a", "b", "c"}
++
++
++# --------------------------------------------------------------------------
++# Combined tests for _render with various edge cases
++# --------------------------------------------------------------------------
++
++
++class TestRenderEdgeCases:
++    """Additional edge case tests for _render."""
++
++    def test_empty_string_key_in_payload(self) -> None:
++        """Empty string value in payload should render as empty."""
++        result = _render("value={k}", {"k": ""})
++        assert result == "value="
++
++    def test_zero_value_renders(self) -> None:
++        """Zero should render as '0'."""
++        result = _render("count={n}", {"n": 0})
++        assert result == "count=0"
++
++    def test_negative_number_value(self) -> None:
++        """Negative numbers should render correctly."""
++        result = _render("temp={t}", {"t": -5})
++        assert result == "temp=-5"
++
++    def test_float_value(self) -> None:
++        """Float values should render correctly."""
++        result = _render("ratio={r}", {"r": 3.14159})
++        assert result == "ratio=3.14159"
++
++    def test_newlines_in_template(self) -> None:
++        """Template with newlines should preserve them."""
++        result = _render("line1\n{key}\nline3", {"key": "line2"})
++        assert result == "line1\nline2\nline3"
++
++    def test_special_characters_preserved(self) -> None:
++        """Special characters in template should be preserved."""
++        result = _render("price: ${amount}", {"amount": "100"})
++        assert result == "price: $100"
++
++    def test_unicode_characters(self) -> None:
++        """Unicode characters should work correctly."""
++        result = _render("greeting={msg}", {"msg": "héllo wörld"})
++        assert result == "greeting=héllo wörld"
++
++    def test_int_value_in_payload(self) -> None:
++        """Integer values in payload should be coerced via str()."""
++        result = _render("count={n}", {"n": 42})
++        assert result == "count=42"
++
++    def test_none_value_in_payload(self) -> None:
++        """None values in payload should be coerced via str()."""
++        result = _render("value={v}", {"v": None})
++        assert result == "value=None"
++
++    def test_list_value_in_payload(self) -> None:
++        """List values in payload should be coerced via str()."""
++        result = _render("items={lst}", {"lst": [1, 2, 3]})
++        assert result == "items=[1, 2, 3]"
++
++    def test_dict_value_in_payload(self) -> None:
++        """Dict values in payload should be coerced via str()."""
++        result = _render("data={d}", {"d": {"a": 1}})
++        assert result == "data={'a': 1}"
++
++    def test_template_longer_than_120_chars_missing_key(
++        self, caplog: pytest.LogCaptureFixture
++    ) -> None:
++        """Template > 120 chars with missing key should log truncated template."""
++        import logging
++
++        long_template = "a" * 150 + " {missing}"
++        with caplog.at_level(logging.WARNING):
++            _render(long_template, {})
++
++        for record in caplog.records:
++            if "notice_template_missing_key" in record.message:
++                # Template should be exactly 120 chars
++                assert len(record.template) == 120  # type: ignore[attr-defined]
++                assert record.key == "missing"  # type: ignore[attr-defined]
++
++
++class TestRenderedNoticeExactDictEquality:
++    """Tests for exact dict equality from order-2.md section 5."""
++
++    def test_to_dict_exact_equality(self) -> None:
++        """RenderedNotice.to_dict() should return exact dict equality."""
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="reminders",
++            kind="reminder_fired",
++            text="Your reminder: check the docs",
++            payload={"reminder_id": "r1", "action": "view"},
++            created_at=datetime(2026, 6, 15, 12, 0, 0, tzinfo=UTC),
++        )
++
++        result = notice.to_dict()
++        expected = {
++            "id": str(notice.id),
++            "plugin_id": "reminders",
++            "kind": "reminder_fired",
++            "text": "Your reminder: check the docs",
++            "payload": {"reminder_id": "r1", "action": "view"},
++            "created_at": "2026-06-15T12:00:00+00:00",
++        }
++        assert result == expected
++
++    def test_to_dict_all_fields_present(self) -> None:
++        """to_dict should contain all 6 fields."""
++        notice = RenderedNotice(
++            id=uuid4(),
++            plugin_id="test_plugin",
++            kind="test_kind",
++            text="test text content here",
++            payload={"key1": "value1", "key2": 123},
++            created_at=datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC),
++        )
++
++        result = notice.to_dict()
++        expected_keys = {"id", "plugin_id", "kind", "text", "payload", "created_at"}
++        assert set(result.keys()) == expected_keys

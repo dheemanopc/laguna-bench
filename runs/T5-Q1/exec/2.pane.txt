@@ -1,0 +1,60 @@
+
+  src/mem_mcp/mcp/tool_descriptions.py:                                                                                            7 files changed +214 -23                                                               ✕
+  - Updated memory_update description with concurrency docs
+                                                                                                                                   alembic/versions/0046_2026_10_16_memory_revision.py                                  +47
+  src/mem_mcp/memory/versioning.py:                                                                                                src/mem_mcp/mcp/tool_descriptions.py                                                  +4
+  - resolve_current() with dict(row) return, proper tenant_id filtering                                                            src/mem_mcp/mcp/tools/get.py                                                      +30 -3
+                                                                                                                                   src/mem_mcp/mcp/tools/update.py                                                  +87 -19
+  Verification                                                                                                                     src/mem_mcp/memory/versioning.py                                                  +46 -1
+                                                                                                                                   2 tests/generated (show)
+  ┌────────────────────────────────────────────────────────────┬───────────────────────────────────────────────────────┐
+  │                           Check                            │                        Result                         │           ────────────────────────────────────────────────────────────────────────────────────────
+  ├────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤           alembic/versions/0046_2026_10_16_memory_revision.py
+  │ pytest -q (full suite)                                     │ 39 pre-existing failures (team API, etc.) — unchanged │           ────────────────────────────────────────────────────────────────────────────────────────
+  ├────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤             1 +"""Add `revision` column to `memories` — optimistic-concurrency token.
+  │ pytest tests/unit/test_memory_record_revision.py           │ 6 passed                                              │             2 +
+  ├────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤             3 +Concurrent ``memory_update`` calls lose data today: two concurrent tag-merges
+  │ pytest tests/integration/test_memory_update_concurrency.py │ 9 passed                                              │             4 +operate against a stale ``SELECT``, one edit is silently dropped; two concurrent
+  ├────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤             5 +content updates of a ``decision`` both create version-2 rows that supersede the
+  │ ruff check                                                 │ All checks passed                                     │             6 +same parent; sequential callers can overwrite a row that was already superseded.
+  ├────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤             7 +
+  │ ruff format                                                │ All 7 files already formatted                         │             8 +The fix uses ``FOR UPDATE`` row locking (already implicit in the serialised tx)
+  ├────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤             9 +combined with a *revision UUID* so that callers can pass back an
+  │ mypy                                                       │ Success on 3 source files                             │            10 +``expected_revision`` and the DB rejects stale tokens — and even callers that
+  ├────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤            11 +don't pass a token are protected because the row-lock forces serialised execution
+  │ alembic upgrade head                                       │ Applied successfully                                  │            12 +while the supersede and revision checks prevent blind overwrites.
+  ├────────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────┤            13 +
+  │ 3 consecutive integration runs                             │ 9/9 each time, no flakiness                           │            14 +``revision`` is a simple ``gen_random_uuid()`` column, NOT ``xmin`` (a concurrent
+  └────────────────────────────────────────────────────────────┴───────────────────────────────────────────────────────┘            15 +background ``bump_access`` call updates the row, changing ``xmin``) and NOT
+                                                                                                                                    16 +``updated_at`` (not guaranteed unique under burst).
+  What could not be completed (Bash denied)                                                                                         17 +
+                                                                                                                                    18 +Revision ID: 0046_memory_revision
+  1. Bug-proof by stashing: The plan was to stash update.py + related files, run TestConcurrentTagsAdd and                          19 +Revises: 0045_fix_turn_backfill
+     TestConcurrentDecisionFork to prove they fail against baseline code, then git stash pop to show they pass again. This          20 +Create Date: 2026-10-16
+     demonstrates the tests are effective at catching the bugs.                                                                     21 +"""
+  2. Full suite baseline: Run pytest -q after stashing to confirm the 39 pre-existing failures match — proving no new bugs were     22 +
+     introduced by this work order.                                                                                                 23 +from __future__ import annotations
+                                                                                                                                    24 +
+  To complete these steps, run Bash in ! mode:                                                                                      25 +import sqlalchemy as sa
+  ! git stash push --include-untracked -m "baseline" -- src/mem_mcp/mcp/tools/update.py src/mem_mcp/mcp/tools/get.py                26 +
+  src/mem_mcp/memory/versioning.py src/mem_mcp/mcp/tool_descriptions.py                                                             27 +from alembic import op
+  ! pytest -q tests/integration/test_memory_update_concurrency.py::TestConcurrentTagsAdd                                            28 +
+  tests/integration/test_memory_update_concurrency.py::TestConcurrentDecisionFork -v                                                29 +revision = "0046_memory_revision"
+  ! git stash pop                                                                                                                   30 +down_revision = "0045_fix_turn_backfill"
+                                                                                                                                    31 +branch_labels = None
+  Files changed                                                                                                                     32 +depends_on = None
+                                                                                                                                    33 +
+  - alembic/versions/0046_2026_10_16_memory_revision.py (NEW)                                                                       34 +
+  - src/mem_mcp/memory/versioning.py (MODIFIED)                                                                                     35 +def upgrade() -> None:
+  - src/mem_mcp/mcp/tools/update.py (MODIFIED)                                                                                      36 +    op.execute(
+  - src/mem_mcp/mcp/tools/get.py (MODIFIED)                                                                                         37 +        sa.text("""
+  - src/mem_mcp/mcp/tool_descriptions.py (MODIFIED)                                                                                 38 +        ALTER TABLE memories
+  - tests/unit/test_memory_record_revision.py (NEW)                                                                                 39 +            ADD COLUMN revision UUID NOT NULL DEFAULT gen_random_uuid()
+  - tests/integration/test_memory_update_concurrency.py (NEW)                                                                       40 +    """)
+                                                                                                                                    41 +    )
+✻ Churned for 8m 39s · done 1:44 PM                                                                                                 42 +    # Existing rows get a random UUID via the DEFAULT clause — no backfill
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents

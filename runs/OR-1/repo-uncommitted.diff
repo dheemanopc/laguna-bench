@@ -1,0 +1,45 @@
+diff --git a/src/mem_mcp/mindmap/workflow_crud.py b/src/mem_mcp/mindmap/workflow_crud.py
+index bcd3e65..726e39e 100644
+--- a/src/mem_mcp/mindmap/workflow_crud.py
++++ b/src/mem_mcp/mindmap/workflow_crud.py
+@@ -143,14 +143,14 @@ def _as_list(value: tuple[str, ...] | None) -> list[str] | None:
+ 
+ 
+ def _team_lock_keys(tenant_id: UUID, team_id: UUID) -> tuple[int, int]:
+-    """Deterministic pair of int64 advisory-lock keys for (tenant, team).
++    """Deterministic pair of int32 advisory-lock keys for (tenant, team).
+ 
+     Used to serialise the lazy legacy-materialisation so that concurrent
+     callers for the same team observe a single committed result instead of
+     racing on the ON CONFLICT / unique-index caveat.
+     """
+-    a = int.from_bytes(tenant_id.bytes[:8], "big", signed=True)
+-    b = int.from_bytes(team_id.bytes[:8], "big", signed=True)
++    a = int.from_bytes(tenant_id.bytes[:4], "big", signed=True)
++    b = int.from_bytes(team_id.bytes[:4], "big", signed=True)
+     return a, b
+ 
+ 
+diff --git a/src/mem_mcp/mindmap/workflow_errors.py b/src/mem_mcp/mindmap/workflow_errors.py
+index 055e058..c0411e4 100644
+--- a/src/mem_mcp/mindmap/workflow_errors.py
++++ b/src/mem_mcp/mindmap/workflow_errors.py
+@@ -31,6 +31,10 @@ if TYPE_CHECKING:
+ 
+     from mem_mcp.auth.permissions import Permission
+ 
++    # Re-exported lazily at runtime via __getattr__; import here so mypy
++    # knows the concrete class when callers (e.g. workflow_moves) raise it.
++    from mem_mcp.mindmap.work_items import ReasonRequiredError
++
+ 
+ class WorkflowError(Exception):
+     """Base exception for all team-workflow operations."""
+@@ -167,6 +171,7 @@ class KindNotAllowedError(WorkflowError):
+ __all__ = [
+     "WorkflowError",
+     "MoveBlockedError",
++    "ReasonRequiredError",
+     "SignoffRequiredError",
+     "SignoffCompleteError",
+     "WorkflowNotFoundError",

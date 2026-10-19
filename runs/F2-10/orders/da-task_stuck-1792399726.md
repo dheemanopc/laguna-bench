@@ -1,0 +1,3 @@
+```json
+{"action":"retry","guidance":"Attempts died on the API 402 credit error. The remaining code problems are small.\n1) tests/unit/mindmap/test_workflow_errors.py:19 has E402. Move `import mem_mcp.mindmap.workflow_errors as we` to the top of the file with the other imports. Put the subprocess isolation check inside a test function. Don't use `# noqa` or change ruff config.\n2) tests/unit/mindmap/test_workflow_reads.py is still missing (WP1-T4). Create it. Cover compute_item_moves (allowed, blocked with reason, needs sign-off) and list_pending_signoffs_for_user (waiting on the user; excludes owner and already-signed).\n3) Run `ruff check src tests`, `mypy` and `pytest -q`. Report any new failures.","new_tasks":[]}
+```

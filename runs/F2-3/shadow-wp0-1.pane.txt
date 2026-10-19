@@ -1,0 +1,67 @@
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  Sonnet 5.5 · Claude Max
+ ▝▝   ▝▝   ~/laguna-bench/runs/F2-3/repo
+
+
+❯ You are the ARCHITECT supervising an engineer who does all of the work on the feature below. This is the wp0 gate
+  (round 1). Review: the implementation of WP0 (see ~/laguna-bench/runs/F2-3/repo/docs/feature/03-plan.md and the code changes): does it deliver its planned scope and tests, is it correct, does it follow the
+  codebase's conventions? The harness gate output is in ~/laguna-bench/runs/F2-3/orders/gates-wp0-1.md (authoritative).
+  Read as much as you need (the repository at ~/laguna-bench/runs/F2-3/repo, the engineer's documents under ~/laguna-bench/runs/F2-3/repo/docs/feature, earlier reviews and
+  orders in ~/laguna-bench/runs/F2-3/orders). Judge against the REQUEST, the existing codebase and its conventions. Spend your effort READING;
+  keep your OUTPUT SHORT. Write to ~/laguna-bench/runs/F2-3/orders/shadow-wp0-1.md — first line exactly "VERDICT: APPROVE" or "VERDICT: REVISE", then at most 5
+  numbered findings, most important first, each one line with evidence (file:line, doc section or gate line). Hard cap 250
+  words. APPROVE only if the stage is good enough to build on; minor nits go in findings without blocking. No code, no
+  rewrites, no praise. Then end your turn.
+
+  === REQUEST ===
+  F2 — Team workflows for work items (real feature, from Anand's backlog)
+
+  Raw product idea (as written in the backlog — not yet a spec):
+
+  > Mind-map work items exist now, but every team works differently. A team should be able to define
+  > its own workflow — the stages a work item moves through, which moves are allowed, and what a move
+  > needs before it happens (for example a reason, or sign-off from someone other than the owner,
+  > possibly from more than one person). Items should never get stuck or lose their history when a
+  > team changes its workflow. People need to see and move their team's work on a board in the web
+  > app, see why a move is blocked, and see what is waiting on them. Agents must be able to do the
+  > same through the MCP tools.
+
+  Context: work items were added recently (migrations 0046/0047, src/mem_mcp/mindmap/, the work-item
+  MCP tools). Mind maps are described in docs/mindmap-v1-build-design.md and the ADRs; the web app is under web/.
+  Follow the existing patterns of this codebase.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_01JHbN8mrbN1WY9TM2G485L5
+
+  Searched for 1 pattern, read 3 files (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/F2-3/orders/shadow-wp0-1.md)
+  ⎿  Wrote 7 lines to ../orders/shadow-wp0-1.md
+      1 VERDICT: REVISE
+      2
+      3 1. 56 new failures in test_mindmap_work_items_e2e.py (gates-wp0-1.md lines 7-22): migration:289 makes `work_items.workflow_id` NOT NULL with no DEFAULT, so the unchanged `mark_work_item` INSERT now violate
+        s it. WP0 "ships idempotently alone" must not break the existing green surface. Fix with a transitional default/trigger that stamps the team's live version, or move the NOT NULL to WP1.
+      4 2. The planned migration tests are missing. Only tests/security/test_workflow_visibility.py was added (gates line 5), not tests/integration/test_mindmap_workflows_migration.py. Plan 03 WP0 lists seven test
+      5 3. Teams created after the migration get no workflow (hooks are WP1/WP3), and `workflow_id` is NOT NULL, so item creation fails for any new team. This is the same root cause as finding 1, and it needs a DB
+        -level fallback.
+      6 4. migration:221 declares `workflow_id ... ON DELETE SET NULL` and migration:289 then sets NOT NULL. The two contradict each other; use RESTRICT, as the other version FKs do.
+      7 5. The new-table policies (migration:353-357) use only the `user_effective_team_access` clause. They omit the same-tenant escape that the plan's "OR-shape" RLS basis describes (plan lines 29-33). A creator
+         who is in `team_role_assignments` but not in UEA could not seed the workflow under RLS. Add a test proving the seed works under `mem_app`.
+     … +1 line (ctrl+o to expand)
+
+● I wrote the review to ~/laguna-bench/runs/F2-3/orders/shadow-wp0-1.md. The verdict is REVISE. I did not run anything. The review rests on the gate output, the plan, the 0048 migration and the grep of function
+  names and imports in the one new test file.
+
+  1. Existing tests broken: the gate shows 56 new failures in test_mindmap_work_items_e2e.py. The migration sets work_items.workflow_id NOT NULL with no default, so the unchanged mark_work_item INSERT now fails.
+  2. Planned tests missing: tests/integration/test_mindmap_workflows_migration.py was never added. Only tests/security/test_workflow_visibility.py exists, with two tests.
+  3. New teams get no workflow: the creation hooks only arrive in WP1 and WP3. Until then, item creation fails for any team created after the migration.
+  4. Contradictory foreign key: workflow_id is declared ON DELETE SET NULL and then made NOT NULL. It should be RESTRICT.
+  5. RLS shape differs from the plan: the new-table policies use only the team-access clause (user_effective_team_access), without the same-tenant escape the plan describes. A team creator listed only in
+     team_role_assignments may not be able to seed the workflow under RLS, and no test covers that.
+
+✻ Churned for 25s · done 11:13 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

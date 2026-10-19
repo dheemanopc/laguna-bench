@@ -1,0 +1,19 @@
+#!/bin/bash
+# laguna-bench vLLM launcher (flags: model card + rev6). /opt/bench/vllm.env may set:
+#   EXTRA_ARGS (tuning profile), and for a different model: MODEL, SERVED_NAME, TP, MAXLEN, GPUS (CUDA_VISIBLE_DEVICES), PORT,
+#   TOOL_PARSER, REASONING_PARSER, TEMPLATE_KWARGS (non-Laguna models, e.g. Qwen).
+# VLLM_ENV selects another env file (the second replica, vllm2.service, uses /opt/bench/vllm2.env).
+# Defaults = Laguna S 2.1 FP8 on both GPUs (the original benchmark).
+export PATH=/opt/bench/vllm/bin:/usr/local/cuda/bin:$PATH MAX_JOBS=16
+export HF_HOME=/opt/bench/hf HF_HUB_OFFLINE=1 VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0
+E=${VLLM_ENV:-/opt/bench/vllm.env}; [ -f $E ] && . $E
+MODEL=${MODEL:-poolside/Laguna-S-2.1-FP8} SERVED_NAME=${SERVED_NAME:-laguna-s-2.1} TP=${TP:-2} MAXLEN=${MAXLEN:-327680}
+[ -n "${GPUS:-}" ] && export CUDA_VISIBLE_DEVICES=$GPUS
+KW='{"enable_thinking": true}'; [ -n "${TEMPLATE_KWARGS:-}" ] && KW=$TEMPLATE_KWARGS
+# "none" drops the flag (models without a reasoning parser / thinking kwargs, e.g. Devstral)
+RP=(--reasoning-parser "${REASONING_PARSER:-poolside_v1}"); [ "${REASONING_PARSER:-}" = none ] && RP=()
+KA=(--default-chat-template-kwargs "$KW"); [ "$KW" = none ] && KA=()
+exec /opt/bench/vllm/bin/vllm serve $MODEL --served-model-name $SERVED_NAME \
+  --host 127.0.0.1 --port ${PORT:-8000} --tensor-parallel-size $TP \
+  --kv-cache-dtype fp8 --enable-prefix-caching --max-model-len $MAXLEN --gpu-memory-utilization 0.92 \
+  --enable-auto-tool-choice --tool-call-parser ${TOOL_PARSER:-poolside_v1} "${RP[@]}" "${KA[@]}" $EXTRA_ARGS

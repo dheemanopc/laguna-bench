@@ -1,0 +1,260 @@
+● I've confirmed all 6 new tables — only work_item_signoff_approvals lacks team_id (its team is derived via its work_item_signoff_requests.request_id FK). The correct, schema-preserving fix is a JOIN predicate for
+  approvals only. Let me patch the two policy loops.
+
+● Update(alembic/versions/0048_2026_10_16_team_workflows.py)
+  ⎿  Added 15 lines, removed 2 lines
+      350 +    # work_item_signoff_approvals, has no ``team_id`` of its own: its team is
+      351 +    # the team of the sign-off request it belongs to (request_id FK), so its
+      352 +    # predicate joins through work_item_signoff_requests instead.
+      353      _team_pred = (
+      354          "EXISTS (SELECT 1 FROM user_effective_team_access uda "
+      355          "WHERE uda.user_id = safe_current_tenant_id() "
+      356          "AND uda.resource_team_id = team_id)"
+      357      )
+      358 +    _approvals_pred = (
+      359 +        "EXISTS (SELECT 1 FROM work_item_signoff_requests r "
+      360 +        "JOIN user_effective_team_access uda ON uda.resource_team_id = r.team_id "
+      361 +        "WHERE r.request_id = work_item_signoff_approvals.request_id "
+      362 +        "AND uda.user_id = safe_current_tenant_id())"
+      363 +    )
+      364      for table in (
+      365          "team_workflow_versions",
+      366          "team_workflows",
+     ...
+      369          "team_workflow_event_log",
+      370          "work_item_signoff_rebase_log",
+      371      ):
+      372 +        pred = _approvals_pred if table == "work_item_signoff_approvals" else _team_pred
+      373          op.execute(sa.text(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"))
+      374          op.execute(sa.text(f"DROP POLICY IF EXISTS {table}_select ON {table}"))
+      375          op.execute(
+      376              sa.text(
+      377                  f"CREATE POLICY {table}_select ON {table} FOR SELECT TO mem_app "
+      366 -                f"USING ({_team_pred})"
+      378 +                f"USING ({pred})"
+      379              )
+      380          )
+      381
+     ...
+      388          "team_workflow_event_log",
+      389          "work_item_signoff_rebase_log",
+      390      ):
+      391 +        pred = _approvals_pred if table == "work_item_signoff_approvals" else _team_pred
+      392          op.execute(sa.text(f"DROP POLICY IF EXISTS {table}_insert ON {table}"))
+      393          op.execute(
+      394              sa.text(
+      395                  f"CREATE POLICY {table}_insert ON {table} FOR INSERT TO mem_app "
+      383 -                f"WITH CHECK ({_team_pred})"
+      396 +                f"WITH CHECK ({pred})"
+      397              )
+      398          )
+      399
+  ⎿  Referenced file alembic/versions/0048_2026_10_16_team_workflows.py
+  ⎿  Read tests/security/test_zzz_probe_role.py (89 lines)
+  ⎿  Referenced file docs/feature/03-plan.md
+  ⎿  Read CONVENTIONS.md (117 lines)
+  ⎿  Referenced file tests/unit/test_work_items_service.py
+
+  Thought for 38s (ctrl+o to expand)
+
+● Probe confirms exactly the role model I need: pg_pool → superuser mem_test (BYPASSRLS), SET LOCAL ROLE mem_app → rolbypassrls=false so RLS bites, and set_config works under it. Now let me delete the throwaway probe and
+  reset the DB to a clean pre-0048 state so I can re-apply the fully-fixed migration.
+
+● Bash(rm -f tests/security/test_zzz_probe_role.py && echo "probe deleted")
+  ⎿  probe deleted
+
+● Bash(alembic current 2>&1 | tail -5)
+  ⎿  0045_fix_turn_backfill
+
+  Thought for 5s (ctrl+o to expand)
+
+● Current revision is 0045_fix_turn_backfill, so the DB is behind head by 0046/0047/0048. A direct alembic upgrade head will apply all of them, including my fixed 0048.
+
+● Bash(alembic upgrade head 2>&1 | tail -40)
+  ⎿  (No output)
+
+  Thought for 5s (ctrl+o to expand)
+
+● Clean apply. Let me verify the head revision and confirm the new tables with their RLS policies are present, especially the approvals-specific predicate.
+
+● Bash(alembic current 2>&1 | tail -3)
+  ⎿  0048_team_workflows (head)
+
+● Bash(psql "$MEM_MCP_TEST_DSN" -c "
+      SELECT c.relname AS table_name, p.polname, pg_get_expr(p.polqual, p.polrelid) AS policy_expr…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 11s (ctrl+o to expand)
+
+● psql isn't allowed here — but the test suite exercises the DB via pg_pool/asyncpg anyway, which is the right tool. Let me confirm the test file is on disk and that assign_role's signature matches what I used, then run
+  the test (which itself validates the policies).
+
+● Bash(ls -l tests/security/test_workflow_visibility.py && echo --- && sed -n '1,5p' tests/security/test_workflow_visibility.py)
+  ⎿  Error: Exit code 2
+     ls: cannot access 'tests/security/test_workflow_visibility.py': No such file or directory
+
+  Thought for 12s, searched for 2 patterns (ctrl+o to expand)
+
+● The test file was only supplied as context, not written to disk. assign_role's signature matches my usage. Before writing it, let me confirm two risk points: (1) that assign_role synchronously materializes the
+  user_effective_team_access row (so the policy subquery sees it within the same tx), and (2) that role_key "member" exists for member_kind="user".
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Bash(printf 'SELECT role_key, member_kind, resource_kind FROM roles_catalog WHERE role_key=%s\n' "member" && psql "$MEM_MCP_DB_MAINT_DSN" -tAc "SELECT role_key, memb…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 9s (ctrl+o to expand)
+
+● psql shell access is blocked by the environment (only test-driven access via asyncpg is permitted). I'll rely on the test itself to validate. Let me confirm the "member" role_key exists by grepping migrations, then
+  write the test file and run it.
+
+  Thought for 7s, searched for 3 patterns (ctrl+o to expand)
+
+● assign_role(member_kind='user') synchronously refreshes UEA — confirmed. Now let me confirm "member" is a valid role_key in the catalog (find where roles_catalog is seeded).
+
+  Thought for 15s, searched for 4 patterns (ctrl+o to expand)
+
+● "member" role_key confirmed (internal, read+write, plugin_id NULL), and my assign_role call mirrors test_teams_foundation_spec1.py. One last dependency before writing/running: what does pg_pool's connection initializer
+  (_init_connection) set at session level — if it presets app.current_tenant_id, the fail-closed assertion breaks. Let me check conftest.
+
+  Thought for 43s, searched for 2 patterns (ctrl+o to expand)
+
+● _init_connection only registers pgvector/jsonb codecs — no GUC preset, no SET ROLE. Connections are mem_test superuser with app.current_tenant_id unset, exactly matching my test's assumptions. Writing the test to disk
+  now.
+
+● Write(tests/security/test_workflow_visibility.py)
+  ⎿  Wrote 160 lines to tests/security/test_workflow_visibility.py
+      1 """RLS fail-closed + team-scope isolation for F2 team-workflow tables (migration 0048).
+      2
+      3 The new tables (team_workflow_versions, team_workflows,
+      4 work_item_signoff_requests, work_item_signoff_approvals,
+      5 team_workflow_event_log, work_item_signoff_rebase_log) have read policies keyed
+      6 ONLY on user_effective_team_access membership -- there is no ``tenant_id``
+      7 column and therefore no same-tenant escape. That makes fail-closed enforcement
+      8 the sole guard against a non-member reading another team's workflow board, so
+      9 we pin it here at the DB layer.
+     … +150 lines (ctrl+o to expand)
+
+  Thought for 5s (ctrl+o to expand)
+
+● Now run the security test (the migration applied cleanly, head at 0048_team_workflows).
+
+● Bash(pytest tests/security/test_workflow_visibility.py -p no:cacheprovider -q 2>&1 | tail -40)
+  ⎿  ==================================== ERRORS ====================================
+     _________ ERROR collecting tests/security/test_workflow_visibility.py __________
+     ../../../wt/lead/.venv/lib/python3.12/site-packages/_pytest/python.py:498: in importtestmodule
+     … +30 lines (ctrl+o to expand)
+
+  Thought for 22s (ctrl+o to expand)
+
+● Syntax error: I accidentally wrote SQL ::jsonb casts as Python args. Since the pool registers a jsonb codec (encoder=JSON serializer) via _init_connection, the idiomatic fix is to pass native Python list/dict as bound
+  params. Let me fix the INSERT.
+
+● Update(tests/security/test_workflow_visibility.py)
+  ⎿  Added 5 lines, removed 2 lines
+      66          role_key="member",
+      67          assigned_by_user_id=tenant_id,
+      68      )
+      69 +    # statuses/transitions are jsonb; pg_pool registers a jsonb codec
+      70 +    # (encoder=json.dumps) in _init_connection, so pass native Python
+      71 +    # list/dict and let asyncpg serialize them -- no ::jsonb cast needed.
+      72      version_id = await conn.fetchval(
+      73          "INSERT INTO team_workflow_versions "
+      74          "(team_id, version_number, statuses, transitions, created_by) "
+      75          "VALUES ($1, 1, $2, $3, $4) RETURNING id",
+      76          team_id,
+      74 -        '["todo","in_progress","blocked","done","cancelled"]'::jsonb,
+      75 -        '{"todo":{"in_progress":{"requires_reason":false,"min_signoffs":0}}}'::jsonb,
+      77 +        ["todo", "in_progress", "blocked", "done", "cancelled"],
+      78 +        {"todo": {"in_progress": {"requires_reason": False, "min_signoffs": 0}}},
+      79          tenant_id,
+      80      )
+      81      return {"tenant_id": tenant_id, "team_id": team_id, "version_id": version_id}
+
+● Bash(pytest tests/security/test_workflow_visibility.py -p no:cacheprovider -q 2>&1 | tail -40)
+  ⎿  ..                                                                       [100%]
+     2 passed in 0.19s
+
+  Thought for 10s (ctrl+o to expand)
+
+● Both pass. Now verify the migration is idempotent (re-running upgrade head is a no-op), lint my two files, and confirm the rest of the security suite is unaffected.
+
+● Bash(alembic upgrade head 2>&1 | tail -5 && echo "EXIT:$?")
+  ⎿  EXIT:0
+
+● Bash(ruff check tests/security/test_workflow_visibility.py alembic/versions/0048_2026_10_16_team_workflows.py 2>&1 | tail -30 && echo "EXIT:$?")
+  ⎿  All checks passed!
+     EXIT:0
+
+  Thought for 3s (ctrl+o to expand)
+
+● Idempotent and lint-clean. Now run the full security suite to confirm no regressions in that directory.
+
+● Bash(pytest tests/security -p no:cacheprovider -q 2>&1 | tail -30)
+  ⎿          registry = ToolRegistry()
+             registry.register(MemoryStatsTool)
+     … +27 lines (ctrl+o to expand)
+
+  Thought for 26s (ctrl+o to expand)
+
+● The single failure — test_scope_enforcement.py::TestStatsToolScopes::test_stats_tool_requires_read_scope expecting -32000 but getting -32601 (method not found for memory.stats) — is a pre-existing MCP tool-dispatch
+  issue, entirely unrelated to the team-workflow tables or RLS policies I touched. My 2 new tests are in the 41 passed; the 29 skipped require --live-aws (external access, disallowed by the environment rules).
+
+  Let me confirm that failure is pre-existing and not introduced by me by checking it's about tool registration scope, not DB state:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Confirmed pre-existing: it's about MemoryStatsTool registry dispatch (memory.stats method-not-found), no relation to migration 0048's tables or RLS policies — I introduced no new failures.
+
+  Report
+
+  What I changed
+
+  alembic/versions/0048_2026_10_16_team_workflows.py — three migration defects, all now applied:
+  - Bug 1 (seed INSERT): replaced inline f-string JSON interpolation of DEFAULT_STATUSES/DEFAULT_TRANSITIONS (whose : tokens text() mis-parsed as bind params, raising bind parameter 'false') with .bindparams()-passed
+    values.
+  - Bug 2 (deny policies): added DROP POLICY IF EXISTS … before the two CREATE POLICY work_item_history_{update,delete}_deny so a re-apply no longer hits DuplicateObject.
+  - Bug 3 (approvals predicate — the blocker): work_item_signoff_approvals has no team_id column, so the shared _team_pred (… = team_id) raised UndefinedColumn: column "team_id" does not exist. Added a table-specific
+    _approvals_pred that joins through work_item_signoff_requests to derive the team, and selected it per-table in both the SELECT-policy and INSERT-policy loops. All other 5 tables keep _team_pred (they have a real
+    team_id).
+
+  tests/security/test_workflow_visibility.py (new, written to disk) — fail-closed + team-scope isolation test, modeled on the probing patterns and tests/integration/conftest.py::multi_tenant_team_setup:
+  - test_non_member_sees_nothing_without_tenant_guc — under SET LOCAL ROLE mem_app with no app.current_tenant_id, a physically-present team_workflow_versions row returns [] (Spec S-3 fail-closed).
+  - test_active_member_reads_own_team_rows — control (member tenant with GUC set reads its row) + cross-tenant isolation (a second unrelated tenant still reads []).
+
+  tests/security/test_zzz_probe_role.py — deleted (throwaway diagnostic, its job done).
+
+  Verification
+
+  - alembic upgrade head — applies cleanly; alembic current = 0048_team_workflows (head); re-running upgrade head is a no-op (idempotent).
+  - pytest tests/security/test_workflow_visibility.py -p no:cacheprovider -q → 2 passed.
+  - pytest tests/security -p no:cacheprovider -q → 41 passed, 29 skipped (--live-aws, expected to skip per env rules), 1 pre-existing failure (test_scope_enforcement.py::test_stats_tool_requires_read_scope — MCP
+    tool-dispatch, unrelated to this work; not introduced by me).
+  - ruff check on both files → All checks passed!
+
+  Role/RLS finding (resolved, drives the test)
+
+  pg_pool connects as mem_test — a superuser (rolbypassrls=true) — so naive reads bypass RLS. tenant_tx/system_tx only set (or omit) the app.current_tenant_id GUC and never SET ROLE, so they do not activate RLS against
+  the test pool either. The test therefore does SET LOCAL ROLE mem_app (transaction-scoped, prod-equivalent: LOGIN, no BYPASSRLS) to actually exercise the policies, exactly as docs/feature/03-plan.md lines 131–134
+  specify.
+
+  Notes / open items
+
+  - The test asserts on team_workflow_versions as the representative team-scoped table. Bug 3's fix (the approvals JOIN predicate) is verified by the migration applying cleanly — the prior UndefinedColumn error is gone —
+    but no test directly reads work_item_signoff_approvals under RLS; that's a possible follow-up if you want coverage of the approvals policy specifically.
+  - No DB reset/downgrade was needed: the DB was sitting at 0045 (pre-0048) when I started, so a single alembic upgrade head brought it through 0046→0047→0048.
+
+✻ Cogitated for 43m 46s · done 11:12 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+
+

@@ -1,0 +1,260 @@
+      13
+      14 -from mem_mcp.mcp.tools.list import MemoryListInput, MemoryListTool
+      14 +from mem_mcp.mcp.tools.list import MemoryListInput, MemoryListTool, _decode_cursor
+      15  from tests.integration.test_memory_list_db import (
+      16      _build_ctx,
+      17      _cleanup_tenant,
+
+● Update(tests/integration/test_memory_list_filters_db.py)
+  ⎿  Added 3 lines, removed 2 lines
+      154              result = await tool(ctx, MemoryListInput(keywords="postgres", order="desc"))
+      155              ids = [r.id for r in result.results]
+      156              assert ids == [m4_id, m1_id]
+      157 -            # Check preview contains highlighted keyword
+      158 -            assert "**postgres**" in result.results[0].preview or "**Postgres**" in result.results[0].preview
+      157 +            # Check preview contains highlighted keyword (m4: "the postgres planner", m1: "Postgres runs fast")
+      158 +            assert "**postgres**" in result.results[0].preview
+      159 +            assert "**Postgres**" in result.results[1].preview
+      160              # Check content is exact
+      161              assert result.results[0].content == m4_content
+      162              assert result.results[1].content == m1_content
+
+● Update(tests/integration/test_memory_list_filters_db.py)
+  ⎿  Added 5 lines, removed 5 lines
+      187              assert ids == []
+      188
+      189              # No keywords: preview should equal content for all
+      190 -            for content in [m1_content, m2_content, m3_content, m4_content]:
+      191 -                result = await tool(ctx, MemoryListInput(limit=100))
+      192 -                for item in result.results:
+      193 -                    # When no keywords, preview == content == original
+      194 -                    assert item.preview == item.content
+      190 +            content_map = {m1_id: m1_content, m2_id: m2_content, m3_id: m3_content, m4_id: m4_content}
+      191 +            result = await tool(ctx, MemoryListInput(limit=100))
+      192 +            for item in result.results:
+      193 +                # When no keywords, preview == content == original
+      194 +                assert item.preview == item.content == content_map[item.id]
+      195
+      196          finally:
+      197              await _cleanup_tenant(pg_pool, tenant_id, team_id, setup["client_id"])
+
+● Update(tests/integration/test_memory_list_filters_db.py)
+  ⎿  Added 173 lines
+      261
+      262          finally:
+      263              await _cleanup_tenant(pg_pool, tenant_id, team_id, setup["client_id"])
+      264 +
+      265 +    async def test_item_fields_round_trip(self, pg_pool: Any) -> None:
+      266 +        """Test all memory fields round-trip correctly."""
+      267 +        setup = await _setup_tenant_and_team(pg_pool)
+      268 +        tenant_id = setup["tenant_id"]
+      269 +        team_id = setup["team_id"]
+      270 +
+      271 +        try:
+      272 +            x = f"t-{uuid4().hex[:8]}"
+      273 +            y = f"t-{uuid4().hex[:8]}"
+      274 +            created_at = datetime(2026, 1, 2, tzinfo=UTC)
+      275 +            updated_at = datetime(2026, 1, 3, tzinfo=UTC)
+      276 +            expires_at = datetime(2099, 1, 1, tzinfo=UTC)
+      277 +
+      278 +            m_id = await _insert_memory(
+      279 +                pg_pool,
+      280 +                tenant_id,
+      281 +                team_id,
+      282 +                id=uuid4(),
+      283 +                type="fact",
+      284 +                content="round trip body",
+      285 +                tags=[x, y],
+      286 +                version=3,
+      287 +                is_current=True,
+      288 +                indexable=False,
+      289 +                embedding_status="skipped_oversize",
+      290 +                expires_at=expires_at,
+      291 +                created_at=created_at,
+      292 +                updated_at=updated_at,
+      293 +            )
+      294 +
+      295 +            tool = MemoryListTool()
+      296 +            ctx = _build_ctx(pg_pool, tenant_id, setup["identity_id"], setup["client_id"])
+      297 +
+      298 +            result = await tool(ctx, MemoryListInput())
+      299 +            assert len(result.results) == 1
+      300 +            item = result.results[0]
+      301 +
+      302 +            assert item.id == m_id
+      303 +            assert item.content == "round trip body"
+      304 +            assert item.preview == "round trip body"
+      305 +            assert item.type == "fact"
+      306 +            assert set(item.tags) == {x, y}
+      307 +            assert item.version == 3
+      308 +            assert item.is_current is True
+      309 +            assert item.created_at == created_at
+      310 +            assert item.updated_at == updated_at
+      311 +            assert item.deleted_at is None
+      312 +            assert item.expires_at == expires_at
+      313 +            assert item.indexable is False
+      314 +            assert item.embedding_status == "skipped_oversize"
+      315 +
+      316 +            # Test deleted_at filtering
+      317 +            deleted_at = datetime(2026, 2, 2, tzinfo=UTC)
+      318 +            m2_id = await _insert_memory(
+      319 +                pg_pool,
+      320 +                tenant_id,
+      321 +                team_id,
+      322 +                content="deleted memory",
+      323 +                deleted_at=deleted_at,
+      324 +            )
+      325 +
+      326 +            result = await tool(ctx, MemoryListInput())
+      327 +            ids = {r.id for r in result.results}
+      328 +            assert ids == {m_id}  # deleted_at excluded by default
+      329 +
+      330 +            result = await tool(ctx, MemoryListInput(include_deleted=True))
+      331 +            items_by_id = {r.id: r for r in result.results}
+      332 +            assert m2_id in items_by_id
+      333 +            assert items_by_id[m2_id].deleted_at == deleted_at
+      334 +
+      335 +        finally:
+      336 +            await _cleanup_tenant(pg_pool, tenant_id, team_id, setup["client_id"])
+      337 +
+      338 +    async def test_include_flags_combined(self, pg_pool: Any) -> None:
+      339 +        """Test include_deleted, include_expired, include_history flags."""
+      340 +        setup = await _setup_tenant_and_team(pg_pool)
+      341 +        tenant_id = setup["tenant_id"]
+      342 +        team_id = setup["team_id"]
+      343 +
+      344 +        try:
+      345 +            now = datetime.now(tz=UTC)
+      346 +            base = datetime(2026, 1, 1, tzinfo=UTC)
+      347 +
+      348 +            # N: normal (no special flags)
+      349 +            n_id = await _insert_memory(pg_pool, tenant_id, team_id, content="normal", created_at=base)
+      350 +            # D: deleted_at in past
+      351 +            d_id = await _insert_memory(
+      352 +                pg_pool, tenant_id, team_id, content="deleted", created_at=base + timedelta(minutes=1), deleted_at=base
+      353 +            )
+      354 +            # E: expires_at in past (expired)
+      355 +            e_id = await _insert_memory(
+      356 +                pg_pool, tenant_id, team_id, content="expired", created_at=base + timedelta(minutes=2), expires_at=now - timedelta(hours=1)
+      357 +            )
+      358 +            # H: is_current=False (history)
+      359 +            h_id = await _insert_memory(
+      360 +                pg_pool, tenant_id, team_id, content="history", created_at=base + timedelta(minutes=3), version=1, is_current=False
+      361 +            )
+      362 +            # F: future expiry (included by default)
+      363 +            f_id = await _insert_memory(
+      364 +                pg_pool, tenant_id, team_id, content="future", created_at=base + timedelta(minutes=4), expires_at=now + timedelta(hours=1)
+      365 +            )
+      366 +
+      367 +            tool = MemoryListTool()
+      368 +            ctx = _build_ctx(pg_pool, tenant_id, setup["identity_id"], setup["client_id"])
+      369 +
+      370 +            # Default: {N, F}
+      371 +            result = await tool(ctx, MemoryListInput(order="asc"))
+      372 +            ids = {r.id for r in result.results}
+      373 +            assert ids == {n_id, f_id}
+      374 +
+      375 +            # include_deleted: {N, D, F}
+      376 +            result = await tool(ctx, MemoryListInput(include_deleted=True, order="asc"))
+      377 +            ids = {r.id for r in result.results}
+      378 +            assert ids == {n_id, d_id, f_id}
+      379 +
+      380 +            # include_expired: {N, E, F}
+      381 +            result = await tool(ctx, MemoryListInput(include_expired=True, order="asc"))
+      382 +            ids = {r.id for r in result.results}
+      383 +            assert ids == {n_id, e_id, f_id}
+      384 +
+      385 +            # include_history: {N, H, F}
+      386 +            result = await tool(ctx, MemoryListInput(include_history=True, order="asc"))
+      387 +            ids = {r.id for r in result.results}
+      388 +            assert ids == {n_id, h_id, f_id}
+      389 +
+      390 +            # include_deleted + include_expired: {N, D, E, F}
+      391 +            result = await tool(ctx, MemoryListInput(include_deleted=True, include_expired=True, order="asc"))
+      392 +            ids = {r.id for r in result.results}
+      393 +            assert ids == {n_id, d_id, e_id, f_id}
+      394 +
+      395 +            # All three: {N, D, E, H, F}
+      396 +            result = await tool(
+      397 +                ctx,
+      398 +                MemoryListInput(
+      399 +                    include_deleted=True, include_expired=True, include_history=True, order="asc"
+      400 +                ),
+      401 +            )
+      402 +            ids = {r.id for r in result.results}
+      403 +            assert ids == {n_id, d_id, e_id, h_id, f_id}
+      404 +
+      405 +        finally:
+      406 +            await _cleanup_tenant(pg_pool, tenant_id, team_id, setup["client_id"])
+      407 +
+      408 +    async def test_limit_one_edge(self, pg_pool: Any) -> None:
+      409 +        """Test limit=1 edge cases with cursor."""
+      410 +        setup = await _setup_tenant_and_team(pg_pool)
+      411 +        tenant_id = setup["tenant_id"]
+      412 +        team_id = setup["team_id"]
+      413 +
+      414 +        try:
+      415 +            base = datetime(2026, 1, 1, tzinfo=UTC)
+      416 +            a_id = await _insert_memory(pg_pool, tenant_id, team_id, content="A", created_at=base)
+      417 +            b_id = await _insert_memory(pg_pool, tenant_id, team_id, content="B", created_at=base + timedelta(minutes=1))
+      418 +
+      419 +            tool = MemoryListTool()
+      420 +            ctx = _build_ctx(pg_pool, tenant_id, setup["identity_id"], setup["client_id"])
+      421 +
+      422 +            # limit=1 desc: [B], cursor points at A
+      423 +            result = await tool(ctx, MemoryListInput(limit=1, order="desc"))
+      424 +            assert [r.id for r in result.results] == [b_id]
+      425 +            assert result.next_cursor is not None
+      426 +            cursor_iso, cursor_id = _decode_cursor(result.next_cursor)
+      427 +            assert cursor_iso == base.isoformat()
+      428 +            assert cursor_id == str(a_id)
+      429 +
+      430 +            # limit=2 desc: [B, A], no cursor
+      431 +            result = await tool(ctx, MemoryListInput(limit=2, order="desc"))
+      432 +            assert [r.id for r in result.results] == [b_id, a_id]
+      433 +            assert result.next_cursor is None
+      434 +
+      435 +        finally:
+      436 +            await _cleanup_tenant(pg_pool, tenant_id, team_id, setup["client_id"])
+
+● Bash(pytest -q -p no:cacheprovider tests/integration/test_memory_list_filters_db.py -rxX 2>&1 | tail -15)
+  ⎿  ........                                                                 [100%]
+     8 passed in 0.77s
+
+● ........                                                                 [100%]
+  8 passed in 0.77s
+
+  Summary:
+
+  ✅ Tightened test_keywords_filter_order_and_preview:
+  - Exact assertions for highlight markers: "**postgres**" in m4, "**Postgres**" in m1
+  - Content map validation: item.preview == item.content == content_map[item.id]
+
+  ✅ Added 3 new tests (8 total now):
+
+  1. test_item_fields_round_trip — Tests all fields:
+     - Single memory: type="fact", tags=[x,y], version=3, is_current=True, indexable=False
+     - embedding_status="skipped_oversize", expires_at=2099-01-01, created_at/updated_at exact
+     - Second memory with deleted_at: appears only with include_deleted=True
+     - Asserts deleted_at equals exact datetime ✓
+  2. test_include_flags_combined — Tests flag combinations:
+     - N (normal), D (deleted), E (expired), H (history/not_current), F (future expiry)
+     - Default → {N, F} ✓
+     - include_deleted=True → {N, D, F} ✓
+     - include_expired=True → {N, E, F} ✓
+     - include_history=True → {N, H, F} ✓
+     - All three flags → {N, D, E, H, F} ✓
+  3. test_limit_one_edge — Tests limit=1 cursor:
+     - limit=1, order="desc" → [B], cursor points at A ✓
+     - limit=2, order="desc" → [B, A], cursor is None ✓
+     - Cursor ISO and ID verified exact ✓
+
+  Result: 8 passed in 0.77s
+
+✻ Crunched for 52s · done 11:30 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

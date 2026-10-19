@@ -1,0 +1,84 @@
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  Opus 5.5 · Claude Max
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   ~/laguna-bench/runs/F2-3/repo
+
+
+❯ You are the ARCHITECT supervising an engineer who does all of the work on the feature below. This is the wp1 gate
+  (round 1). Review: the implementation of WP1 (see ~/laguna-bench/runs/F2-3/repo/docs/feature/03-plan.md and the code changes): does it deliver its planned scope and tests, is it correct, does it follow the
+  codebase's conventions? The harness gate output is in ~/laguna-bench/runs/F2-3/orders/gates-wp1-1.md (authoritative).
+  Read as much as you need (the repository at ~/laguna-bench/runs/F2-3/repo, the engineer's documents under ~/laguna-bench/runs/F2-3/repo/docs/feature, earlier reviews and
+  orders in ~/laguna-bench/runs/F2-3/orders). Judge against the REQUEST, the existing codebase and its conventions. Spend your effort READING;
+  keep your OUTPUT SHORT. Write to ~/laguna-bench/runs/F2-3/orders/review-wp1-1.md — first line exactly "VERDICT: APPROVE" or "VERDICT: REVISE", then at most 5
+  numbered findings, most important first, each one line with evidence (file:line, doc section or gate line). Hard cap 250
+  words. APPROVE only if the stage is good enough to build on; minor nits go in findings without blocking. No code, no
+  rewrites, no praise. Then end your turn.
+
+  === REQUEST ===
+  F2 — Team workflows for work items (real feature, from Anand's backlog)
+
+  Raw product idea (as written in the backlog — not yet a spec):
+
+  > Mind-map work items exist now, but every team works differently. A team should be able to define
+  > its own workflow — the stages a work item moves through, which moves are allowed, and what a move
+  > needs before it happens (for example a reason, or sign-off from someone other than the owner,
+  > possibly from more than one person). Items should never get stuck or lose their history when a
+  > team changes its workflow. People need to see and move their team's work on a board in the web
+  > app, see why a move is blocked, and see what is waiting on them. Agents must be able to do the
+  > same through the MCP tools.
+
+  Context: work items were added recently (migrations 0046/0047, src/mem_mcp/mindmap/, the work-item
+  MCP tools). Mind maps are described in docs/mindmap-v1-build-design.md and the ADRs; the web app is under web/.
+  Follow the existing patterns of this codebase.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_01JFK6RB6WAmZzT3a8SS7vyk
+
+  Searched for 4 patterns, read 4 files (ctrl+o to expand)
+
+● Checking a couple of remaining details (migration NOT NULL, tests), then writing the review.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/F2-3/orders/review-wp1-1.md)
+  ⎿  Wrote 7 lines to ../orders/review-wp1-1.md
+      1 VERDICT: REVISE
+      2
+        kflow check runs; `TRANSITIONS`/`check_transition` remain (work_items.py:42, 263). This misses R1/R2, which are WP1 scope (plan §WP1 "remove … as the source of truth").
+      4 2. `mark_work_item` does not stamp `workflow_id` and does not check the initial status against `__entry__`. It still inserts a literal `'todo'` (work_items.py:531-534). NOT NULL was deferred to WP1 (0048:2
+        97-301) but is never re-applied, so R4 (frozen version per item) does not hold for new items.
+        /`get_work_item`/`get_work_item_history` are not team-wide and do not return `available_transitions`/`signoff_state`. The planned `test_list_work_items_team_wide_cross_tenant` was not added.
+      6 4. Sign-off semantics differ from the plan and design. `start_signoff` silently reuses a pending request instead of raising `SignoffAlreadyPendingError` (workflows.py:384-421). A request that reaches quoru
+        m is stored as `superseded`, not `approved` (540-549). A closed request raises `SignoffAlreadyPendingError` (473-474). The deferred move hard-codes `channel="mcp"` (538), which is wrong for web callers. `F
+      7 5. Planned tests are missing: `test_signoff_rejects_inactive_approver`, `test_no_two_pending_requests_same_item`, `test_completion_revalidates_status` (the two-connection race), `test_ensure_default_workfl
+        ow_idempotent`, and the two `test_work_items_service.py` extensions. Also, the plan names the function `rebase_work_item` but the code has `rebase_workitem` (workflows.py:594).
+     … +3 lines (ctrl+o to expand)
+
+● My verdict on WP1 is REVISE, written to ~/laguna-bench/runs/F2-3/orders/review-wp1-1.md. The harness gates pass (ruff, mypy, no new test failures), but large parts of the planned scope are missing.
+
+  1. Custom workflows still don't work. Status values are still checked against the old hard-coded list before the workflow check runs, so any status a team defines is rejected (work_items.py:257). The old transition
+     table is also still in the code, though the plan says to remove it as the source of truth.
+  2. New items aren't tied to a workflow version. Creating a work item doesn't record its workflow version and still starts it as todo, without checking the workflow's allowed starting statuses. WP0 deferred making that
+     column required to WP1, and WP1 doesn't do it either. So "items never lose their history when the workflow changes" doesn't hold for new items.
+  3. Teammates in other tenants still can't see or move each other's items. The item lookup for moves still filters by tenant (work_items.py:375). Listing, get and history aren't team-wide and don't return the allowed
+     moves or sign-off state. The planned cross-tenant listing test wasn't added.
+  4. Sign-off behaves differently from the design:
+     - A second request on an item quietly reuses the open one instead of raising an error.
+     - A request that reaches quorum is stored as "superseded" instead of "approved".
+     - A move that completes after sign-off is always logged as coming from MCP, even when the web app made it.
+     - The approval path locks only the request row, not the work item row.
+  5. Five planned tests are missing:
+     - inactive approver
+     - two pending requests on one item
+     - approval racing a move
+     - seeding the default workflow twice adds only one
+     - the two additions to the existing work-item service tests
+
+     The rebase function is also named rebase_workitem instead of the planned rebase_work_item.
+
+✻ Cooked for 55s · done 12:35 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

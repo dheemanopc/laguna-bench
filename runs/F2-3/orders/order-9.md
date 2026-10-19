@@ -1,0 +1,12 @@
+The architect reviewed your plan and asked for revisions:
+
+VERDICT: REVISE
+
+1. The RLS-basis predicate is self-defeating (plan:27). `tenant_id = safe_current_tenant_id() AND can_access_team_resource(...)` is the same as same-tenant only, because the helper returns true whenever caller = resource tenant (0035:68-75). That means team-wide reads and moves across tenants (R6/R8/Risk 6) can never work. It also breaks history inserts, which carry the item's tenant (analysis:144), so tenant B can never move tenant A's item. Use the OR shape that 0033:88-92 uses: `can_access_team_resource(safe_current_tenant_id(), tenant_id, team_id)`. Note that the helper is granted to mem_app, not PUBLIC (0035:81).
+2. The plan's tests can't catch defect 1. WP0's `test_create_team_member_can_read_write_move` (plan:125-131) uses a single tenant, so it passes through the same-tenant clause. WP0 needs a DB-level test where tenant B, a member of the team, reads, updates and inserts history on tenant A's item. Add a negative test for a non-member in the same team as well.
+3. WP3 contradicts itself on the personal team. The plan says the hook runs inside `system_tx` (plan:268-269), but the test claims it runs as `mem_app` under RLS (plan:303-307). Pick one, and test the path that actually runs.
+4. WP2 changes `mark`/`assign`/`set_kind` (stamping `workflow_id`, plus the `__entry__` check at plan:147) with no test. Add one: a new item is stamped with the live version and an invalid initial status is rejected.
+5. Nits: `memmap_workflow_get.py` (plan:213) and `team_workflows_versions` (plan:91) are typos. WP3 dispatches to MCP tool classes, but the header says web handlers call domain modules (plan:10-11 vs 255). WP1's "move before commit" race test (plan:183) needs a deterministic two-connection setup.
+
+
+Revise docs/feature/03-plan.md accordingly (no code). When done, end your turn with a 3-line summary of what you changed.

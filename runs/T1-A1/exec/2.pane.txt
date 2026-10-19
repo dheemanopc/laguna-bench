@@ -1,0 +1,260 @@
+      150 +        except Exception as audit_exc:
+      151 +            _log.warning(
+      152 +                "admin_error_audit_failed",
+      153 +                tool=self.name,
+      154 +                request_id=ctx.request_id,
+      155 +                error=type(audit_exc).__name__,
+      156 +            )
+
+● Update(src/mem_mcp/mcp/tools/_admin_base.py)
+  ⎿  Added 1 line, removed 1 line
+      82          conn: asyncpg.Connection,
+      83          ctx: ToolContext,
+      84          *,
+      85 -        result: str,
+      85 +        result: AuditResult,
+      86          error_code: str | None = None,
+      87          extra: dict[str, Any] | None = None,
+      88      ) -> None:
+
+● Update(src/mem_mcp/mcp/tools/_admin_base.py)
+  ⎿  Added 1 line, removed 1 line
+       98          await ctx.deps.audit.audit(
+       99              conn,
+      100              action=self.audit_action,
+      101 -            result=result,  # type: ignore[arg-type]
+      101 +            result=result,
+      102              tenant_id=ctx.tenant_id,
+      103              identity_id=ctx.identity_id,
+      104              client_id=ctx.client_id,
+
+● Update(src/mem_mcp/mcp/tools/_admin_base.py)
+  ⎿  Added 1 line, removed 1 line
+      25
+      26  from pydantic import BaseModel
+      27
+      28 -from mem_mcp.audit.logger import AuditAction
+      28 +from mem_mcp.audit.logger import AuditAction, AuditResult
+      29  from mem_mcp.auth.permissions import Permission
+      30  from mem_mcp.auth.rbac import has_permission
+      31  from mem_mcp.db import system_tx
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Now the tests. First the strong limit test and the DB-free role test in the service file:
+
+● Update(tests/unit/test_admin_service.py)
+  ⎿  Added 28 lines, removed 4 lines
+      122              assert [u.tenant_id for u in hits] == [str(tid)]
+      123
+      124      async def test_limit_is_clamped(self, pg_pool: Any) -> None:
+      125 +        """Seed 105 matching tenants so the clamp is observable on a shared DB."""
+      126 +        token = uuid4().hex
+      127 +        async with pg_pool.acquire() as conn:
+      128 +            await conn.execute(
+      129 +                """
+      130 +                INSERT INTO tenants (id, email, status)
+      131 +                SELECT gen_random_uuid(), 'lim' || g || '-' || $1 || '@test.invalid', 'active'
+      132 +                FROM generate_series(1, 105) g
+      133 +                """,
+      134 +                token,
+      135 +            )
+      136          async with system_tx(pg_pool) as conn:
+      126 -            hits = await find_users(conn, query="te", limit=9999)
+      127 -            assert len(hits) <= 100
+      128 -            hits = await find_users(conn, query="te", limit=0)
+      129 -            assert len(hits) <= 1
+      137 +            assert len(await find_users(conn, query=token, limit=9999)) == 100
+      138 +            assert len(await find_users(conn, query=token, limit=None)) == 20
+      139 +            assert len(await find_users(conn, query=token, limit=0)) == 1
+      140 +            assert len(await find_users(conn, query=token, limit=-5)) == 1
+      141 +            assert len(await find_users(conn, query=token, limit=50)) == 50
+      142
+      143
+      144 +def test_team_roles_never_confer_system_permissions() -> None:
+      145 +    """Only system roles may hold system.*; team roles must never (privilege escalation)."""
+      146 +    system_roles = {"system_admin", "system_support"}
+      147 +    non_system = {k: v for k, v in ROLE_PERMISSIONS.items() if k not in system_roles}
+      148 +    assert non_system, "expected team roles in ROLE_PERMISSIONS"
+      149 +    for role_key, perms in non_system.items():
+      150 +        leaked = sorted(p.value for p in perms if p.value.startswith("system."))
+      151 +        assert leaked == [], f"role {role_key} grants system perms: {leaked}"
+      152 +    # sanity: the system roles do hold some
+      153 +    assert any(p.value.startswith("system.") for p in ROLE_PERMISSIONS["system_admin"])
+      154 +
+      155 +
+      156  class TestGetUser:
+      157      async def test_roles_and_active_teams_only(self, pg_pool: Any) -> None:
+      158          async with pg_pool.acquire() as conn:
+
+● Update(tests/unit/test_admin_service.py)
+  ⎿  Added 1 line
+      18      find_users,
+      19      get_user,
+      20  )
+      21 +from mem_mcp.auth.permissions import ROLE_PERMISSIONS
+      22  from mem_mcp.db import system_tx, tenant_tx
+      23  from tests.unit._admin_fixtures import assign_role, make_team, make_tenant
+      24
+
+● Reading 1 file… (ctrl+o to expand)
+  ⎿  tests/security/test_admin_tools_authz.py
+
+● Update(tests/security/test_admin_tools_authz.py)
+  ⎿  Added 69 lines
+      182          assert ei.value.data == {"missing_permission": PERM}
+      183
+      184
+      185 +class TestPermissionCheckFailure:
+      186 +    async def test_has_permission_error_is_audited_once_and_propagates(
+      187 +        self, pg_pool: Any, monkeypatch: pytest.MonkeyPatch
+      188 +    ) -> None:
+      189 +        from mem_mcp.mcp.tools import _admin_base
+      190 +
+      191 +        async def _raise(*_a: Any, **_k: Any) -> bool:
+      192 +            raise RuntimeError("permission backend down")
+      193 +
+      194 +        monkeypatch.setattr(_admin_base, "has_permission", _raise)
+      195 +        monkeypatch.setattr(AdminGetUserTool, "run", _boom)
+      196 +        tid, iid = await _caller(pg_pool, kind="admin")
+      197 +        ctx = make_ctx(pg_pool, tid, iid)
+      198 +        with pytest.raises(RuntimeError, match="permission backend down"):
+      199 +            await AdminGetUserTool()(ctx, AdminGetUserInput(tenant_id=uuid4()))
+      200 +        rows = await audit_rows(pg_pool, ctx.request_id)
+      201 +        assert len(rows) == 1
+      202 +        assert (rows[0]["action"], rows[0]["result"]) == ("admin.get_user", "error")
+      203 +        assert rows[0]["error_code"] == "RuntimeError"
+      204 +        assert rows[0]["tenant_id"] == tid and rows[0]["actor_identity_id"] == iid
+      205 +
+      206 +
+      207 +class TestPooledConnectionAfterRollback:
+      208 +    """The permission check and audit INSERT must survive a GUC that reads back ''."""
+      209 +
+      210 +    async def test_tools_on_single_connection_pool(self) -> None:
+      211 +        import os
+      212 +
+      213 +        from mem_mcp.db import tenant_tx
+      214 +
+      215 +        dsn = os.environ.get("MEM_MCP_TEST_DSN")
+      216 +        if not dsn:
+      217 +            pytest.skip("MEM_MCP_TEST_DSN env not set")
+      218 +        import asyncpg  # type: ignore[import-untyped]
+      219 +
+      220 +        from mem_mcp.db.pool import _init_connection
+      221 +
+      222 +        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=1, init=_init_connection)
+      223 +        try:
+      224 +            admin_t, admin_i = await _caller(pool, kind="admin")
+      225 +            plain_t, plain_i = await _caller(pool, kind="plain")
+      226 +            async with pool.acquire() as conn:
+      227 +                target, _, _ = await make_tenant(conn)
+      228 +
+      229 +            with pytest.raises(RuntimeError):
+      230 +                async with tenant_tx(pool, uuid4()):
+      231 +                    raise RuntimeError("force rollback")
+      232 +
+      233 +            ctx = make_ctx(pool, admin_t, admin_i)
+      234 +            out = await AdminGetUserTool()(ctx, AdminGetUserInput(tenant_id=target))
+      235 +            assert out.user.tenant_id == str(target)  # type: ignore[attr-defined]
+      236 +            rows = await audit_rows(pool, ctx.request_id)
+      237 +            assert [(r["action"], r["result"]) for r in rows] == [("admin.get_user", "success")]
+      238 +
+      239 +            with pytest.raises(RuntimeError):
+      240 +                async with tenant_tx(pool, uuid4()):
+      241 +                    raise RuntimeError("force rollback again")
+      242 +
+      243 +            ctx2 = make_ctx(pool, plain_t, plain_i)
+      244 +            with pytest.raises(JsonRpcError) as ei:
+      245 +                await AdminFindUserTool()(ctx2, AdminFindUserInput(query="whatever"))
+      246 +            assert ei.value.code == -32603
+      247 +            assert ei.value.data == {"missing_permission": PERM}
+      248 +            rows = await audit_rows(pool, ctx2.request_id)
+      249 +            assert [(r["action"], r["result"]) for r in rows] == [("admin.find_user", "denied")]
+      250 +        finally:
+      251 +            await pool.close()
+      252 +
+      253 +
+      254  class TestSubclassGuards:
+      255      def _attrs(self) -> dict[str, Any]:
+      256          return {
+
+● Bash(pytest -q -p no:cacheprovider tests/unit/test_admin_service.py tests/security/test_admin_tools_authz.py 2>&1 | tail -15)
+  ⎿  ...............................................                          [100%]
+     47 passed in 0.84s
+
+● Bash(pytest -q -p no:cacheprovider tests/unit/test_lint_tenant_scope.py tests/unit/test_mcp.py tests/unit/test_main.py tests/unit/test_audit.py tests/unit/test_rbac_…)
+  ⎿  E   DETAIL:  Failing row contains (aac463e0-bdef-499f-9897-eb2e8b5b0135, 4a76ff1c-484d-4339-a117-49e1b4d7fa32, admin, invited, 2026-10-16 00:51:22.747056+00, 4a76ff1c-484d-4339-a117-49e1b4d7fa32).
+
+     asyncpg/protocol/protocol.pyx:206: CheckViolationError
+     … +3 lines (ctrl+o to expand)
+
+● Bash(pytest -q -p no:cacheprovider 2>&1 | grep -E "^(FAILED|ERROR) |passed|failed" | sed 's/ - .*//' | sort > /tmp/claude-1000/-home-anand-laguna-bench-runs-T1-A1-re…)
+  ⎿  37 failed, 1320 passed, 31 skipped, 62 warnings, 15 errors in 11.44s
+
+● Bash(S=/tmp/claude-1000/-home-anand-laguna-bench-runs-T1-A1-repo/e470a5c9-7aa4-469a-91aa-c7c65eabad8f/scratchpad; grep -E "^(FAILED|ERROR) " $S/after2.txt | diff $S/…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Bash(ruff check src tests && ruff format --check src/mem_mcp/mcp/tools/_admin_base.py tests/unit/test_admin_service.py tests/security/test_admin_tools_authz.py && my…)
+  ⎿  All checks passed!
+     3 files already formatted
+     Success: no issues found in 328 source files
+
+● Bash(pytest -q -p no:cacheprovider 2>&1 | grep -E "^(FAILED|ERROR) " | sed 's/ - .*//' | sort | diff /tmp/claude-1000/-home-anand-laguna-bench-runs-T1-A1-repo/e470a5…)
+  ⎿  IDENTICAL
+
+● All the requested follow-ups are in, and the full suite shows no new failures.
+
+  Changes
+
+  _admin_base.py
+  - A1: The permission check and its denial audit are now wrapped in a try. If has_permission raises, one result="error" row is written on a fresh system_tx, and the original exception is re-raised.
+  - One row per call: I factored the best-effort audit into _audit_error() and used it from both paths. A permission-check failure re-raises before the run() handler is reached, so only one row can ever be written.
+  - A2: _audit(result: AuditResult) is typed, and the # type: ignore is gone.
+
+  test_admin_service.py
+  - B1: test_limit_is_clamped seeds 105 tenants sharing a UUID token with one INSERT … generate_series. It asserts 9999→100, None→20, 0→1, -5→1 and 50→50.
+  - B4: test_team_roles_never_confer_system_permissions is DB-free and runs over every ROLE_PERMISSIONS key except the two system roles.
+
+  test_admin_tools_authz.py
+  - B3: TestPermissionCheckFailure patches has_permission in _admin_base to raise RuntimeError. It asserts the error propagates, run() is not reached, and there is exactly one error row (error_code="RuntimeError") with
+    the caller's tenant and identity.
+  - B2: TestPooledConnectionAfterRollback uses a max_size=1 pool and forces a ROLLBACK first. AdminGetUserTool as admin then gives a result and one success row. After a second rollback, AdminFindUserTool as non-admin
+    gives -32603 with missing_permission and one denied row.
+
+  Verification
+
+  ┌────────────────────────────────────────────────────────────────────────────────────────────────────┬───────────────────────────────────────────────┐
+  │                                               Check                                                │                    Result                     │
+  ├────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ test_admin_service.py + test_admin_tools_authz.py                                                  │ 47 passed                                     │
+  ├────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ test_lint_tenant_scope, test_mcp, test_main, test_audit, test_rbac_permissions, test_rbac_resolver │ 65 passed, 1 failed                           │
+  ├────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ Full suite                                                                                         │ 37 failed, 1320 passed, 31 skipped, 15 errors │
+  ├────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ Failing/erroring IDs vs before_src_only.txt                                                        │ identical, no new IDs                         │
+  ├────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ ruff check src tests                                                                               │ clean                                         │
+  ├────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ ruff format --check on the 3 changed files                                                         │ clean                                         │
+  ├────────────────────────────────────────────────────────────────────────────────────────────────────┼───────────────────────────────────────────────┤
+  │ mypy                                                                                               │ no issues in 328 files                        │
+  └────────────────────────────────────────────────────────────────────────────────────────────────────┴───────────────────────────────────────────────┘
+
+  The one failure in the second group is test_rbac_resolver.py::TestHasPermissionResolver::test_has_permission_inactive_member_denied. It is a pre-existing red test: a CHECK constraint violation on team_role_assignments
+  (the inserted status 'invited' is not allowed), and its ID is in the saved baseline list.
+
+  The full-suite totals differ from the earlier run (34/16 before, 37/15 after) only in count; the ID sets are the same, as in order 1.
+
+  One caveat carries over: the baseline is HEAD plus my order-1 source changes, not a pristine checkout, because stash and worktree were denied in this session.
+
+✻ Churned for 1m 16s · done 6:22 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

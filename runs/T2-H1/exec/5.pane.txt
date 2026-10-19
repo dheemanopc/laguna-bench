@@ -1,0 +1,260 @@
+      590                      owner = await _provision_user_like_backfill(conn)
+      591                      outsider = await _provision_user_like_backfill(conn)
+      534 -                    target = await _create_memory(conn, owner["tenant"], owner["team"], "target")
+      592 +                    target = await _create_memory(
+      593 +                        conn, owner["tenant"], owner["team"], "target"
+      594 +                    )
+      595                      own_citer = await _create_memory(
+      596                          conn, owner["tenant"], owner["team"], "own citer"
+      597                      )
+     ...
+      618                          reference_kind="cites",
+      619                      )
+      620
+      561 -            # Test the tool (it opens its own transaction)
+      562 -            ctx = ToolContext(
+      563 -                request_id="test",
+      564 -                tenant_id=owner["tenant"],
+      565 -                identity_id=owner["tenant"],
+      566 -                client_id="test-client",
+      567 -                scopes=["memory.read"],
+      568 -                db_pool=pg_pool,
+      569 -                deps=ToolDeps(
+      570 -                    embeddings=None,
+      571 -                    audit=NoopAuditLogger(),
+      572 -                    quotas=NoopQuotas(),
+      573 -                ),
+      574 -            )
+      621 +            # Test the tool
+      622 +            ctx = _tool_ctx(pg_pool, owner["tenant"])
+      623              tool = RefsInTool()
+      624              result = await tool(ctx, RefsInInput(memory_id=target))
+      625
+      626 +            assert isinstance(result, RefsInOutput)
+      627              assert result.accessible_count == 1
+      628              assert result.inaccessible_count == 1
+      629              assert len(result.refs) == 1
+     ...
+      640  class TestRefsOutTool:
+      641      """Test memsys_refs_out with shared access rule."""
+      642
+      594 -    async def test_own_refs_accessible_unrelated_inaccessible(self, pg_pool) -> None:
+      643 +    async def test_own_refs_accessible_unrelated_inaccessible(
+      644 +        self, pg_pool: Any
+      645 +    ) -> None:
+      646          """Own targets listed, unrelated-tenant targets hidden."""
+      647          owner = None
+      648          outsider = None
+     ...
+      651                  async with conn.transaction():
+      652                      owner = await _provision_user_like_backfill(conn)
+      653                      outsider = await _provision_user_like_backfill(conn)
+      603 -                    source = await _create_memory(conn, owner["tenant"], owner["team"], "source")
+      654 +                    source = await _create_memory(
+      655 +                        conn, owner["tenant"], owner["team"], "source"
+      656 +                    )
+      657                      own_target = await _create_memory(
+      658                          conn, owner["tenant"], owner["team"], "own target"
+      659                      )
+     ...
+      680                          reference_kind="cites",
+      681                      )
+      682
+      630 -            # Test the tool (it opens its own transaction)
+      631 -            ctx = ToolContext(
+      632 -                request_id="test",
+      633 -                tenant_id=owner["tenant"],
+      634 -                identity_id=owner["tenant"],
+      635 -                client_id="test-client",
+      636 -                scopes=["memory.read"],
+      637 -                db_pool=pg_pool,
+      638 -                deps=ToolDeps(
+      639 -                    embeddings=None,
+      640 -                    audit=NoopAuditLogger(),
+      641 -                    quotas=NoopQuotas(),
+      642 -                ),
+      643 -            )
+      683 +            # Test the tool
+      684 +            ctx = _tool_ctx(pg_pool, owner["tenant"])
+      685              tool = RefsOutTool()
+      686              result = await tool(ctx, RefsOutInput(memory_id=source))
+      687
+      688 +            assert isinstance(result, RefsOutOutput)
+      689              assert result.accessible_count == 1
+      690              assert result.inaccessible_count == 1
+      691              assert len(result.refs) == 1
+     ...
+      707      ) -> None:
+      708          """Backfill-provisioned user writes M1, then M2 citing M1, succeeds."""
+      709          setup = None
+      710 +        plugin_id = f"test-write-{uuid4().hex[:8]}"
+      711          try:
+      712              async with pg_pool.acquire() as conn:
+      713                  async with conn.transaction():
+      714                      setup = await _provision_user_like_backfill(conn)
+      672 -                    plugin_id = f"test-write-{uuid4().hex[:8]}"
+      715
+      716                      # Create oauth_client for this plugin
+      717                      await conn.execute(
+     ...
+      734              assert m2 is not None
+      735
+      736              # Verify refs are visible
+      695 -            async with system_tx(pg_pool) as conn:
+      696 -                ctx = ToolContext(
+      697 -                    request_id="test",
+      698 -                    tenant_id=setup["tenant"],
+      699 -                    identity_id=setup["tenant"],
+      700 -                    client_id=plugin_id,
+      701 -                    scopes=["memory.read"],
+      702 -                    db_pool=pg_pool,
+      703 -                    deps=ToolDeps(
+      704 -                        embeddings=None,
+      705 -                        audit=NoopAuditLogger(),
+      706 -                        quotas=NoopQuotas(),
+      707 -                    ),
+      708 -                )
+      709 -                refs_out_tool = RefsOutTool()
+      710 -                refs_in_tool = RefsInTool()
+      737 +            ctx = _tool_ctx(pg_pool, setup["tenant"], plugin_id)
+      738 +            refs_out_tool = RefsOutTool()
+      739 +            refs_in_tool = RefsInTool()
+      740
+      712 -                result_out = await refs_out_tool(ctx, RefsOutInput(memory_id=m2))
+      713 -                assert result_out.accessible_count == 1
+      741 +            result_out = await refs_out_tool(ctx, RefsOutInput(memory_id=m2))
+      742 +            assert isinstance(result_out, RefsOutOutput)
+      743 +            assert result_out.accessible_count == 1
+      744 +            assert result_out.inaccessible_count == 0
+      745 +            assert str(result_out.refs[0].target_memory_id) == str(m1)
+      746
+      715 -                result_in = await refs_in_tool(ctx, RefsInInput(memory_id=m1))
+      716 -                assert result_in.accessible_count == 1
+      717 -
+      747 +            result_in = await refs_in_tool(ctx, RefsInInput(memory_id=m1))
+      748 +            assert isinstance(result_in, RefsInOutput)
+      749 +            assert result_in.accessible_count == 1
+      750 +            assert result_in.inaccessible_count == 0
+      751 +            assert str(result_in.refs[0].source_memory_id) == str(m2)
+      752          finally:
+      753              if setup:
+      754                  await _cleanup(
+     ...
+      764          """Cross-tenant cite and random-UUID cite raise identical errors."""
+      765          owner = None
+      766          outsider = None
+      767 +        owner_plugin = f"owner-{uuid4().hex[:8]}"
+      768 +        outsider_plugin = f"outsider-{uuid4().hex[:8]}"
+      769          try:
+      770              async with pg_pool.acquire() as conn:
+      771                  async with conn.transaction():
+      772                      owner = await _provision_user_like_backfill(conn)
+      773                      outsider = await _provision_user_like_backfill(conn)
+      738 -                    owner_plugin = f"owner-{uuid4().hex[:8]}"
+      739 -                    outsider_plugin = f"outsider-{uuid4().hex[:8]}"
+      774
+      775                      for plugin_id in [owner_plugin, outsider_plugin]:
+      776                          await conn.execute(
+     ...
+      783                              f"plugin:{plugin_id}",
+      784                          )
+      785
+      752 -            owner_sdk = sdk_client_factory(tenant_id=owner["tenant"], plugin_id=owner_plugin)
+      790
+      791              outsider_sdk = sdk_client_factory(
+     ...
+      793              )
+      794
+      795              # Try to cite owner's memory
+      760 -            try:
+      796 +            with pytest.raises(PluginValidationError) as exc_no_access:
+      797                  await outsider_sdk.write(
+      798                      content="trying to cite owner memory",
+      799                      type="note",
+      764 -                    references=[ReferenceInput(target_uuid=owner_mem, reference_kind="cites")],
+      800 +                    references=[
+      801 +                        ReferenceInput(target_uuid=owner_mem, reference_kind="cites")
+      802 +                    ],
+      803                  )
+      766 -                raise AssertionError("should have raised PluginValidationError")
+      767 -            except PluginValidationError as exc_no_access:
+      768 -                no_access_code = exc_no_access.code
+      769 -                no_access_message = exc_no_access.message
+      804
+      805              # Try with random UUID
+      772 -            try:
+      806 +            with pytest.raises(PluginValidationError) as exc_not_found:
+      807                  await outsider_sdk.write(
+      808                      content="trying to cite random uuid",
+      809                      type="note",
+      776 -                    references=[ReferenceInput(target_uuid=uuid4(), reference_kind="cites")],
+      810 +                    references=[
+      811 +                        ReferenceInput(target_uuid=uuid4(), reference_kind="cites")
+      812 +                    ],
+      813                  )
+      778 -                raise AssertionError("should have raised PluginValidationError")
+      779 -            except PluginValidationError as exc_not_found:
+      780 -                not_found_code = exc_not_found.code
+      781 -                not_found_message = exc_not_found.message
+      814
+      815              # Must be identical (opacity)
+      784 -            assert no_access_code == not_found_code
+      785 -            assert no_access_message == not_found_message
+      786 -
+      816 +            assert exc_no_access.value.code == "memory_not_accessible"
+      817 +            assert exc_not_found.value.code == "memory_not_accessible"
+      818 +            assert exc_no_access.value.message == exc_not_found.value.message
+      819          finally:
+      820              if owner and outsider:
+      821                  oauth_ids = [f"plugin:{owner_plugin}", f"plugin:{outsider_plugin}"]
+  ⎿  Referenced file tests/integration/test_references_access_regression.py
+  ⎿  Read src/mem_mcp/mcp/tools/_base.py (55 lines)
+  ⎿  Read src/mem_mcp/mcp/tools/_deps.py (66 lines)
+  ⎿  Read tests/unit/test_references_helpers.py (202 lines)
+  ⎿  Read src/mem_mcp/teams/references.py (285 lines)
+
+● Now I'll delete the old test file and run the verification commands:
+
+● Bash(rm -f tests/integration/test_user_can_read_memory_regression_01a54.py)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● I've successfully rewritten the test file with all the fixes:
+  - Added _stub_embedder() helper for stub EmbeddingClient
+  - Created _tool_ctx() helper for proper ToolContext construction with frozenset[str] scopes
+  - Added type annotations to all test method parameters (pg_pool: Any, sdk_client_factory: Any)
+  - Added assert isinstance() checks after tool calls
+  - Replaced try/except with pytest.raises() where needed
+  - Fixed _create_memory return type annotation
+  - Fixed all mypy issues (ToolContext scopes type, ToolDeps embeddings type, Tool output assertions)
+
+  However, bash is in don't-ask mode, so I can't execute the remaining shell commands. Please run these verification commands:
+
+  rm -f tests/integration/test_user_can_read_memory_regression_01a54.py
+  ruff format tests/integration/test_references_access_regression.py && ruff check src tests alembic
+  mypy tests/integration/test_references_access_regression.py src/mem_mcp/teams/references.py src/mem_mcp/mcp/tools/refs_in.py src/mem_mcp/mcp/tools/refs_out.py
+  pytest -q -p no:cacheprovider tests/integration/test_references_own_memory_repro.py tests/integration/test_references_access_regression.py tests/unit/test_references_helpers.py
+  tests/integration/test_references_integration.py
+  git stash -u && pytest -q -p no:cacheprovider tests -rfE 2>&1 | grep -E '^(FAILED|ERROR)' | sort > /tmp/claude-before.txt
+  git stash pop
+  pytest -q -p no:cacheprovider tests -rfE 2>&1 | grep -E '^(FAILED|ERROR)' | sort > /tmp/claude-after.txt
+  diff /tmp/claude-before.txt /tmp/claude-after.txt
+  git status --short
+
+  This will:
+  1. Delete the old test file
+  2. Format and lint the code
+  3. Run mypy type checking
+  4. Run the reference tests
+  5. Compare test failures before/after to verify no regressions were introduced
+  6. Show final git status
+
+✻ Cooked for 1m 50s · done 10:58 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

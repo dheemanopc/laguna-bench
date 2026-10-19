@@ -1,0 +1,260 @@
+● Bash(pytest tests/unit/test_work_items_service.py tests/integration/test_mindmap_work_items_e2e.py tests/unit/test_lint_tenant_scope.py -q 2>&1)
+  ⎿  ........................................................................ [ 91%]
+     .......                                                                  [100%]
+     79 passed in 5.36s
+  ⎿  (timeout 2m)
+
+  Thought for 6s (ctrl+o to expand)
+
+● Now I need to add unit tests for the new behavior. Let me read the current test file to find the right place to add new tests:
+
+  Thought for 12s, read 1 file (ctrl+o to expand)
+
+● Let me add the new unit tests. I'll add a test for the kind validation ordering (viewer should get permission denied, not invalid kind) after the existing mark tests:
+
+● Update(tests/unit/test_work_items_service.py)
+  ⎿  Added 54 lines
+      797          assert history[0].change_type == "created"
+      798
+      799
+      800 +async def test_mark_viewer_bad_kind_gets_permission_denied(
+      801 +    pg_pool: asyncpg.Pool,
+      802 +    tenant_a: UUID,
+      803 +    team_a: UUID,
+      804 +    viewer_tenant: UUID,
+      805 +    map_setup: tuple[UUID, UUID, str],
+      806 +) -> None:
+      807 +    """Viewer with bad kind should get permission denied, not invalid kind error."""
+      808 +    from mem_mcp.mindmap import work_items
+      809 +
+      810 +    root_mem_id, node_id, map_key = map_setup
+      811 +
+      812 +    # Viewer should get permission denied, not invalid kind error
+      813 +    # (permission is checked before kind validation)
+      814 +    with pytest.raises(WorkItemPermissionDeniedError) as exc_info:
+      815 +        async with tenant_tx(pg_pool, viewer_tenant) as conn:
+      816 +            await work_items.mark_work_item(
+      817 +                conn,
+      818 +                tenant_id=viewer_tenant,
+      819 +                team_id=team_a,
+      820 +                map_key=map_key,
+      821 +                node_id=node_id,
+      822 +                kind="invalid_kind",
+      823 +            )
+      824 +
+      825 +    assert exc_info.value.team_id == team_a
+      826 +
+      827 +
+      828 +async def test_mark_non_member_bad_kind_gets_not_found(
+      829 +    pg_pool: asyncpg.Pool,
+      830 +    tenant_a: UUID,
+      831 +    team_a: UUID,
+      832 +    tenant_b: UUID,  # Not on team_a
+      833 +    map_setup: tuple[UUID, UUID, str],
+      834 +) -> None:
+      835 +    """Non-member should get map not found, not invalid kind error."""
+      836 +    from mem_mcp.mindmap import work_items
+      837 +
+      838 +    root_mem_id, node_id, map_key = map_setup
+      839 +
+      840 +    # Non-member should get WorkItemMapNotFoundError (opaque error),
+      841 +    # not InvalidKindError (the map check happens before kind validation)
+      842 +    with pytest.raises(WorkItemMapNotFoundError):
+      843 +        async with tenant_tx(pg_pool, tenant_b) as conn:
+      844 +            await work_items.mark_work_item(
+      845 +                conn,
+      846 +                tenant_id=tenant_b,
+      847 +                team_id=team_a,
+      848 +                map_key=map_key,
+      849 +                node_id=node_id,
+      850 +                kind="invalid_kind",
+      851 +            )
+      852 +
+      853 +
+      854  # -------------------------------------------------------------------------
+      855  # Archived map tests
+      856  # -------------------------------------------------------------------------
+
+  Thought for 6s (ctrl+o to expand)
+
+● Now let me add a test for the race condition (unique violation) in mark_work_item. Let me find a good place:
+
+  Thought for 3s, read 1 file (ctrl+o to expand)
+
+● Let me add a test for the race condition. I'll add it after the new tests I added:
+
+  Thought for 4s, read 1 file (ctrl+o to expand)
+
+● Let me add a test for the race condition (unique violation):
+
+● Update(tests/unit/test_work_items_service.py)
+  ⎿  Error editing file
+
+  Thought for 9s, read 1 file (ctrl+o to expand)
+
+● Update(tests/unit/test_work_items_service.py)
+  ⎿  Added 56 lines
+      1541      assert node_id not in result
+      1542
+      1543
+      1544 +async def test_mark_race_condition_unique_violation(
+      1545 +    pg_pool: asyncpg.Pool,
+      1546 +    tenant_a: UUID,
+      1547 +    team_a: UUID,
+      1548 +    map_setup: tuple[UUID, UUID, str],
+      1549 +) -> None:
+      1550 +    """Concurrent mark on same node should raise AlreadyWorkItemError."""
+      1551 +    from mem_mcp.mindmap import work_items
+      1552 +
+      1553 +    root_mem_id, node_id, map_key = map_setup
+      1554 +
+      1555 +    # Pre-get history count before first mark
+      1556 +    async with tenant_tx(pg_pool, tenant_a) as conn:
+      1557 +        initial_count = await conn.fetchval(
+      1558 +            "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1",
+      1559 +            node_id,
+      1560 +        )
+      1561 +
+      1562 +    # Simulate a race condition by inserting a work_items row directly
+      1563 +    # This bypasses the pre-check, simulating concurrent access
+      1564 +    async with tenant_tx(pg_pool, tenant_a) as conn:
+      1565 +        await conn.execute(
+      1566 +            """
+      1567 +            INSERT INTO work_items
+      1568 +                (memory_id, root_memory_id, tenant_id, team_id, kind, assignee_id,
+      1569 +                 created_by, status, status_changed_at)
+      1570 +            VALUES ($1, $2, $3, $4, 'story', NULL, $3, 'todo', now())
+      1571 +            """,
+      1572 +            node_id,
+      1573 +            root_mem_id,
+      1574 +            tenant_a,
+      1575 +            team_a,
+      1576 +        )
+      1577 +
+      1578 +    # Now mark_work_item should fail with AlreadyWorkItemError
+      1579 +    # due to UniqueViolationError from the INSERT
+      1580 +    with pytest.raises(AlreadyWorkItemError):
+      1581 +        async with tenant_tx(pg_pool, tenant_a) as conn:
+      1582 +            await work_items.mark_work_item(
+      1583 +                conn,
+      1584 +                tenant_id=tenant_a,
+      1585 +                team_id=team_a,
+      1586 +                map_key=map_key,
+      1587 +                node_id=node_id,
+      1588 +                kind="story",
+      1589 +            )
+      1590 +
+      1591 +    # History count should be unchanged (no new history row created)
+      1592 +    async with tenant_tx(pg_pool, tenant_a) as conn:
+      1593 +        final_count = await conn.fetchval(
+      1594 +            "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1",
+      1595 +            node_id,
+      1596 +        )
+      1597 +    assert final_count == initial_count  # No new history row
+      1598 +
+      1599 +
+      1600  # -------------------------------------------------------------------------
+      1601  # Kind validation tests
+      1602  # -------------------------------------------------------------------------
+
+  Thought for 2s (ctrl+o to expand)
+
+● Now let me run the tests:
+
+● Bash(pytest tests/unit/test_work_items_service.py tests/integration/test_mindmap_work_items_e2e.py tests/unit/test_lint_tenant_scope.py -q 2>&1)
+  ⎿  ........................................................................ [ 87%]
+     ..........                                                               [100%]
+     82 passed in 5.32s
+  ⎿  (timeout 2m)
+
+  Thought for 2s (ctrl+o to expand)
+
+● Let me run ruff check on src tests:
+
+● Bash(ruff check src tests 2>&1)
+  ⎿  All checks passed!
+
+  Thought for 3s (ctrl+o to expand)
+
+● Let me check if service is still used elsewhere:
+
+  Thought for 3s, searched for 1 pattern (ctrl+o to expand)
+
+● Good, service is still used. Let me run the tests with RuntimeWarning as errors to verify no unawaited coroutine warnings:
+
+● Bash(pytest tests/unit/test_work_items_service.py tests/integration/test_mindmap_work_items_e2e.py tests/unit/test_lint_tenant_scope.py -W error::RuntimeWarning -q 2…)
+  ⎿  ........................................................................ [ 87%]
+     ..........                                                               [100%]
+     82 passed in 5.48s
+  ⎿  (timeout 2m)
+
+  Thought for 2s (ctrl+o to expand)
+
+● Bash(mypy src/mem_mcp/mindmap/work_items.py 2>&1)
+  ⎿  Success: no issues found in 1 source file
+
+  Thought for 2s (ctrl+o to expand)
+
+● Bash(ruff format --check src/mem_mcp/mindmap/work_items.py tests/unit/test_work_items_service.py 2>&1)
+  ⎿  2 files already formatted
+
+  Thought for 2s (ctrl+o to expand)
+
+● Let me verify the final state of the code by reading the key sections:
+
+  Thought for 10s, read 1 file (ctrl+o to expand)
+
+● Let me run one final comprehensive check:
+
+● Bash(ruff check src tests && ruff format --check src/mem_mcp/mindmap/work_items.py tests/unit/test_work_items_service.py && mypy src/mem_mcp/mindmap/work_items.py &&…)
+  ⎿  All checks passed!
+     2 files already formatted
+     Success: no issues found in 1 source file
+     … +3 lines (ctrl+o to expand)
+  ⎿  (timeout 2m)
+
+  Thought for 2s (ctrl+o to expand)
+
+● Summary
+
+  All checks pass. Here's what was changed:
+
+  Files Modified
+
+  1. src/mem_mcp/mindmap/work_items.py
+
+  1. Fixed missing await keywords (lines 606, 719, 825) - Added await before _check_permission() calls in set_work_item_status, set_work_item_kind, and assign_work_item
+  2. Removed unused variable - Removed actual_map_key = map_key from list_work_items (line 1095)
+  3. Fixed _check_permission to handle None role - Now raises WorkItemMapNotFoundError when caller_role is None, making it safe to call independently
+  4. Moved _validate_kind after permission checks in mark_work_item - A viewer with an invalid kind now gets WorkItemPermissionDeniedError instead of InvalidKindError
+  5. Added race condition handling - Wrapped the INSERT in a savepoint transaction with UniqueViolationError handling to raise AlreadyWorkItemError on concurrent mark attempts
+  6. Replaced service.log_event with _record_change - Now uses the helper function for consistency
+  7. Fixed import - Changed asyncpg from TYPE_CHECKING import to runtime import
+
+  2. tests/unit/test_work_items_service.py
+
+  1. Added NotAWorkItemError to imports
+  2. Added new tests:
+     - test_cross_tenant_assignee_rejected - Tests assigning someone from another tenant fails
+     - test_wrong_map_key_rejected - Tests using wrong/nonexistent map_key raises error
+     - test_list_work_items_team_wide - Tests listing all work items for a team (map_key=None)
+     - test_get_work_item_history_for_plain_node - Tests getting history for non-work-item node raises NotAWorkItemError
+     - test_blank_reason_stored_as_null - Tests whitespace-only reason is stored as NULL
+     - test_mark_viewer_bad_kind_gets_permission_denied - Tests viewer gets permission denied, not invalid kind error
+     - test_mark_non_member_bad_kind_gets_not_found - Tests non-member gets map not found, not invalid kind error
+     - test_mark_race_condition_unique_violation - Tests race condition handling via direct SQL insert
+
+  Verification
+
+  - ruff check src tests - All checks passed!
+  - ruff format --check - 2 files already formatted
+  - mypy - Success: no issues found
+  - pytest - 82 passed
+
+✻ Cogitated for 5m 55s · done 1:36 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                6% until auto-compact
+

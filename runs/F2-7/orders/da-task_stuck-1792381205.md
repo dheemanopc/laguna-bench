@@ -1,0 +1,3 @@
+```json
+{"action":"retry","guidance":"Remove the `# type: ignore[import-untyped]` on the asyncpg import (line 23). The harness rejects any new ignore.\nOther modules (jobs/embedding_backfill.py, teams/slugs.py) import asyncpg with no ignore, so the original mypy error probably wasn't the asyncpg import itself.\nRun `mypy src/mem_mcp/mindmap/workflow_crud.py` without the ignore and read the actual error.\nFix it properly. Options: import asyncpg the way the jobs/ modules do, or use `from __future__ import annotations` so the TYPE_CHECKING-only annotation works.\nDon't touch pyproject or mypy config. Re-run ruff, mypy and pytest.","new_tasks":[]}
+```

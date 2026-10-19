@@ -1,0 +1,24 @@
+{
+  "session_id": "a7abfd59-5bc3-4ead-b0e1-bce49d85080c",
+  "exit_code": 0,
+  "remote_control_url": "",
+  "is_error": false,
+  "num_turns": 93,
+  "result": "Everything is complete. Here's the report:\n\n---\n\n## Report\n\n### What changed\n\n**Source changes (all 4 files, from the earlier summary):**\n- `src/mem_mcp/memory/versioning.py` — Added `compute_revision(memory_id, updated_at)` using sha256 of `\"{id}:{epoch_microseconds_utc}\"` truncated to 24 hex chars, with UTC normalization and None-tolerance.\n- `src/mem_mcp/mcp/tools/get.py` — Added `revision: str = \"\"` field to `MemoryRecord` with a `@model_validator(mode=\"after\")` that auto-fills it via `compute_revision` when not explicitly set.\n- `src/mem_mcp/mcp/tools/update.py` — Added `expected_revision: str | None = None` input field, `revision` output field, FOR UPDATE row locking, conflict detection (stale revision → -32000 `update_conflict` with `current_revision`; superseded target → -32000 with `current_id`/`current_revision`), `GREATEST(clock_timestamp(), updated_at + interval '1 microsecond')` for strictly-advancing `updated_at`, and a `_find_current_in_chain` helper for superseded-chain resolution.\n- `src/mem_mcp/mcp/tool_descriptions.py` — Updated `memory_update` description documenting `expected_revision`, `revision` output, conflict contract, and serialized concurrent updates.\n\n**New test files:**\n- `tests/unit/test_tools_update_concurrency.py` (15 tests, 460 lines) — Mock-based unit tests:\n  - `compute_revision`: 1µs change → different revision; tz-normalization; naive-as-UTC; None tolerance (3 cases)\n  - `MemoryRecord`: revision auto-fill in `model_dump()`; not overwritten when set\n  - `MemoryUpdateTool` conflicts: stale `expected_revision` on in-place path → -32000, no writes; stale on versioned path → -32000, no INSERT; matching revision → succeeds with correct output revision; superseded target → -32000 with `current_id`; superseded with no current in chain\n  - Happy paths: in-place and versioned updates without `expected_revision` still succeed and return revision\n- `tests/integration/test_update_concurrency.py` (9 tests, 628 lines) — Real Postgres integration tests using a dedicated pool with `max_size=12`:\n  - 8 concurrent tags add/remove → no lost updates (all tags present)\n  - 8 concurrent distinct tag adds → all present\n  - 6 concurrent stale `expected_revision` updates → 1 success, 5 conflicts\n  - Sequential superseded decision update → v1 update fails with -32000 + `current_id` = v2; updating v2 (current) works\n  - 6 concurrent same-valid-revision updates → 1 success, 5 conflicts\n  - Revision semantics: get-after-update == update revision; successive updates yield different revisions; stale token refused with correct `current_revision`\n\n### How verified\n\n- `ruff check src tests` — clean\n- `mypy` (project-wide, strict) — 0 issues across 333 source files\n- `pytest tests/unit/test_tools_update_concurrency.py tests/integration/test_update_concurrency.py -v` — **24 passed**\n- `pytest tests/unit/test_tools_update.py tests/unit/test_tools.py tests/unit/test_embedding_status_select.py tests/unit/test_web_memories_handler.py -q` — **67 passed** (existing tests unaffected)\n\nPre-existing failures in team/access/roles tests (17 failed, 16 errors in the full suite) were already failing before this change and are unrelated to the memory update work order.",
+  "usage": {
+    "input_tokens": 10186744,
+    "output_tokens": 60537,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  },
+  "modelUsage": {
+    "laguna-s-2.1": {
+      "inputTokens": 10186744,
+      "outputTokens": 60537,
+      "cacheReadInputTokens": 0,
+      "cacheCreationInputTokens": 0
+    }
+  },
+  "thinking_blocks": 30,
+  "transcript": "~/.claude/projects/-home-anand-laguna-bench-runs-T5-B2-repo/a7abfd59-5bc3-4ead-b0e1-bce49d85080c.jsonl"
+}

@@ -1,0 +1,11 @@
+{
+  "key": "wp4-t3-peer",
+  "status": "ok",
+  "compactions": 0,
+  "rc": 0,
+  "session_id": "638745d7-0b50-45cb-b896-ebcd952598bb",
+  "wall_s": 40,
+  "ctx_max": 31889,
+  "result": "VERDICT: ISSUES\n1. `WaitingOnYou.tsx:98`: The code branches on `data.status === \"committed\"`, but the signoff endpoint has no `status` field. `MindmapWorkflowSignoffOutput` (`mindmap_workflow_signoff.py:27-34`) returns `{node_id, signed_count, signoff_min, committed: bool, request_id}`. The committed branch therefore never runs. A final sign-off that commits the move is handled as \"awaiting\": the row stays with a bumped count, and `remaining` comes out as 0. The row only disappears if the follow-up `load()` drops it.\n2. `WaitingOnYou.tsx:16, 79, 144`: The panel assumes pending-signoff rows carry `node_id`, but the backend doesn't send it. `PendingSignoffOutput` (`_work_item_common.py:208-220`) has `memory_id` and no `node_id`, and the web handler (`workflows.py:116-128`) returns the tool output unchanged. No changed file adds `node_id` on the backend. At runtime `row.node_id` is `undefined`, so three things break:\n   - The board-item join fails, and the title falls back to `undefined`. Then `title.length` at line 153 throws and crashes the panel.\n   - The Sign URL becomes `/work-items/undefined/signoff`, which the `node_id: UUID` route rejects with a 422.\n   - Neither the field name nor the missing backend field is reconciled. WP4-T5 is supposed to pin this field, but `PendingSignoffOutput` doesn't have it.\n3. `WaitingOnYou.tsx:102`: The component reads `signatory_count ?? signed_count`. The real signoff response only has `signed_count`, so this fallback happens to work. The `row.signatory_count + 1` fallback shows the contract was guessed rather than checked, and `bumpRefresh` in that branch isn't required by the acceptance.\n4. No test covers this component. No Playwright, vitest or integration test exercises the panel. The only check named is `tsc`, which can't catch the response-shape mismatches in items 1 and 2.",
+  "stderr_tail": ""
+}

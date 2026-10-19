@@ -1,0 +1,2324 @@
+diff --git a/src/mem_mcp/audit/logger.py b/src/mem_mcp/audit/logger.py
+index 5186a84..e38d6dc 100644
+--- a/src/mem_mcp/audit/logger.py
++++ b/src/mem_mcp/audit/logger.py
+@@ -89,6 +89,10 @@ AUDIT_ACTIONS: tuple[str, ...] = (
+     "skill.kite.intent_smoke_failed",
+     # mindmap work items
+     "mindmap.work_item_changed",
++    "mindmap.workflow_created",
++    "mindmap.signoff_approved",
++    "mindmap.signoff_rejected",
++    "mindmap.rebase",
+     # admin tools (memsys_admin_*) — recorded on allow AND deny, see
+     # mcp/tools/_admin_base.py
+     "admin.find_user",
+@@ -144,6 +148,10 @@ AuditAction = Literal[
+     "skill.kite.intent_smoke_failed",
+     # mindmap work items
+     "mindmap.work_item_changed",
++    "mindmap.workflow_created",
++    "mindmap.signoff_approved",
++    "mindmap.signoff_rejected",
++    "mindmap.rebase",
+     "admin.find_user",
+     "admin.get_user",
+ ]
+diff --git a/src/mem_mcp/main.py b/src/mem_mcp/main.py
+index e0afa76..fc29120 100644
+--- a/src/mem_mcp/main.py
++++ b/src/mem_mcp/main.py
+@@ -76,9 +76,18 @@ from mem_mcp.mcp.tools.mindmap_queue import MindmapListTool, MindmapQueueTool
+ from mem_mcp.mcp.tools.mindmap_resolve import MindmapResolveTool
+ from mem_mcp.mcp.tools.mindmap_review import MindmapReviewTool
+ from mem_mcp.mcp.tools.mindmap_work_assign import MindmapWorkAssignTool
++from mem_mcp.mcp.tools.mindmap_work_get import MindmapWorkGetTool
++from mem_mcp.mcp.tools.mindmap_work_history import MindmapWorkHistoryTool
++from mem_mcp.mcp.tools.mindmap_work_list import MindmapWorkListTool
+ from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
+ from mem_mcp.mcp.tools.mindmap_work_set_kind import MindmapWorkSetKindTool
+ from mem_mcp.mcp.tools.mindmap_work_set_status import MindmapWorkSetStatusTool
++from mem_mcp.mcp.tools.mindmap_work_signoff_approve import MindmapWorkSignoffApproveTool
++from mem_mcp.mcp.tools.mindmap_work_signoff_list import MindmapWorkSignoffListTool
++from mem_mcp.mcp.tools.mindmap_work_signoff_reject import MindmapWorkSignoffRejectTool
++from mem_mcp.mcp.tools.mindmap_workflow_get import MindmapWorkflowGetTool
++from mem_mcp.mcp.tools.mindmap_workflow_rebase import MindmapWorkflowRebaseTool
++from mem_mcp.mcp.tools.mindmap_workflow_update import MindmapWorkflowUpdateTool
+ from mem_mcp.mcp.tools.mindmap_write_node import MindmapWriteNodeTool
+ from mem_mcp.mcp.tools.refs_in import RefsInTool
+ from mem_mcp.mcp.tools.refs_out import RefsOutTool
+@@ -526,6 +535,15 @@ def _wire_routers(app: FastAPI) -> None:
+         MindmapWorkSetStatusTool,
+         MindmapWorkSetKindTool,
+         MindmapWorkAssignTool,
++        MindmapWorkGetTool,
++        MindmapWorkListTool,
++        MindmapWorkHistoryTool,
++        MindmapWorkflowGetTool,
++        MindmapWorkflowUpdateTool,
++        MindmapWorkflowRebaseTool,
++        MindmapWorkSignoffListTool,
++        MindmapWorkSignoffApproveTool,
++        MindmapWorkSignoffRejectTool,
+         # Admin tool family — gated on system.* permissions via AdminTool,
+         # NOT reachable by an ordinary caller. See mcp/tools/_admin_base.py.
+         AdminFindUserTool,
+diff --git a/src/mem_mcp/mcp/tool_descriptions.py b/src/mem_mcp/mcp/tool_descriptions.py
+index 20535da..fee2ad8 100644
+--- a/src/mem_mcp/mcp/tool_descriptions.py
++++ b/src/mem_mcp/mcp/tool_descriptions.py
+@@ -509,6 +509,87 @@ Call when: user says "actually this is an epic", "this is a milestone", "split i
+ Do not call for: changing a node that isn't a work item; changing kind when already set to the requested value.
+ 
+ Examples: "This epic covers multiple stories" → mindmap_work_set_kind(node_id="...", kind="epic"). "That story needs its own work item" → mindmap_work_set_kind(node_id="...", kind="story").""",
++    "mindmap_work_get": """Read a single work item's details — call this when you need to inspect a work item's current status, workflow state, sign-off request, available transitions, or block state.
++
++Call when: user says "show me that task", "what's the status of node X", "is item Y blocked", "what transitions are available"; you need the current sign-off state or workflow enrichment fields for a specific work item.
++
++Do not call for: listing or browsing multiple items — use mindmap_work_list instead.
++
++Returns: the work item with workflow_id, available_transitions (sorted list of valid target statuses from the current status), signoff_state (pending/approved/superseded if a sign-off request exists, else null), and blocked (true if the work item status is 'blocked').
++
++Examples: "Show me work item abc-123" → mindmap_work_get(map_key="...", node_id="abc-123"). "Is this task blocked?" → mindmap_work_get and check blocked=true.""",
++    "mindmap_work_list": """List work items for a team or map, with optional filters — call this when the user wants to see all tracked tasks, or wants to filter by status, kind, assignee, or find unowned items.
++
++Call when: user says "show me all my tasks", "what's in progress", "list blocked items", "find unclaimed stories", "stories assigned to Alice"; building a work dashboard; filtering the backlog by kind or status.
++
++Do not call for: reading a single item in detail — use mindmap_work_get instead.
++
++Filters (all optional, AND-combined): map_key (single map), status, kind (story|epic|milestone), assignee_id, unassigned=true (only items with no assignee). limit defaults to 100, capped at 500. Each result includes workflow_id, available_transitions, signoff_state, and blocked — the same enrichment as mindmap_work_get.
++
++Examples: "Show me all in-progress stories" → status="in_progress", kind="story". "What's unassigned?" → unassigned=true. "How many done items does Alice have?" → assignee_id=<alice-uuid>, status="done".""",
++    "mindmap_work_history": """Read a work item's change history — call this when the user wants to see how a work item evolved: who changed its status, kind, or assignee, and when.
++
++Call when: user says "what happened to that task", "when did it move to done", "show me the audit trail", "who set the status"; debugging why a work item is in an unexpected state.
++
++Do not call for: the current state of an item — use mindmap_work_get instead.
++
++Returns: a list of history entries (oldest first), each with kind_before/after, status_before/after, assignee_before/after, actor_id, channel, reason, created_at, change_type (created/kind_changed/status_changed/owner_changed/signoff_requested/signoff_approved/signoff_rejected/workflow_changed), and the available_transitions at the time of the entry.
++
++Examples: "When was this done?" → mindmap_work_history(map_key="...", node_id="..."), filter for status_after="done". "Who changed the status?" → look at actor_id fields.""",
++    "mindmap_workflow_get": """Read a team's live workflow definition or a specific frozen version — call this when you need to inspect the status set, transition graph, or version history of a team's work-item workflow.
++
++Call when: user says "what workflow is this team using", "show me available statuses", "how many versions exist"; before calling mindmap_workflow_update to understand the current version; debugging transition or sign-off configuration.
++
++Do not call for: a work item's current status or transitions — use mindmap_work_get (that shows available_transitions for a specific item).
++
++Inputs: team_id (or default). Pass workflow_id to read a specific frozen version; omit it to read the team's current live workflow. Returns the WorkflowDef: version_number, statuses (list of valid status names), transitions (graph of {from: {to: {requires_reason, min_signoffs, eligible_role_classes}}}), created_at, and created_by.
++
++Examples: "What workflow does team X use?" → mindmap_workflow_get(team_id="<uuid>"). "Show me version 3 of the workflow" → mindmap_workflow_get(team_id="<uuid>", workflow_id="<version-uuid>").""",
++    "mindmap_workflow_update": """Create a new frozen workflow version and promote it to live — call this when the team's task workflow needs to change: add or rename statuses, adjust transitions, or introduce sign-off requirements.
++
++Call when: user says "add a 'review' status", "make done→todo require a reason", "change our workflow"; the team has agreed on a new workflow definition.
++
++Do not call for: changing a single work item's status — use mindmap_work_set_status instead.
++
++E1 (orphan check): by default, if any existing work item has a status NOT in the new statuses list, the call is refused with a list of orphan statuses (set reject_if_orphans=false to override). The new version is always strictly newer than the live version. The transitions dict shape is {from_status: {to_status: {requires_reason: bool, min_signoffs: int, eligible_role_classes: [str]}}}.
++
++Examples: "Add a review stage" → statuses=["todo","in_progress","review","done","cancelled"], transitions={"in_progress":{"review":{"requires_reason":true,"min_signoffs":0,"eligible_role_classes":[]}}, "review":{"done":{"requires_reason":false,"min_signoffs":1,"eligible_role_classes":["admin","member"]}, "review":{"in_progress":{"requires_reason":true,"min_signoffs":0,"eligible_role_classes":[]}}}}.""",
++    "mindmap_workflow_rebase": """Rebase a work item onto a newer workflow version, remapping its status — call this when a workflow was updated and an existing work item needs to move to the new version.
++
++Call when: a new workflow version was created via mindmap_workflow_update and an existing work item is still on the old version; the work item's status needs to be remapped to the new version's status set; you want to apply a workflow change to a specific item without waiting for sign-off.
++
++Do not call for: creating new workflow versions — use mindmap_workflow_update instead.
++
++Inputs: map_key, node_id (the work item), target_version_id (must be strictly newer than the item's current workflow version — see E1/R4), and status_map (e.g. {"done":"completed"} to remap old statuses to new ones). The item's current status MUST have an entry in status_map; otherwise RebaseConflictError. The item's workflow_id is updated and its status is remapped. Any pending sign-off request is superseded.
++
++Examples: "Move this item to the new workflow" → mindmap_workflow_rebase(map_key="...", node_id="...", target_version_id="<new-uuid>", status_map={"in_progress":"in_progress","done":"completed"}).""",
++    "mindmap_work_signoff_list": """List pending sign-off requests where you are an eligible approver — call this when you want to see work-item transitions that need your approval, or when resuming to check what awaits your sign-off.
++
++Call when: user says "what needs my approval", "show me pending sign-offs", "who's waiting on me"; the caller has a team role (admin/owner/member) that matches eligible_role_classes on one or more pending requests.
++
++Do not call for: listing all work items — use mindmap_work_list. Do not call for: approving a request — use mindmap_work_signoff_approve.
++
++Returns: a list of sign-off state objects, each with request_id, status (always "pending" here), from_status, to_status, have (current approvals), needed (min_signoffs threshold), approvers, and eligible_role_classes. Per R8, the mover and item owner are excluded from their own lists.
++
++Examples: "What's pending my sign-off?" → mindmap_work_signoff_list(team_id="<uuid>").""",
++    "mindmap_work_signoff_approve": """Approve a pending sign-off request — call this when the caller (or someone directing them) wants to approve a work-item transition that requires sign-off.
++
++Call when: user says "approve that", "I approve this transition"; the request_id comes from mindmap_work_signoff_list; the caller holds an active team role in the request's eligible_role_classes and is neither the mover nor the item owner.
++
++Do not call for: listing requests — use mindmap_work_signoff_list. Do not call for: rejecting — use mindmap_work_signoff_reject.
++
++Quorum: once the number of distinct approvals reaches min_signoffs, the request is marked approved and the deferred transition is applied (status + signoff_state updated on the work item). If the item has already moved/rebased while the request was open, the request is superseded instead. Approvals are idempotent.
++
++Examples: "Approve request abc-123" → mindmap_work_signoff_approve(team_id="<uuid>", request_id="abc-123").""",
++    "mindmap_work_signoff_reject": """Reject (close) a pending sign-off request without applying the move — call this when the caller wants to veto a sign-off request, closing it as superseded.
++
++Call when: user says "reject that", "no, don't do this", "cancel the sign-off"; the request_id comes from mindmap_work_signoff_list. Pass an optional reason to record why.
++
++Do not call for: listing — use mindmap_work_signoff_list. Do not call for: approving — use mindmap_work_signoff_approve.
++
++Effect: the request is marked superseded (no further approvals possible), a signoff_decided history row is appended, and the work-item status is left unchanged. The returned SignoffState shows status="superseded".
++
++Examples: "Reject this sign-off, it's wrong" → mindmap_work_signoff_reject(team_id="<uuid>", request_id="abc-123", reason="dependency not ready").""",
+     "mindmap_work_assign": """Assign a work item to a team member, or unassign (pass null) — call this when ownership of a task changes.
+ 
+ Call when: user says "Alice should do this", "I'm assigning to Bob", "unassigned, I'll do it"; changing who owns a work item; removing assignment.
+diff --git a/src/mem_mcp/mcp/tools/_work_item_common.py b/src/mem_mcp/mcp/tools/_work_item_common.py
+index eef348d..95edd3c 100644
+--- a/src/mem_mcp/mcp/tools/_work_item_common.py
++++ b/src/mem_mcp/mcp/tools/_work_item_common.py
+@@ -6,11 +6,12 @@ Work items allow marking map nodes as tasks with kind, status, and assignee.
+ from __future__ import annotations
+ 
+ from datetime import datetime
++from typing import Any
+ from uuid import UUID
+ 
+-from pydantic import BaseModel
++from pydantic import BaseModel, Field
+ 
+-from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mindmap import workflows as workflow_service
+ from mem_mcp.mindmap.work_items import (
+     AlreadyWorkItemError,
+     AssigneeUnchangedError,
+@@ -18,6 +19,7 @@ from mem_mcp.mindmap.work_items import (
+     InvalidKindError,
+     InvalidStatusError,
+     InvalidTransitionError,
++    InvalidWorkflowStatusError,
+     KindUnchangedError,
+     MapNotLiveError,
+     NodeNotInMapError,
+@@ -26,14 +28,29 @@ from mem_mcp.mindmap.work_items import (
+     RootNodeNotAllowedError,
+     StatusConflictError,
+     StatusUnchangedError,
++    WorkItem,
+     WorkItemError,
++    WorkItemHistoryEntry,
+     WorkItemMapNotFoundError,
+     WorkItemPermissionDeniedError,
+ )
++from mem_mcp.mindmap.workflows import SignoffState
+ 
+ # Canonical order for error messages
+ KIND_ORDER = ("story", "epic", "milestone")
+-STATUS_ORDER = ("todo", "in_progress", "blocked", "done", "cancelled")
++
++
++class SignoffStateOutput(BaseModel):
++    """Output model for sign-off request state."""
++
++    request_id: UUID
++    status: str
++    from_status: str
++    to_status: str
++    have: int
++    needed: int
++    approvers: list[UUID] = Field(default_factory=list)
++    eligible_role_classes: list[str] = Field(default_factory=list)
+ 
+ 
+ class WorkItemOutput(BaseModel):
+@@ -51,16 +68,174 @@ class WorkItemOutput(BaseModel):
+     updated_at: datetime
+     status_changed_at: datetime
+     request_id: str
++    # --- WP1+ enrichment fields ---
++    workflow_id: UUID | None = None
++    available_transitions: list[str] = Field(default_factory=list)
++    signoff_state: SignoffStateOutput | None = None
++    blocked: bool = False
++
++
++class WorkItemHistoryEntryOutput(BaseModel):
++    """Output model for work item history entries."""
++
++    id: int
++    memory_id: UUID
++    kind_before: str | None
++    kind_after: str
++    status_before: str | None
++    status_after: str
++    assignee_before: UUID | None
++    assignee_after: UUID | None
++    actor_id: UUID
++    channel: str
++    reason: str | None
++    created_at: datetime
++    change_type: str
++    available_transitions: list[str] = Field(default_factory=list)
++    signoff_state: SignoffStateOutput | None = None
++
++
++class WorkItemCollectionOutput(BaseModel):
++    """Collection wrapper for list endpoints."""
++
++    items: list[WorkItemOutput]
++    count: int
++
++
++class WorkItemHistoryCollectionOutput(BaseModel):
++    """Collection wrapper for work item history endpoints."""
++
++    items: list[WorkItemHistoryEntryOutput]
++    count: int
++
++
++class SignoffStateListOutput(BaseModel):
++    """Collection wrapper for sign-off list endpoints."""
++
++    items: list[SignoffStateOutput]
++    count: int
++
++
++class WorkflowDefOutput(BaseModel):
++    """Output model for a frozen workflow version definition."""
++
++    id: UUID
++    team_id: UUID
++    version_number: int
++    statuses: list[str]
++    transitions: dict[str, Any]
++    created_at: datetime
++    created_by: UUID | None
++
++
++class RebasedViewOutput(BaseModel):
++    """Output model for rebase results."""
++
++    work_item_id: UUID
++    from_version_id: UUID
++    to_version_id: UUID
++    old_status: str
++    new_status: str
++    status_map: dict[str, str]
++
++
++def _signoff_to_output(state: SignoffState | None) -> SignoffStateOutput | None:
++    """Convert a domain SignoffState to the output model."""
++    if state is None:
++        return None
++    return SignoffStateOutput(
++        request_id=state.request_id,
++        status=state.status,
++        from_status=state.from_status,
++        to_status=state.to_status,
++        have=state.approvals,
++        needed=state.min_signoffs,
++        approvers=[],
++        eligible_role_classes=state.eligible_role_classes,
++    )
++
++
++def work_item_to_output(result: Any, request_id: str = "") -> WorkItemOutput:
++    """Convert a WorkItem dataclass to the output model."""
++    from mem_mcp.mindmap.work_items import WorkItem
++    assert isinstance(result, WorkItem)
++    return WorkItemOutput(
++        node_id=result.memory_id,
++        map_key=result.map_key,
++        map_state=result.map_state,
++        kind=result.kind,
++        status=result.status,
++        assignee_id=result.assignee_id,
++        title=result.title,
++        created_by=result.created_by,
++        created_at=result.created_at,
++        updated_at=result.updated_at,
++        status_changed_at=result.status_changed_at,
++        request_id=request_id,
++        workflow_id=result.workflow_id,
++        available_transitions=result.available_transitions,
++        signoff_state=_signoff_to_output(result.signoff_state),
++        blocked=(result.status == "blocked"),
++    )
+ 
+ 
+ def map_work_item_error(e: Exception) -> JsonRpcError:
+     """Map a work item service exception to JsonRpcError.
+ 
+-    Non-WorkItemError exceptions propagate unchanged (re-raised).
++    Non-WorkItemError/WorklowError exceptions propagate unchanged (re-raised).
+     """
+-    if not isinstance(e, WorkItemError):
++    if not isinstance(e, (WorkItemError, workflow_service.WorkflowError)):
+         raise e
+ 
++    # --- Workflow domain errors ---
++    if isinstance(e, workflow_service.RebaseConflictError):
++        return JsonRpcError(
++            -32602,
++            str(e),
++            data={"code": "rebase_conflict", "errors": [{"path": "node_id"}]},
++        )
++    if isinstance(e, workflow_service.OrphanStatusError):
++        return JsonRpcError(
++            -32602,
++            str(e),
++            data={
++                "code": "invalid_workflow_definition",
++                "orphan_statuses": e.orphan_statuses,
++                "errors": [{"path": "statuses"}],
++            },
++        )
++    if isinstance(e, workflow_service.SignoffAlreadyPendingError):
++        return JsonRpcError(
++            -32602,
++            "signoff already pending for this work item",
++            data={
++                "code": "signoff_already_pending",
++                "request_id": str(e.request_id),
++            },
++        )
++    if isinstance(e, workflow_service.SignoffRequestClosedError):
++        return JsonRpcError(
++            -32602,
++            "signoff request is already terminal",
++            data={
++                "code": "signoff_request_closed",
++                "request_id": str(e.request_id),
++            },
++        )
++    if isinstance(e, workflow_service.NotAnApproverError):
++        return JsonRpcError(
++            -32602,
++            "caller is not an eligible approver for this signoff request",
++            data={"code": "not_an_approver"},
++        )
++    if isinstance(e, workflow_service.WorkflowNotFoundError):
++        return JsonRpcError(
++            -32602,
++            "workflow not found",
++            data={"code": "workflow_not_found"},
++        )
++
++    # --- Work item errors ---
+     # Dispatch: map each exception type to its handler
+     if isinstance(e, WorkItemMapNotFoundError):
+         return JsonRpcError(-32602, "map not found", data={"errors": [{"path": "map_key"}]})
+@@ -112,14 +287,23 @@ def map_work_item_error(e: Exception) -> JsonRpcError:
+             },
+         )
+     if isinstance(e, InvalidStatusError):
+-        allowed = [s for s in STATUS_ORDER if s in e.allowed]
+         return JsonRpcError(
+             -32602,
+-            f"status must be one of: {', '.join(allowed)}",
++            f"status must be one of: {', '.join(e.allowed)}",
+             data={
+                 "code": "invalid_work_item_status",
+-                "errors": [{"path": "status", "message": f"status must be one of: {', '.join(allowed)}"}],
+-                "allowed": allowed,
++                "errors": [{"path": "status", "message": f"status must be one of: {', '.join(e.allowed)}"}],
++                "allowed": list(e.allowed),
++            },
++        )
++    if isinstance(e, InvalidWorkflowStatusError):
++        return JsonRpcError(
++            -32602,
++            f"status {e.status!r} is not a valid initial status; allowed: {e.allowed}",
++            data={
++                "code": "invalid_workflow_status",
++                "errors": [{"path": "status", "message": f"status must be one of: {', '.join(e.allowed)}"}],
++                "allowed": e.allowed,
+             },
+         )
+     if isinstance(e, InvalidTransitionError):
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_assign.py b/src/mem_mcp/mcp/tools/mindmap_work_assign.py
+index a68ef6e..0201327 100644
+--- a/src/mem_mcp/mcp/tools/mindmap_work_assign.py
++++ b/src/mem_mcp/mcp/tools/mindmap_work_assign.py
+@@ -14,6 +14,7 @@ from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
+ from mem_mcp.mcp.tools._work_item_common import (
+     WorkItemOutput,
+     map_work_item_error,
++    work_item_to_output,
+ )
+ from mem_mcp.mindmap import work_items as work_item_service
+ 
+@@ -76,17 +77,4 @@ class MindmapWorkAssignTool(BaseTool):
+                     },
+                 )
+ 
+-            return WorkItemOutput(
+-                node_id=result.memory_id,
+-                map_key=inp.map_key,
+-                map_state=result.map_state,
+-                kind=result.kind,
+-                status=result.status,
+-                assignee_id=result.assignee_id,
+-                title=result.title,
+-                created_by=result.created_by,
+-                created_at=result.created_at,
+-                updated_at=result.updated_at,
+-                status_changed_at=result.status_changed_at,
+-                request_id=ctx.request_id,
+-            )
++            return work_item_to_output(result, request_id=ctx.request_id)
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_get.py b/src/mem_mcp/mcp/tools/mindmap_work_get.py
+new file mode 100644
+index 0000000..4230a05
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_work_get.py
+@@ -0,0 +1,67 @@
++"""mindmap_work_get — read a single work item's details."""
++
++from __future__ import annotations
++
++from typing import ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import WorkItemOutput, map_work_item_error, work_item_to_output
++from mem_mcp.mindmap import work_items as work_item_service
++
++
++class MindmapWorkGetInput(BaseModel):
++    """Input for reading a single work item."""
++
++    team_id: UUID | None = Field(default=None, description="Team UUID; defaults to caller's default team")
++    map_key: str = Field(..., min_length=1, max_length=64)
++    node_id: UUID = Field(..., description="The work item node UUID")
++
++
++class MindmapWorkGetTool(BaseTool):
++    """Read a single work item, including workflow and sign-off state."""
++
++    name: ClassVar[str] = "mindmap_work_get"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_work_get"]
++    required_scope: ClassVar[str] = "memory.read"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkGetInput
++    OutputModel: ClassVar[type[BaseModel]] = WorkItemOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkGetInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            try:
++                result = await work_item_service.get_work_item(
++                    conn,
++                    tenant_id=ctx.tenant_id,
++                    team_id=team_id,
++                    map_key=inp.map_key,
++                    node_id=inp.node_id,
++                )
++            except work_item_service.WorkItemError as e:
++                raise map_work_item_error(e) from e
++
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="memory.get",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "node_id": str(result.memory_id),
++                        "map_key": inp.map_key,
++                    },
++                )
++
++            return work_item_to_output(result, request_id=ctx.request_id)
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_history.py b/src/mem_mcp/mcp/tools/mindmap_work_history.py
+new file mode 100644
+index 0000000..79a6f85
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_work_history.py
+@@ -0,0 +1,95 @@
++"""mindmap_work_history — read a work item's history entries."""
++
++from __future__ import annotations
++
++from typing import ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import (
++    WorkItemHistoryCollectionOutput,
++    WorkItemHistoryEntryOutput,
++    _signoff_to_output,
++    map_work_item_error,
++)
++from mem_mcp.mindmap import work_items as work_item_service
++
++
++class MindmapWorkHistoryInput(BaseModel):
++    """Input for reading work item history."""
++
++    team_id: UUID | None = Field(default=None, description="Team UUID; defaults to caller's default team")
++    map_key: str = Field(..., min_length=1, max_length=64)
++    node_id: UUID = Field(..., description="The work item node UUID")
++
++
++class MindmapWorkHistoryTool(BaseTool):
++    """Read the history of a work item (oldest first)."""
++
++    name: ClassVar[str] = "mindmap_work_history"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_work_history"]
++    required_scope: ClassVar[str] = "memory.read"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkHistoryInput
++    OutputModel: ClassVar[type[BaseModel]] = WorkItemHistoryCollectionOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkHistoryInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            try:
++                entries = await work_item_service.get_work_item_history(
++                    conn,
++                    tenant_id=ctx.tenant_id,
++                    team_id=team_id,
++                    map_key=inp.map_key,
++                    node_id=inp.node_id,
++                )
++            except work_item_service.WorkItemError as e:
++                raise map_work_item_error(e) from e
++
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="memory.get",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "node_id": str(inp.node_id),
++                        "map_key": inp.map_key,
++                        "count": len(entries),
++                    },
++                )
++
++            return WorkItemHistoryCollectionOutput(
++                items=[
++                    WorkItemHistoryEntryOutput(
++                        id=e.id,
++                        memory_id=e.memory_id,
++                        change_type=e.change_type,
++                        kind_before=e.kind_before,
++                        kind_after=e.kind_after,
++                        status_before=e.status_before,
++                        status_after=e.status_after,
++                        assignee_before=e.assignee_before,
++                        assignee_after=e.assignee_after,
++                        actor_id=e.actor_id,
++                        channel=e.channel,
++                        reason=e.reason,
++                        created_at=e.created_at,
++                        available_transitions=e.available_transitions,
++                        signoff_state=_signoff_to_output(e.signoff_state),
++                    )
++                    for e in entries
++                ],
++                count=len(entries),
++            )
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_list.py b/src/mem_mcp/mcp/tools/mindmap_work_list.py
+new file mode 100644
+index 0000000..4d632ec
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_work_list.py
+@@ -0,0 +1,100 @@
++"""mindmap_work_list — list work items for a team or map with optional filters."""
++
++from __future__ import annotations
++
++from typing import ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import WorkItemCollectionOutput, map_work_item_error, work_item_to_output
++from mem_mcp.mindmap import work_items as work_item_service
++from mem_mcp.auth.rbac import get_team_role
++
++
++class MindmapWorkListInput(BaseModel):
++    """Input for listing work items."""
++
++    team_id: UUID | None = Field(default=None, description="Team UUID; defaults to caller's default team")
++    map_key: str | None = Field(default=None, description="Restrict to a single map; omit for team-wide")
++    status: str | None = Field(default=None, description="Filter by status")
++    kind: str | None = Field(default=None, description="Filter by kind (story|epic|milestone)")
++    assignee_id: UUID | None = Field(default=None, description="Filter by assignee")
++    unassigned: bool = Field(default=False, description="Only items without an assignee")
++    waiting_on_me: bool = Field(default=False, description="Only items where the caller is an eligible approver on a pending sign-off")
++    limit: int = Field(default=100, ge=1, le=500)
++
++
++class MindmapWorkListTool(BaseTool):
++    """List work items for a team or map, with filters."""
++
++    name: ClassVar[str] = "mindmap_work_list"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_work_list"]
++    required_scope: ClassVar[str] = "memory.read"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkListInput
++    OutputModel: ClassVar[type[BaseModel]] = WorkItemCollectionOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkListInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            try:
++                items = await work_item_service.list_work_items(
++                    conn,
++                    tenant_id=ctx.tenant_id,
++                    team_id=team_id,
++                    map_key=inp.map_key,
++                    status=inp.status,
++                    kind=inp.kind,
++                    assignee_id=inp.assignee_id,
++                    unassigned=inp.unassigned,
++                    limit=inp.limit,
++                )
++            except work_item_service.WorkItemError as e:
++                raise map_work_item_error(e) from e
++
++            # R8: waiting_on_me filters to items where the caller holds an
++            # active role in the pending sign-off request's eligible_role_classes
++            # and is neither the mover nor the item owner.
++            if inp.waiting_on_me:
++                caller_role = await get_team_role(conn, ctx.identity_id, team_id)
++                eligible_role = caller_role if caller_role else ""
++                filtered = []
++                for item in items:
++                    ss = item.signoff_state
++                    if ss is None or ss.status != "pending":
++                        continue
++                    if ctx.identity_id == item.created_by:
++                        continue
++                    if ctx.identity_id == (item.assignee_id or item.created_by):
++                        continue
++                    if eligible_role in ss.eligible_role_classes:
++                        filtered.append(item)
++                items = filtered
++
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="memory.list",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "team_id": str(team_id),
++                        "map_key": inp.map_key or "",
++                        "count": len(items),
++                    },
++                )
++
++            return WorkItemCollectionOutput(
++                items=[work_item_to_output(item, request_id=ctx.request_id) for item in items],
++                count=len(items),
++            )
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_mark.py b/src/mem_mcp/mcp/tools/mindmap_work_mark.py
+index bac7f46..b84438a 100644
+--- a/src/mem_mcp/mcp/tools/mindmap_work_mark.py
++++ b/src/mem_mcp/mcp/tools/mindmap_work_mark.py
+@@ -14,6 +14,7 @@ from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
+ from mem_mcp.mcp.tools._work_item_common import (
+     WorkItemOutput,
+     map_work_item_error,
++    work_item_to_output,
+ )
+ from mem_mcp.mindmap import work_items as work_item_service
+ 
+@@ -26,6 +27,7 @@ class MindmapWorkMarkInput(BaseModel):
+     kind: str = Field(..., max_length=64)  # str, not Literal, so error can name allowed values
+     assignee_id: UUID | None = Field(default=None)
+     reason: str | None = Field(default=None, max_length=2000)
++    status: str | None = Field(default=None, description="Initial status; defaults to 'todo' via the workflow __entry__ sentinel. Must be a valid __entry__ target (typically 'todo').")
+     team_id: UUID | None = Field(default=None)
+ 
+ 
+@@ -54,6 +56,7 @@ class MindmapWorkMarkTool(BaseTool):
+                     kind=inp.kind,
+                     assignee_id=inp.assignee_id,
+                     reason=inp.reason,
++                    status=inp.status,
+                     channel="mcp",
+                 )
+             except work_item_service.WorkItemError as e:
+@@ -76,17 +79,4 @@ class MindmapWorkMarkTool(BaseTool):
+                     },
+                 )
+ 
+-            return WorkItemOutput(
+-                node_id=result.memory_id,
+-                map_key=inp.map_key,
+-                map_state=result.map_state,
+-                kind=result.kind,
+-                status=result.status,
+-                assignee_id=result.assignee_id,
+-                title=result.title,
+-                created_by=result.created_by,
+-                created_at=result.created_at,
+-                updated_at=result.updated_at,
+-                status_changed_at=result.status_changed_at,
+-                request_id=ctx.request_id,
+-            )
++            return work_item_to_output(result, request_id=ctx.request_id)
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_set_kind.py b/src/mem_mcp/mcp/tools/mindmap_work_set_kind.py
+index a09f673..bf53301 100644
+--- a/src/mem_mcp/mcp/tools/mindmap_work_set_kind.py
++++ b/src/mem_mcp/mcp/tools/mindmap_work_set_kind.py
+@@ -14,6 +14,7 @@ from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
+ from mem_mcp.mcp.tools._work_item_common import (
+     WorkItemOutput,
+     map_work_item_error,
++    work_item_to_output,
+ )
+ from mem_mcp.mindmap import work_items as work_item_service
+ 
+@@ -74,17 +75,4 @@ class MindmapWorkSetKindTool(BaseTool):
+                     },
+                 )
+ 
+-            return WorkItemOutput(
+-                node_id=result.memory_id,
+-                map_key=inp.map_key,
+-                map_state=result.map_state,
+-                kind=result.kind,
+-                status=result.status,
+-                assignee_id=result.assignee_id,
+-                title=result.title,
+-                created_by=result.created_by,
+-                created_at=result.created_at,
+-                updated_at=result.updated_at,
+-                status_changed_at=result.status_changed_at,
+-                request_id=ctx.request_id,
+-            )
++            return work_item_to_output(result, request_id=ctx.request_id)
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_set_status.py b/src/mem_mcp/mcp/tools/mindmap_work_set_status.py
+index fd33bd1..825f2ee 100644
+--- a/src/mem_mcp/mcp/tools/mindmap_work_set_status.py
++++ b/src/mem_mcp/mcp/tools/mindmap_work_set_status.py
+@@ -14,6 +14,7 @@ from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
+ from mem_mcp.mcp.tools._work_item_common import (
+     WorkItemOutput,
+     map_work_item_error,
++    work_item_to_output,
+ )
+ from mem_mcp.mindmap import work_items as work_item_service
+ 
+@@ -76,17 +77,4 @@ class MindmapWorkSetStatusTool(BaseTool):
+                     },
+                 )
+ 
+-            return WorkItemOutput(
+-                node_id=result.memory_id,
+-                map_key=inp.map_key,
+-                map_state=result.map_state,
+-                kind=result.kind,
+-                status=result.status,
+-                assignee_id=result.assignee_id,
+-                title=result.title,
+-                created_by=result.created_by,
+-                created_at=result.created_at,
+-                updated_at=result.updated_at,
+-                status_changed_at=result.status_changed_at,
+-                request_id=ctx.request_id,
+-            )
++            return work_item_to_output(result, request_id=ctx.request_id)
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_signoff_approve.py b/src/mem_mcp/mcp/tools/mindmap_work_signoff_approve.py
+new file mode 100644
+index 0000000..7cfc68e
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_work_signoff_approve.py
+@@ -0,0 +1,68 @@
++"""mindmap_work_signoff_approve — approve a pending sign-off request."""
++
++from __future__ import annotations
++
++from typing import ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import SignoffStateOutput, map_work_item_error, _signoff_to_output
++from mem_mcp.mindmap import workflows as workflow_service
++
++
++class MindmapWorkSignoffApproveInput(BaseModel):
++    """Input for approving a sign-off request."""
++
++    team_id: UUID | None = Field(default=None, description="Team UUID; defaults to caller's default team")
++    request_id: UUID = Field(..., description="The sign-off request UUID")
++
++
++class MindmapWorkSignoffApproveTool(BaseTool):
++    """Approve a pending sign-off request via the caller's team role."""
++
++    name: ClassVar[str] = "mindmap_work_signoff_approve"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_work_signoff_approve"]
++    required_scope: ClassVar[str] = "memory.write"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkSignoffApproveInput
++    OutputModel: ClassVar[type[BaseModel]] = SignoffStateOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkSignoffApproveInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            try:
++                state = await workflow_service.add_approval(
++                    conn,
++                    request_id=inp.request_id,
++                    approver_identity_id=ctx.identity_id,
++                    actor_identity_id=ctx.identity_id,
++                )
++            except workflow_service.WorkflowError as e:
++                raise map_work_item_error(e) from e
++
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="mindmap.signoff_approved",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "team_id": str(team_id),
++                        "request_id": str(inp.request_id),
++                        "status": state.status,
++                        "from_status": state.from_status,
++                        "to_status": state.to_status,
++                    },
++                )
++
++            return _signoff_to_output(state)
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_signoff_list.py b/src/mem_mcp/mcp/tools/mindmap_work_signoff_list.py
+new file mode 100644
+index 0000000..99bc377
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_work_signoff_list.py
+@@ -0,0 +1,63 @@
++"""mindmap_work_signoff_list — list pending sign-off requests where caller is eligible."""
++
++from __future__ import annotations
++
++from typing import ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import SignoffStateListOutput, _signoff_to_output
++from mem_mcp.mindmap import workflows as workflow_service
++
++
++class MindmapWorkSignoffListInput(BaseModel):
++    """Input for listing eligible sign-off requests."""
++
++    team_id: UUID | None = Field(default=None, description="Team UUID; defaults to caller's default team")
++
++
++class MindmapWorkSignoffListTool(BaseTool):
++    """List pending sign-off requests where the caller is an eligible approver."""
++
++    name: ClassVar[str] = "mindmap_work_signoff_list"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_work_signoff_list"]
++    required_scope: ClassVar[str] = "memory.read"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkSignoffListInput
++    OutputModel: ClassVar[type[BaseModel]] = SignoffStateListOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkSignoffListInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            states = await workflow_service.list_eligible_signoff_requests(
++                conn,
++                team_id=team_id,
++                caller_identity_id=ctx.identity_id,
++            )
++
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="memory.list",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "team_id": str(team_id),
++                        "count": len(states),
++                    },
++                )
++
++            return SignoffStateListOutput(
++                items=[_signoff_to_output(s) for s in states],
++                count=len(states),
++            )
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_signoff_reject.py b/src/mem_mcp/mcp/tools/mindmap_work_signoff_reject.py
+new file mode 100644
+index 0000000..24e5d0d
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_work_signoff_reject.py
+@@ -0,0 +1,70 @@
++"""mindmap_work_signoff_reject — reject (close) a pending sign-off request."""
++
++from __future__ import annotations
++
++from typing import ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import SignoffStateOutput, map_work_item_error, _signoff_to_output
++from mem_mcp.mindmap import workflows as workflow_service
++
++
++class MindmapWorkSignoffRejectInput(BaseModel):
++    """Input for rejecting a sign-off request."""
++
++    team_id: UUID | None = Field(default=None, description="Team UUID; defaults to caller's default team")
++    request_id: UUID = Field(..., description="The sign-off request UUID")
++    reason: str | None = Field(default=None, max_length=2000)
++
++
++class MindmapWorkSignoffRejectTool(BaseTool):
++    """Reject a pending sign-off request, closing it as superseded without applying the move."""
++
++    name: ClassVar[str] = "mindmap_work_signoff_reject"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_work_signoff_reject"]
++    required_scope: ClassVar[str] = "memory.write"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkSignoffRejectInput
++    OutputModel: ClassVar[type[BaseModel]] = SignoffStateOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkSignoffRejectInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            try:
++                state = await workflow_service.reject_signoff(
++                    conn,
++                    request_id=inp.request_id,
++                    actor_identity_id=ctx.identity_id,
++                    channel="mcp",
++                    reason=inp.reason,
++                )
++            except workflow_service.WorkflowError as e:
++                raise map_work_item_error(e) from e
++
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="mindmap.signoff_rejected",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "team_id": str(team_id),
++                        "request_id": str(inp.request_id),
++                        "from_status": state.from_status,
++                        "to_status": state.to_status,
++                        "reason": inp.reason or "",
++                    },
++                )
++
++            return _signoff_to_output(state)
+diff --git a/src/mem_mcp/mcp/tools/mindmap_workflow_get.py b/src/mem_mcp/mcp/tools/mindmap_workflow_get.py
+new file mode 100644
+index 0000000..7fa4c3f
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_workflow_get.py
+@@ -0,0 +1,76 @@
++"""mindmap_workflow_get — read a team's live or specific workflow definition."""
++
++from __future__ import annotations
++
++from typing import ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import WorkflowDefOutput, map_work_item_error
++from mem_mcp.mindmap import workflows as workflow_service
++
++
++class MindmapWorkflowGetInput(BaseModel):
++    """Input for reading a workflow definition."""
++
++    team_id: UUID | None = Field(default=None, description="Team UUID; defaults to caller's default team")
++    workflow_id: UUID | None = Field(default=None, description="Specific version; omit for the team's live workflow")
++
++
++class MindmapWorkflowGetTool(BaseTool):
++    """Read a team's live workflow definition or a specific frozen version."""
++
++    name: ClassVar[str] = "mindmap_workflow_get"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_workflow_get"]
++    required_scope: ClassVar[str] = "memory.read"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkflowGetInput
++    OutputModel: ClassVar[type[BaseModel]] = WorkflowDefOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkflowGetInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            try:
++                if inp.workflow_id is not None:
++                    wf = await workflow_service.get_workflow_version(
++                        conn, workflow_id=inp.workflow_id
++                    )
++                else:
++                    wf = await workflow_service.get_live_workflow(
++                        conn, team_id=team_id, created_by=ctx.tenant_id
++                    )
++            except workflow_service.WorkflowError as e:
++                raise map_work_item_error(e) from e
++
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="memory.get",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "team_id": str(team_id),
++                        "workflow_id": str(wf.id),
++                        "version_number": wf.version_number,
++                    },
++                )
++
++            return WorkflowDefOutput(
++                id=wf.id,
++                team_id=wf.team_id,
++                version_number=wf.version_number,
++                statuses=wf.statuses,
++                transitions=wf.transitions,
++                created_at=wf.created_at,
++                created_by=wf.created_by,
++            )
+diff --git a/src/mem_mcp/mcp/tools/mindmap_workflow_rebase.py b/src/mem_mcp/mcp/tools/mindmap_workflow_rebase.py
+new file mode 100644
+index 0000000..171d534
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_workflow_rebase.py
+@@ -0,0 +1,85 @@
++"""mindmap_workflow_rebase — rebase a work item onto a newer workflow version."""
++
++from __future__ import annotations
++
++from typing import Any, ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import RebasedViewOutput, map_work_item_error
++from mem_mcp.mindmap import workflows as workflow_service
++
++
++class MindmapWorkflowRebaseInput(BaseModel):
++    """Input for rebasing a work item onto a newer workflow version."""
++
++    team_id: UUID | None = Field(default=None, description="Team UUID; defaults to caller's default team")
++    map_key: str = Field(..., min_length=1, max_length=64)
++    node_id: UUID = Field(..., description="The work item's node UUID")
++    target_version_id: UUID = Field(..., description="The newer workflow version to rebase onto")
++    status_map: dict[str, str] = Field(
++        ..., description="Mapping of old status names → new status names"
++    )
++    reason: str | None = Field(default=None, max_length=2000)
++
++
++class MindmapWorkflowRebaseTool(BaseTool):
++    """Rebase a work item's workflow onto a newer version, remapping its status."""
++
++    name: ClassVar[str] = "mindmap_workflow_rebase"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_workflow_rebase"]
++    required_scope: ClassVar[str] = "memory.write"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkflowRebaseInput
++    OutputModel: ClassVar[type[BaseModel]] = RebasedViewOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkflowRebaseInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            try:
++                result = await workflow_service.rebase_work_item(
++                    conn,
++                    work_item_id=inp.node_id,
++                    team_id=team_id,
++                    target_version_id=inp.target_version_id,
++                    status_map=inp.status_map,
++                    actor_identity_id=ctx.identity_id,
++                    channel="mcp",
++                )
++            except workflow_service.WorkflowError as e:
++                raise map_work_item_error(e) from e
++
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="mindmap.rebase",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "node_id": str(result.work_item_id),
++                        "from_version_id": str(result.from_version_id),
++                        "to_version_id": str(result.to_version_id),
++                        "old_status": result.old_status,
++                        "new_status": result.new_status,
++                        "map_key": inp.map_key,
++                    },
++                )
++
++            return RebasedViewOutput(
++                work_item_id=result.work_item_id,
++                from_version_id=result.from_version_id,
++                to_version_id=result.to_version_id,
++                old_status=result.old_status,
++                new_status=result.new_status,
++                status_map=result.status_map,
++            )
+diff --git a/src/mem_mcp/mcp/tools/mindmap_workflow_update.py b/src/mem_mcp/mcp/tools/mindmap_workflow_update.py
+new file mode 100644
+index 0000000..c19dc15
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_workflow_update.py
+@@ -0,0 +1,80 @@
++"""mindmap_workflow_update — create a new frozen workflow version and promote it live."""
++
++from __future__ import annotations
++
++from typing import Any, ClassVar
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mcp.tools._work_item_common import WorkflowDefOutput, map_work_item_error
++from mem_mcp.mindmap import workflows as workflow_service
++
++
++class MindmapWorkflowUpdateInput(BaseModel):
++    """Input for creating a new workflow version."""
++
++    team_id: UUID | None = Field(default=None, description="Team UUID; defaults to caller's default team")
++    statuses: list[str] = Field(..., min_length=1, description="All valid status names for the new version")
++    transitions: dict[str, dict[str, dict[str, Any]]] = Field(
++        ..., description="Transition graph {from: {to: {requires_reason, min_signoffs, eligible_role_classes}}}"
++    )
++    reject_if_orphans: bool = Field(default=True, description="Refuse if existing work items use statuses not in the new version")
++
++
++class MindmapWorkflowUpdateTool(BaseTool):
++    """Create a new workflow version and promote it to live."""
++
++    name: ClassVar[str] = "mindmap_workflow_update"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_workflow_update"]
++    required_scope: ClassVar[str] = "memory.write"
++    InputModel: ClassVar[type[BaseModel]] = MindmapWorkflowUpdateInput
++    OutputModel: ClassVar[type[BaseModel]] = WorkflowDefOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapWorkflowUpdateInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++
++            try:
++                wf = await workflow_service.create_workflow_version(
++                    conn,
++                    team_id=team_id,
++                    statuses=inp.statuses,
++                    transitions=inp.transitions,
++                    created_by=ctx.identity_id,
++                    reject_if_orphans=inp.reject_if_orphans,
++                )
++            except workflow_service.WorkflowError as e:
++                raise map_work_item_error(e) from e
++
++            if ctx.deps is not None:
++                await ctx.deps.audit.audit(
++                    conn,
++                    action="mindmap.workflow_created",
++                    result="success",
++                    tenant_id=ctx.tenant_id,
++                    identity_id=ctx.identity_id,
++                    client_id=ctx.client_id,
++                    request_id=ctx.request_id,
++                    details={
++                        "team_id": str(team_id),
++                        "version_number": wf.version_number,
++                        "statuses": inp.statuses,
++                    },
++                )
++
++            return WorkflowDefOutput(
++                id=wf.id,
++                team_id=wf.team_id,
++                version_number=wf.version_number,
++                statuses=wf.statuses,
++                transitions=wf.transitions,
++                created_at=wf.created_at,
++                created_by=wf.created_by,
++            )
+diff --git a/src/mem_mcp/mindmap/work_items.py b/src/mem_mcp/mindmap/work_items.py
+index e98ba22..530b8e6 100644
+--- a/src/mem_mcp/mindmap/work_items.py
++++ b/src/mem_mcp/mindmap/work_items.py
+@@ -97,6 +97,17 @@ class InvalidStatusError(WorkItemError):
+         self.allowed = allowed
+ 
+ 
++class InvalidWorkflowStatusError(WorkItemError):
++    """Initial status is not a valid __entry__ target under the workflow."""
++
++    def __init__(self, status: str, allowed: list[str]) -> None:
++        super().__init__(
++            f"status {status!r} is not a valid initial status; allowed: {allowed}"
++        )
++        self.status = status
++        self.allowed = allowed
++
++
+ class RootNodeNotAllowedError(WorkItemError):
+     """Cannot mark the root node as a work item."""
+ 
+@@ -434,6 +445,7 @@ async def mark_work_item(
+     assignee_id: UUID | None = None,
+     reason: str | None = None,
+     channel: str = "mcp",
++    status: str | None = None,
+ ) -> WorkItem:
+     """Mark a node as a work item.
+ 
+@@ -475,10 +487,10 @@ async def mark_work_item(
+ 
+     # Validate initial status against __entry__ (E5) instead of hard-coding
+     # 'todo' without checking the workflow allows it.
+-    initial_status = "todo"
++    initial_status = status or "todo"
+     entry = wf.transitions.get("__entry__", {})
+     if initial_status not in entry:
+-        raise InvalidTransitionError("__entry__", initial_status)
++        raise InvalidWorkflowStatusError(initial_status, list(entry.keys()))
+ 
+     # Get node content for title extraction (team-scoped RLS governs visibility;
+     # do NOT filter on the caller's tenant_id — teammates belong to different
+diff --git a/src/mem_mcp/mindmap/workflows.py b/src/mem_mcp/mindmap/workflows.py
+index e2806f4..2d910cb 100644
+--- a/src/mem_mcp/mindmap/workflows.py
++++ b/src/mem_mcp/mindmap/workflows.py
+@@ -120,6 +120,22 @@ class RebaseConflictError(WorkflowError):
+     """A rebase target/transition could not be applied."""
+ 
+ 
++class OrphanStatusError(WorkflowError):
++    """A workflow version edit would orphan existing work-item statuses.
++
++    Carries ``orphan_statuses`` (the statuses that live in work_items but are
++    absent from the proposed ``statuses`` list). Raised by
++    :func:`create_workflow_version` when ``reject_if_orphans`` is true (the
++    default per E1).
++    """
++
++    def __init__(self, orphan_statuses: list[str]) -> None:
++        super().__init__(
++            f"workflow edit would orphan statuses: {', '.join(orphan_statuses)}"
++        )
++        self.orphan_statuses = orphan_statuses
++
++
+ # -------------------------------------------------------------------------
+ # Dataclasses
+ # -------------------------------------------------------------------------
+@@ -773,6 +789,191 @@ async def rebase_work_item(
+     )
+ 
+ 
++# -------------------------------------------------------------------------
++# Workflow version management (R1/R4)
++# -------------------------------------------------------------------------
++
++
++async def create_workflow_version(
++    conn: asyncpg.Connection,
++    *,
++    team_id: UUID,
++    statuses: list[str],
++    transitions: dict[str, dict[str, dict[str, Any]]],
++    created_by: UUID,
++    reject_if_orphans: bool = True,
++) -> WorkflowDef:
++    """Create a new frozen workflow version for a team and promote it to live.
++
++    E1: when ``reject_if_orphans`` is true (the default), the call refuses if any
++    existing work_items carry a status absent from the proposed ``statuses`` list.
++    Pass ``reject_if_orphans=False`` to allow dropping statuses.
++    """
++    live = await get_live_workflow(conn, team_id=team_id, created_by=created_by)
++
++    if reject_if_orphans:
++        current_statuses = {s for s in statuses}
++        orphans = await conn.fetch(
++            "SELECT DISTINCT status FROM work_items WHERE team_id = $1",
++            team_id,
++        )
++        orphan_statuses = [r["status"] for r in orphans if r["status"] not in current_statuses]
++        if orphan_statuses:
++            raise OrphanStatusError(orphan_statuses)
++
++    version_number = live.version_number + 1
++    version_id = await conn.fetchval(
++        """
++        INSERT INTO team_workflow_versions
++            (team_id, version_number, statuses, transitions, created_by)
++        VALUES ($1, $2, $3, $4, $5)
++        RETURNING id
++        """,
++        team_id,
++        version_number,
++        statuses,
++        _dumps_json(transitions),
++        created_by,
++    )
++    await conn.execute(
++        """
++        UPDATE team_workflows
++        SET current_version_id = $1, updated_at = now(), updated_by = $2
++        WHERE team_id = $3
++        """,
++        version_id,
++        created_by,
++        team_id,
++    )
++    return await get_workflow_version(conn, version_id)
++
++
++# -------------------------------------------------------------------------
++# Sign-off rejection & listing
++# -------------------------------------------------------------------------
++
++
++async def reject_signoff(
++    conn: asyncpg.Connection,
++    *,
++    request_id: UUID,
++    actor_identity_id: UUID,
++    channel: str = "mcp",
++    reason: str | None = None,
++) -> SignoffState:
++    """Reject (close) a pending sign-off request without applying the move.
++
++    §2.4: marks the request ``superseded`` so no further approvals can be
++    recorded; the work-item ``status`` is left unchanged. Appends a
++    ``signoff_decided`` history row.
++    """
++    req = await conn.fetchrow(
++        """
++        SELECT r.request_id, r.work_item_id, r.team_id, r.from_status,
++               r.to_status, r.min_signoffs, r.eligible_role_classes, r.status
++        FROM work_item_signoff_requests r
++        WHERE r.request_id = $1
++        FOR UPDATE
++        """,
++        request_id,
++    )
++    if req is None:
++        raise WorkflowNotFoundError()
++    if req["status"] != "pending":
++        raise SignoffRequestClosedError(req["request_id"])
++
++    await conn.execute(
++        """
++        UPDATE work_item_signoff_requests
++        SET status = 'superseded'
++        WHERE request_id = $1 AND team_id = $2
++        """,
++        request_id,
++        req["team_id"],
++    )
++
++    await _record_signoff_history(
++        conn,
++        work_item_id=req["work_item_id"],
++        team_id=req["team_id"],
++        actor_id=actor_identity_id,
++        channel=channel,
++        change_type="signoff_decided",
++        from_status=req["from_status"],
++        to_status=req["to_status"],
++        reason=reason,
++    )
++
++    return await _signoff_state_raw(
++        conn,
++        request_id=request_id,
++        status="superseded",
++        from_status=req["from_status"],
++        to_status=req["to_status"],
++        min_signoffs=int(req["min_signoffs"]),
++        approvals=await _count_approvals(conn, request_id),
++        eligible_role_classes=list(req["eligible_role_classes"]),
++    )
++
++
++async def list_eligible_signoff_requests(
++    conn: asyncpg.Connection,
++    *,
++    team_id: UUID,
++    caller_identity_id: UUID,
++) -> list[SignoffState]:
++    """List pending sign-off requests where ``caller_identity_id`` is an eligible approver.
++
++    R8: a caller sees only requests for which they hold an active role in
++    ``eligible_role_classes`` and are neither the mover nor the item owner.
++    """
++    role = await get_team_role(conn, caller_identity_id, team_id)
++    if role is None:
++        return []
++
++    rows = await conn.fetch(
++        """
++        SELECT r.request_id, r.status, r.from_status, r.to_status,
++               r.min_signoffs, r.eligible_role_classes, r.created_by,
++               wi.assignee_id, wi.created_by AS item_creator
++        FROM work_item_signoff_requests r
++        JOIN work_items wi ON wi.memory_id = r.work_item_id AND wi.team_id = r.team_id
++        WHERE r.team_id = $1 AND r.status = 'pending'
++        ORDER BY r.created_at DESC
++        """,
++        team_id,
++    )
++    result: list[SignoffState] = []
++    for row in rows:
++        eligible = list(row["eligible_role_classes"])
++        # Exclude mover and item owner from their own approvals.
++        if caller_identity_id == row["created_by"]:
++            continue
++        if caller_identity_id == (row["assignee_id"] or row["item_creator"]):
++            continue
++        if role not in eligible:
++            continue
++        approvals = await _count_approvals(conn, row["request_id"])
++        approvers = await conn.fetch(
++            "SELECT DISTINCT approver_identity_id FROM work_item_signoff_approvals "
++            "WHERE request_id = $1",
++            row["request_id"],
++        )
++        result.append(
++            await _signoff_state_raw(
++                conn,
++                request_id=row["request_id"],
++                status=row["status"],
++                from_status=row["from_status"],
++                to_status=row["to_status"],
++                min_signoffs=int(row["min_signoffs"]),
++                approvals=approvals,
++                eligible_role_classes=eligible,
++            )
++        )
++    return result
++
++
+ # -------------------------------------------------------------------------
+ # Internal helpers
+ # -------------------------------------------------------------------------
+diff --git a/tests/integration/test_mindmap_work_items_e2e.py b/tests/integration/test_mindmap_work_items_e2e.py
+index 7e889a1..06cb885 100644
+--- a/tests/integration/test_mindmap_work_items_e2e.py
++++ b/tests/integration/test_mindmap_work_items_e2e.py
+@@ -143,8 +143,20 @@ async def _cleanup(pool: Any, tenant_a: UUID, tenant_b: UUID, team: UUID, client
+             )
+             await conn.execute("DELETE FROM memory_map_events WHERE tenant_id = ANY($1::uuid[])", tenants)
+             await conn.execute("DELETE FROM memory_map_membership WHERE tenant_id = ANY($1::uuid[])", tenants)
+-            await conn.execute("DELETE FROM work_items WHERE tenant_id = ANY($1::uuid[])", tenants)
++            # Sign-off + rebase tables (team-scoped, cleanup before work_items)
++            await conn.execute("DELETE FROM work_item_signoff_approvals WHERE request_id IN (SELECT request_id FROM work_item_signoff_requests WHERE team_id = $1)", team)
++            await conn.execute("DELETE FROM work_item_signoff_requests WHERE team_id = $1", team)
++            await conn.execute("DELETE FROM work_item_signoff_rebase_log WHERE team_id = $1", team)
++            # Work item history + work items (before workflow tables —
++            # work_items.workflow_id FKs to team_workflow_versions via
++            # current_version_id as well, so work_items must go first).
+             await conn.execute("DELETE FROM work_item_history WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM work_items WHERE tenant_id = ANY($1::uuid[])", tenants)
++            # Workflow version tables (team-scoped)
++            # Delete team_workflows first to drop the FK reference to
++            # current_version_id before deleting from team_workflow_versions.
++            await conn.execute("DELETE FROM team_workflows WHERE team_id = $1", team)
++            await conn.execute("DELETE FROM team_workflow_versions WHERE team_id = $1", team)
+             await conn.execute("DELETE FROM memory_maps WHERE tenant_id = ANY($1::uuid[])", tenants)
+             await conn.execute("DELETE FROM slugs WHERE team_id = $1", team)
+             await conn.execute("DELETE FROM memories WHERE tenant_id = ANY($1::uuid[])", tenants)
+@@ -980,6 +992,104 @@ async def test_work_item_expected_status_mismatch(pg_pool: Any) -> None:
+         await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
+ 
+ 
+<email>
++async def test_get_and_history_tools_enriched(pg_pool: Any) -> None:
++    """mindmap_work_get/_list/_history return workflow_id, available_transitions,
++    signoff_state, and sign-off change_type rows. Proves R10/R14."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Enriched test", root_question="What needs doing?"),
++        )
++        map_key = opened.map_key
++
++        from mem_mcp.mcp.tools.mindmap_write_node import (
++            MindmapWriteNodeInput,
++            MindmapWriteNodeTool,
++        )
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Task for enrichment", node_role="position"),
++        )
++        node_id = node.node_id
++
++        from mem_mcp.mcp.tools._work_item_common import WorkItemOutput
++        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
++        from mem_mcp.mcp.tools.mindmap_work_get import MindmapWorkGetTool, MindmapWorkGetInput
++        from mem_mcp.mcp.tools.mindmap_work_list import MindmapWorkListTool, MindmapWorkListInput
++        from mem_mcp.mcp.tools.mindmap_work_history import MindmapWorkHistoryTool, MindmapWorkHistoryInput
++
++        # Mark as work item (default v1 workflow)
++        mark_result = await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(map_key=map_key, node_id=node_id, kind="story"),
++        )
++        assert mark_result.workflow_id is not None
++        assert mark_result.available_transitions == ["in_progress", "cancelled"]
++        assert mark_result.signoff_state is None
++        assert mark_result.blocked is False
++
++        # Set to in_progress (valid transition from todo)
++        await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node_id,
++                status="in_progress",
++                reason="starting",
++            ),
++        )
++
++        # Get the work item — should show enriched fields
++        get_result = await MindmapWorkGetTool()(
++            ctx,
++            MindmapWorkGetInput(map_key=map_key, node_id=node_id),
++        )
++        assert isinstance(get_result, WorkItemOutput)
++        assert get_result.workflow_id is not None
++        assert get_result.status == "in_progress"
++        assert "blocked" in get_result.available_transitions
++        assert "done" in get_result.available_transitions
++        assert "todo" in get_result.available_transitions
++        assert "cancelled" in get_result.available_transitions
++        assert get_result.signoff_state is None
++
++        # List work items — each should have enriched fields
++        list_result = await MindmapWorkListTool()(
++            ctx,
++            MindmapWorkListInput(map_key=map_key),
++        )
++        assert list_result.count == 1
++        assert list_result.items[0].workflow_id is not None
++        assert list_result.items[0].available_transitions == ["blocked", "cancelled", "done", "todo"]
++        assert list_result.items[0].signoff_state is None
++
++        # History should have entries with available_transitions and change_type
++        hist_result = await MindmapWorkHistoryTool()(
++            ctx,
++            MindmapWorkHistoryInput(map_key=map_key, node_id=node_id),
++        )
++        assert hist_result.count >= 2  # created + status_changed
++        # First entry is 'created'
++        assert hist_result.items[0].change_type == "created"
++        assert hist_result.items[0].available_transitions  # populated from current workflow
++        assert hist_result.items[0].signoff_state is None
++        # Second entry is 'status' (from todo -> in_progress)
++        assert hist_result.items[1].change_type == "status"
++        assert hist_result.items[1].status_before == "todo"
++        assert hist_result.items[1].status_after == "in_progress"
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+ @pytest.mark.asyncio
+ async def test_work_item_branch_status_unchanged(pg_pool: Any) -> None:
+     """Work item status change should not affect branch status in memory_map_membership."""
+diff --git a/tests/integration/test_mindmap_workflows_e2e.py b/tests/integration/test_mindmap_workflows_e2e.py
+new file mode 100644
+index 0000000..51e153a
+--- /dev/null
++++ b/tests/integration/test_mindmap_workflows_e2e.py
+@@ -0,0 +1,607 @@
++# mypy: disable-error-code="attr-defined"
++# BaseTool.__call__ is declared to return BaseModel, so mypy cannot see the
++# concrete output models' fields. Suppressed at module level rather than with
++# inline ignores; the assertions themselves are what give these tests value.
++"""End-to-end integration tests for team workflow tools (WP2).
++
++Tests mindmap_workflow_* and mindmap_work_signoff_* tools through the real
++Postgres pool, exercising workflow version creation, stamping, sign-off
++quorum, reject, and orphan-status refusal (E1).
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Any
++from uuid import UUID
++
++import pytest
++
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tools._work_item_common import (
++    SignoffStateOutput,
++    WorkItemOutput,
++    WorkflowDefOutput,
++)
++from mem_mcp.mcp.tools.mindmap_open import MindmapOpenInput, MindmapOpenTool
++from mem_mcp.mcp.tools.mindmap_work_get import MindmapWorkGetInput, MindmapWorkGetTool
++from mem_mcp.mcp.tools.mindmap_work_history import MindmapWorkHistoryInput, MindmapWorkHistoryTool
++from mem_mcp.mcp.tools.mindmap_work_list import MindmapWorkListInput, MindmapWorkListTool
++from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkInput, MindmapWorkMarkTool
++from mem_mcp.mcp.tools.mindmap_work_set_status import (
++    MindmapWorkSetStatusInput,
++    MindmapWorkSetStatusTool,
++)
++from mem_mcp.mcp.tools.mindmap_work_signoff_approve import (
++    MindmapWorkSignoffApproveInput,
++    MindmapWorkSignoffApproveTool,
++)
++from mem_mcp.mcp.tools.mindmap_work_signoff_list import (
++    MindmapWorkSignoffListInput,
++    MindmapWorkSignoffListTool,
++)
++from mem_mcp.mcp.tools.mindmap_work_signoff_reject import (
++    MindmapWorkSignoffRejectInput,
++    MindmapWorkSignoffRejectTool,
++)
++from mem_mcp.mcp.tools.mindmap_workflow_update import (
++    MindmapWorkflowUpdateInput,
++    MindmapWorkflowUpdateTool,
++)
++from mem_mcp.mcp.tools.mindmap_write_node import MindmapWriteNodeInput, MindmapWriteNodeTool
++
++# Skip all tests if MEM_MCP_TEST_DSN not set
++pytestmark = pytest.mark.skipif(
++    not os.getenv("MEM_MCP_TEST_DSN"),
++    reason="MEM_MCP_TEST_DSN not set",
++)
++
++from .test_mindmap_work_items_e2e import _cleanup, _ctx, _setup  # noqa: E402
++
++# A v2 workflow that adds a "review" status and a signoff-required
++# transition (todo → done requires 1 member approval).
++_V2_TRANSITIONS: dict[str, Any] = {
++    "__entry__": {"todo": {"requires_reason": False, "min_signoffs": 0}},
++    "todo": {
++        "in_progress": {"requires_reason": False, "min_signoffs": 0},
++        "done": {
++            "requires_reason": False,
++            "min_signoffs": 1,
++            "eligible_role_classes": ["member"],
++        },
++        "cancelled": {"requires_reason": True, "min_signoffs": 0},
++    },
++    "in_progress": {
++        "review": {"requires_reason": False, "min_signoffs": 0},
++        "blocked": {"requires_reason": True, "min_signoffs": 0},
++        "done": {
++            "requires_reason": False,
++            "min_signoffs": 1,
++            "eligible_role_classes": ["member"],
++        },
++        "todo": {"requires_reason": False, "min_signoffs": 0},
++        "cancelled": {"requires_reason": True, "min_signoffs": 0},
++    },
++    "review": {
++        "done": {"requires_reason": False, "min_signoffs": 0},
++        "in_progress": {"requires_reason": True, "min_signoffs": 0},
++    },
++    "blocked": {
++        "in_progress": {"requires_reason": False, "min_signoffs": 0},
++        "cancelled": {"requires_reason": True, "min_signoffs": 0},
++    },
++    "done": {
++        "in_progress": {"requires_reason": True, "min_signoffs": 0},
++    },
++    "cancelled": {
++        "todo": {"requires_reason": True, "min_signoffs": 0},
++    },
++}
++_V2_STATUSES = ["todo", "in_progress", "review", "blocked", "done", "cancelled"]
++
++
++# A v2 workflow WITHOUT "blocked" status (for orphan-status test).
++_V2_NO_BLOCKED_TRANSITIONS: dict[str, Any] = {
++    "__entry__": {"todo": {"requires_reason": False, "min_signoffs": 0}},
++    "todo": {
++        "in_progress": {"requires_reason": False, "min_signoffs": 0},
++        "done": {"requires_reason": False, "min_signoffs": 0},
++        "cancelled": {"requires_reason": True, "min_signoffs": 0},
++    },
++    "in_progress": {
++        "done": {"requires_reason": False, "min_signoffs": 0},
++        "todo": {"requires_reason": False, "min_signoffs": 0},
++        "cancelled": {"requires_reason": True, "min_signoffs": 0},
++    },
++    "done": {
++        "in_progress": {"requires_reason": True, "min_signoffs": 0},
++    },
++    "cancelled": {
++        "todo": {"requires_reason": True, "min_signoffs": 0},
++    },
++}
++_V2_NO_BLOCKED_STATUSES = ["todo", "in_progress", "done", "cancelled"]
++
++
++async def _mark_node(ctx: Any, team_id: UUID | None = None) -> tuple[str, UUID, WorkItemOutput]:
++    """Open a map, write a position node, mark it as a story.
++
++    Returns ``(map_key, node_id, result)``.
++    """
++    opened = await MindmapOpenTool()(
++        ctx,
++        MindmapOpenInput(title="Workflow test", root_question="What needs doing?"),
++    )
++    map_key = opened.map_key
++
++    node = await MindmapWriteNodeTool()(
++        ctx,
++        MindmapWriteNodeInput(map_key=map_key, content="Test task", node_role="position"),
++    )
++
++    result = await MindmapWorkMarkTool()(
++        ctx,
++        MindmapWorkMarkInput(
++            map_key=map_key, node_id=node.node_id, kind="story", team_id=team_id
++        ),
++    )
++    return map_key, node.node_id, result
++
++
+<email>
++async def test_team_can_define_and_apply_workflow(pg_pool: Any) -> None:
++    """mindmap_workflow_update creates v2; new items stamp v2, old items keep v1.
++
++    Proves R4 (frozen versions) + R1/R2 (stamping + live pointer).
++    """
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        # Mark a node BEFORE creating v2 — it stamps default v1
++        map_key, node1_id, item1 = await _mark_node(ctx, team_id=team)
++
++        # Create v2 via mindmap_workflow_update
++        wf_result = await MindmapWorkflowUpdateTool()(
++            ctx,
++            MindmapWorkflowUpdateInput(
++                team_id=team,
++                statuses=_V2_STATUSES,
++                transitions=_V2_TRANSITIONS,
++                reject_if_orphans=True,
++            ),
++        )
++        assert isinstance(wf_result, WorkflowDefOutput)
++        assert wf_result.version_number == 2
++        assert "review" in wf_result.statuses
++
++        # Mark a second node AFTER v2 — should stamp v2
++        map_key2, node2_id, item2 = await _mark_node(ctx, team_id=team)
++
++        assert item1.workflow_id is not None
++        assert item2.workflow_id is not None
++        assert item1.workflow_id != item2.workflow_id
++
++        # Old item (v1): can still transition under v1 (todo → in_progress)
++        result = await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node1_id,
++                status="in_progress",
++                reason="starting",
++            ),
++        )
++        assert result.status == "in_progress"
++
++        # New item (v2): can transition under v2 (todo → in_progress, v2 has "review")
++        result2 = await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key2,
++                node_id=node2_id,
++                status="in_progress",
++                reason="starting",
++            ),
++        )
++        assert result2.status == "in_progress"
++        assert "review" in result2.available_transitions
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_mark_work_item_stamps_live_workflow_and_validates_entry(pg_pool: Any) -> None:
++    """mindmap_work_mark stamps the live workflow version and rejects invalid __entry__ status.
++
++    Proves stamping + __entry__ initial-status validation (E5).
++    """
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        # Create v2 (live workflow is now v2)
++        await MindmapWorkflowUpdateTool()(
++            ctx,
++            MindmapWorkflowUpdateInput(
++                team_id=team,
++                statuses=_V2_STATUSES,
++                transitions=_V2_TRANSITIONS,
++                reject_if_orphans=True,
++            ),
++        )
++
++        opened = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Entry validation", root_question="What?"),
++        )
++        map_key = opened.map_key
++
++        node = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Entry test task", node_role="position"),
++        )
++
++        # Valid initial status 'todo' (it is a valid __entry__ target)
++        result = await MindmapWorkMarkTool()(
++            ctx,
++            MindmapWorkMarkInput(
++                map_key=map_key,
++                node_id=node.node_id,
++                kind="story",
++                status="todo",
++                team_id=team,
++            ),
++        )
++        assert result.workflow_id is not None  # stamped to v2
++        assert result.status == "todo"
++
++        # Invalid initial status 'done' — not a valid __entry__ target
++        node2 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=map_key, content="Bad entry", node_role="position"),
++        )
++
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkMarkTool()(
++                ctx,
++                MindmapWorkMarkInput(
++                    map_key=map_key,
++                    node_id=node2.node_id,
++                    kind="story",
++                    status="done",
++                    team_id=team,
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert exc_info.value.data is not None
++        assert exc_info.value.data["code"] == "invalid_workflow_status"
++        assert "todo" in exc_info.value.data["allowed"]
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_move_requiring_signoff_blocks_until_approval(pg_pool: Any) -> None:
++    """set_status on a guarded transition opens a sign-off; approve moves the item.
++
++    Proves R3/R13/R14 + §2.8.
++    """
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant_a, tenant_b, team, client_id = (
++        s["tenant_a"],
++        s["tenant_b"],
++        s["team"],
++        s["client_id"],
++    )
++    ctx_a = _ctx(pg_pool, tenant_a, client_id)
++
++    try:
++        # Install v2 with signoff on todo → done
++        await MindmapWorkflowUpdateTool()(
++            ctx_a,
++            MindmapWorkflowUpdateInput(
++                team_id=team,
++                statuses=_V2_STATUSES,
++                transitions=_V2_TRANSITIONS,
++                reject_if_orphans=True,
++            ),
++        )
++
++        # Create work item (stamps v2)
++        map_key, node_id, _ = await _mark_node(ctx_a, team_id=team)
++
++        # Attempt todo → done (requires signoff)
++        result = await MindmapWorkSetStatusTool()(
++            ctx_a,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node_id,
++                status="done",
++                reason="all done",
++            ),
++        )
++        # Status unchanged (still todo), signoff state populated
++        assert result.status == "todo"
++        assert result.signoff_state is not None
++        assert result.signoff_state.status == "pending"
++        assert result.signoff_state.have == 0
++        assert result.signoff_state.needed == 1
++        request_id = result.signoff_state.request_id
++
++        # Approve as tenant_b (member — eligible approver, not mover/owner)
++        ctx_b = _ctx(pg_pool, tenant_b, client_id)
++        approve_result = await MindmapWorkSignoffApproveTool()(
++            ctx_b,
++            MindmapWorkSignoffApproveInput(team_id=team, request_id=request_id),
++        )
++        assert isinstance(approve_result, SignoffStateOutput)
++        assert approve_result.status == "approved"
++        assert approve_result.have == 1
++        assert approve_result.needed == 1
++
++        # Verify the item's status actually changed to done
++        get_result = await MindmapWorkGetTool()(
++            ctx_b,
++            MindmapWorkGetInput(map_key=map_key, node_id=node_id, team_id=team),
++        )
++        assert get_result.status == "done"
++
++        # History should have signoff_requested + status entries
++        hist_result = await MindmapWorkHistoryTool()(
++            ctx_b,
++            MindmapWorkHistoryInput(map_key=map_key, node_id=node_id, team_id=team),
++        )
++        change_types = [e.change_type for e in hist_result.items]
++        assert "signoff_requested" in change_types
++        assert "status" in change_types
++
++    finally:
++        await _cleanup(pg_pool, tenant_a, tenant_b, team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_waiting_on_me_only_lists_callers_pending_requests(pg_pool: Any) -> None:
++    """mindmap_work_list(waiting_on_me=true) and mindmap_work_signoff_list
++    return only requests where the caller is an eligible approver.
++
++    Proves R8 + opacity (Risk 7).
++    """
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant_a, tenant_b, team, client_id = (
++        s["tenant_a"],
++        s["tenant_b"],
++        s["team"],
++        s["client_id"],
++    )
++    ctx_a = _ctx(pg_pool, tenant_a, client_id)
++
++    try:
++        # Install v2 with signoff on todo → done (eligible: member)
++        await MindmapWorkflowUpdateTool()(
++            ctx_a,
++            MindmapWorkflowUpdateInput(
++                team_id=team,
++                statuses=_V2_STATUSES,
++                transitions=_V2_TRANSITIONS,
++                reject_if_orphans=True,
++            ),
++        )
++
++        # Create work item + trigger signoff (mover = tenant_a, owner)
++        map_key, node_id, _ = await _mark_node(ctx_a, team_id=team)
++
++        # Trigger signoff: todo → done requires 1 member approval
++        await MindmapWorkSetStatusTool()(
++            ctx_a,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node_id,
++                status="done",
++                reason="completing",
++            ),
++        )
++
++        ctx_b = _ctx(pg_pool, tenant_b, client_id)
++
++        # --- mindmap_work_list(waiting_on_me=True) ---
++        # tenant_a (mover/owner) should see nothing
++        list_a = await MindmapWorkListTool()(
++            ctx_a,
++            MindmapWorkListInput(team_id=team, waiting_on_me=True),
++        )
++        assert list_a.count == 0
++
++        # tenant_b (member, eligible) should see it
++        list_b = await MindmapWorkListTool()(
++            ctx_b,
++            MindmapWorkListInput(team_id=team, waiting_on_me=True),
++        )
++        assert list_b.count == 1
++        assert list_b.items[0].signoff_state is not None
++        assert list_b.items[0].signoff_state.status == "pending"
++
++        # --- mindmap_work_signoff_list ---
++        # tenant_a (mover/owner) should see nothing
++        signoff_a = await MindmapWorkSignoffListTool()(
++            ctx_a,
++            MindmapWorkSignoffListInput(team_id=team),
++        )
++        assert signoff_a.count == 0
++
++        # tenant_b (member, eligible) should see the pending request
++        signoff_b = await MindmapWorkSignoffListTool()(
++            ctx_b,
++            MindmapWorkSignoffListInput(team_id=team),
++        )
++        assert signoff_b.count == 1
++        assert signoff_b.items[0].status == "pending"
++        assert signoff_b.items[0].needed == 1
++        assert signoff_b.items[0].have == 0
++
++    finally:
++        await _cleanup(pg_pool, tenant_a, tenant_b, team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_signoff_reject_does_not_move(pg_pool: Any) -> None:
++    """Reject closes the request as superseded; item status stays unchanged.
++
++    Proves §2.4.
++    """
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant_a, tenant_b, team, client_id = (
++        s["tenant_a"],
++        s["tenant_b"],
++        s["team"],
++        s["client_id"],
++    )
++    ctx_a = _ctx(pg_pool, tenant_a, client_id)
++
++    try:
++        # Install v2 with signoff on todo → done
++        await MindmapWorkflowUpdateTool()(
++            ctx_a,
++            MindmapWorkflowUpdateInput(
++                team_id=team,
++                statuses=_V2_STATUSES,
++                transitions=_V2_TRANSITIONS,
++                reject_if_orphans=True,
++            ),
++        )
++
++        map_key, node_id, _ = await _mark_node(ctx_a, team_id=team)
++
++        # Trigger signoff: todo → done requires 1 member approval
++        result = await MindmapWorkSetStatusTool()(
++            ctx_a,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node_id,
++                status="done",
++                reason="completing",
++            ),
++        )
++        assert result.signoff_state is not None
++        assert result.signoff_state.status == "pending"
++        request_id = result.signoff_state.request_id
++
++        # Reject the signoff (mover can reject — reject_signoff has no
++        # eligibility check beyond the request being pending)
++        reject_result = await MindmapWorkSignoffRejectTool()(
++            ctx_a,
++            MindmapWorkSignoffRejectInput(
++                team_id=team,
++                request_id=request_id,
++                reason="not ready for review",
++            ),
++        )
++        assert isinstance(reject_result, SignoffStateOutput)
++        assert reject_result.status == "superseded"
++
++        # Item status unchanged
++        get_result = await MindmapWorkGetTool()(
++            ctx_a,
++            MindmapWorkGetInput(map_key=map_key, node_id=node_id, team_id=team),
++        )
++        assert get_result.status == "todo"
++        assert get_result.signoff_state is not None
++        assert get_result.signoff_state.status == "superseded"
++
++        # Approving a closed request should fail — even as an eligible approver
++        ctx_b = _ctx(pg_pool, tenant_b, client_id)
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkSignoffApproveTool()(
++                ctx_b,
++                MindmapWorkSignoffApproveInput(team_id=team, request_id=request_id),
++            )
++        assert exc_info.value.code == -32602
++        assert exc_info.value.data is not None
++        assert exc_info.value.data["code"] == "signoff_request_closed"
++
++    finally:
++        await _cleanup(pg_pool, tenant_a, tenant_b, team, client_id) if "s" in dir() else None
++
++
+<email>
++async def test_workflow_edit_refuses_orphan_statuses(pg_pool: Any) -> None:
++    """Creating a v2 that drops a status still used by live items is refused.
++
++    With reject_if_orphans=False it succeeds. Proves E1.
++    """
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        # Mark a node and move it to 'blocked' (a default v1 status)
++        map_key, node_id, _ = await _mark_node(ctx, team_id=team)
++
++        # todo → in_progress (valid v1 transition)
++        await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node_id,
++                status="in_progress",
++                reason="starting",
++            ),
++        )
++
++        # in_progress → blocked (valid v1 transition, requires reason)
++        await MindmapWorkSetStatusTool()(
++            ctx,
++            MindmapWorkSetStatusInput(
++                map_key=map_key,
++                node_id=node_id,
++                status="blocked",
++                reason="waiting on dep",
++            ),
++        )
++
++        # Try to create v2 that drops 'blocked' — should fail with orphans
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapWorkflowUpdateTool()(
++                ctx,
++                MindmapWorkflowUpdateInput(
++                    team_id=team,
++                    statuses=_V2_NO_BLOCKED_STATUSES,
++                    transitions=_V2_NO_BLOCKED_TRANSITIONS,
++                    reject_if_orphans=True,
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert exc_info.value.data is not None
++        assert exc_info.value.data["code"] == "invalid_workflow_definition"
++        assert "blocked" in exc_info.value.data["orphan_statuses"]
++
++        # With reject_if_orphans=False, it should succeed
++        wf_result = await MindmapWorkflowUpdateTool()(
++            ctx,
++            MindmapWorkflowUpdateInput(
++                team_id=team,
++                statuses=_V2_NO_BLOCKED_STATUSES,
++                transitions=_V2_NO_BLOCKED_TRANSITIONS,
++                reject_if_orphans=False,
++            ),
++        )
++        assert wf_result.version_number == 2
++
++    finally:
++        await _cleanup(pg_pool, tenant, s["tenant_a"], team, client_id) if "s" in dir() else None

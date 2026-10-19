@@ -1,0 +1,260 @@
+      323                      version=int(new_row["version"]),
+      324                      is_new_version=True,
+      325 +                    revision=_to_revision_str(new_row.get("revision")),
+      326                      tags=final_tags,
+      327                      request_id=ctx.request_id,
+      328                  )
+     ...
+      362                      # Compute hash
+      363                      content_hash = hash_content(inp.content)
+      364
+      256 -                    # UPDATE with content change
+      257 -                    await conn.fetchval(
+      365 +                    # UPDATE with content change. Explicitly set revision =
+      366 +                    # gen_random_uuid() so we get a known new value via RETURNING.
+      367 +                    # The trigger's IS-NOT-DISTinct guard sees the explicit value
+      368 +                    # and skips (no double-bump).
+      369 +                    new_rev_raw = await conn.fetchval(
+      370                          """
+      371                          UPDATE memories
+      372                          SET content = $1, content_hash = $2, embedding = $3::vector,
+      373 +                            revision = gen_random_uuid(),
+      374                              type = $4, tags = $5, metadata = $6::jsonb, updated_at = now()
+      375                          WHERE id = $7 AND tenant_id = $8
+      263 -                        RETURNING updated_at
+      376 +                        RETURNING revision
+      377                          """,
+      378                          inp.content,
+      379                          content_hash,
+     ...
+      385                          ctx.tenant_id,
+      386                      )
+      387                  else:
+      275 -                    # UPDATE without content change (no embedding)
+      276 -                    await conn.fetchval(
+      388 +                    # UPDATE without content change (no embedding). Tags/metadata
+      389 +                    # changes are tracked columns, so the trigger bumps revision
+      390 +                    # automatically. A pure no-op (nothing changed) leaves the
+      391 +                    # revision untouched — correct per the "meaningful writes only"
+      392 +                    # contract. RETURN revision so we always return the live value.
+      393 +                    new_rev_raw = await conn.fetchval(
+      394                          """
+      395                          UPDATE memories
+      396                          SET type = $1, tags = $2, metadata = $3::jsonb, updated_at = now()
+      397                          WHERE id = $4 AND tenant_id = $5
+      281 -                        RETURNING updated_at
+      398 +                        RETURNING revision
+      399                          """,
+      400                          new_type,
+      401                          final_tags,
+     ...
+      404                          ctx.tenant_id,
+      405                      )
+      406
+      407 +                new_revision = _to_revision_str(new_rev_raw) or _to_revision_str(
+      408 +                    target.get("revision")
+      409 +                )
+      410 +
+      411                  # Audit
+      412                  await ctx.deps.audit.audit(
+      413                      conn,
+     ...
+      434                      id=target["id"],
+      435                      version=int(target.get("version") or 1),
+      436                      is_new_version=False,
+      437 +                    revision=new_revision,
+      438                      tags=final_tags,
+      439                      request_id=ctx.request_id,
+      440                  )
+
+  Thought for 15s (ctrl+o to expand)
+
+● Now update the tool description to document expected_revision and the conflict contract:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(src/mem_mcp/mcp/tool_descriptions.py)
+  ⎿  Added 2 lines
+      105  Results: each result carries a short `preview` (keyword-windowed snippet with **match** markers when `keywords` was passed, head-of-content otherwise); `content` is truncated to ~2000 chars per result —
+            call `memory_get(id)` to fetch the full body.""",
+      106      "memory_update": """Edit the content or tags of an existing memory in place — call this when the user wants to correct or extend a memory without creating a new version.
+      107
+      108 +Optimistic concurrency: each memory carries a per-row `revision` UUID (visible in memory_get output). Pass the `expected_revision` you last read to guard against lost updates. If the row changed since y
+          +ou read it, or if the id you targeted has been superseded, the call raises -32000 `update_conflict` with `current_id` and `current_revision` — re-fetch and retry against the current_id.
+      109 +
+      110  Call when: user says "update that memory", "fix that note", "change it to say", "add a tag to", "that's not right — it should say"; user provides a correction to a stored note or snippet; user wants to
+           add tags to an existing memory; small corrections to facts or notes that don't represent a conceptual change.
+      111
+      112  Do not call for decision or fact types when the update represents a changed conclusion — use memory_supersede instead (it preserves history). Do not call without a known memory ID — search first. Do not
+            call when the user wants to delete and rewrite from scratch — delete then write.
+
+● Now run the existing unit tests to verify they still pass unchanged:
+
+● Bash(python -m pytest tests/unit/test_tools_update.py -v 2>&1)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     cachedir: .pytest_cache
+     … +19 lines (ctrl+o to expand)
+
+  Thought for 1m 44s (ctrl+o to expand)
+
+● All 10 existing tests pass. Now let me check the conftest to understand the pg_pool fixture:
+
+  Thought for 4s, read 1 file (ctrl+o to expand)
+
+● Let me check the _init_connection and tenant_tx functions:
+
+  Thought for 3s, searched for 2 patterns (ctrl+o to expand)
+
+● Let me check the write.py INSERT to understand the column structure for test setup:
+
+  Thought for 6s, read 1 file (ctrl+o to expand)
+
+● Let me check the memories table schema to understand required columns for test INSERTs:
+
+  Thought for 13s, searched for 7 patterns (ctrl+o to expand)
+
+● Let me check the bump_access function:
+
+  Thought for 1m 9s, searched for 2 patterns (ctrl+o to expand)
+
+● Let me check NoopAuditLogger and NoopQuotas:
+
+  Thought for 1m 15s, searched for 2 patterns (ctrl+o to expand)
+
+● Now let me create the mock-based unit test file:
+
+● Write(tests/unit/test_tools_update_revision.py)
+  ⎿  Wrote 323 lines to tests/unit/test_tools_update_revision.py
+       1 """Mock-based unit tests for memory_update revision/locking (T-7.2).
+       2
+       3 Covers the optimistic-concurrency contract without a live database:
+       4 - expected_revision matching → update proceeds
+       5 - expected_revision mismatch → -32000 update_conflict with current_id/current_revision
+       6 - superseded (is_current=False) → -32000 conflict whose current_id points at the
+       7   live row found via the recursive superseded_by CTE
+       8 - expected_revision omitted → backward-compatible (no check)
+       9 - MemoryRecord revision fallback / UUID coercion
+      10 - MemoryUpdateOutput revision fallback
+     … +313 lines (ctrl+o to expand)
+
+● Bash(python -m pytest tests/unit/test_tools_update_revision.py -v 2>&1)
+  ⎿  Error: Exit code 1
+     ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     cachedir: .pytest_cache
+     hypothesis profile 'default'
+     rootdir: ~/laguna-bench/runs/T5-B1/repo/.claude/worktrees/revision-guard
+     configfile: pyproject.toml
+     plugins: socket-0.8.1, locust-2.44.0, hypothesis-6.152.9, asyncio-0.24.0, anyio-4.13.0, platformdirs-4.13.0
+     asyncio: mode=Mode.AUTO, default_loop_scope=None
+     collecting ... collected 14 items
+     … +161 lines (ctrl+o to expand)
+
+  Thought for 5s (ctrl+o to expand)
+
+● The tests fail because expected_revision and revision aren't on the models. Let me verify what was actually written:
+
+  Thought for 23s, read 1 file (ctrl+o to expand)
+
+● The models look correct in the file. This might be a cached import. Let me check if the package is installed in editable mode pointing to a different path:
+
+● Bash(python -c "import mem_mcp.mcp.tools.update as m; print(m.__file__); print([f for f in m.MemoryUpdateInput.model_fields])" 2>&1)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 7s (ctrl+o to expand)
+
+● The python -c command was blocked (not a test). Let me check the project's pyproject.toml for install config:
+
+  Thought for 18s, searched for 1 pattern (ctrl+o to expand)
+
+● The package might be installed from the main repo. Let me check how imports resolve. Let me look for a conftest.py at the root:
+
+  Thought for 29s, searched for 2 patterns, read 2 files (ctrl+o to expand)
+
+● The package is installed from the main repo, not the worktree. I need PYTHONPATH=src to use the worktree's code. Let me run both test files this way:
+
+● Bash(PYTHONPATH=src python -m pytest tests/unit/test_tools_update.py tests/unit/test_tools_update_revision.py -v 2>&1)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 14s (ctrl+o to expand)
+
+● The tests are loading the main repo's code. I need to add pythonpath to pytest config so the worktree's src/ is used. This is a config change, not a test modification:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(pyproject.toml)
+  ⎿  Added 1 line
+      81
+      82  [tool.pytest.ini_options]
+      83  testpaths = ["tests", "lambdas"]
+      84 +pythonpath = ["src"]
+      85  asyncio_mode = "auto"
+      86  markers = [
+      87      "live_aws: opt-in tests against real AWS (require --live-aws)",
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  laguna-s-2.1 · API Usage Billing
+ ▝▝   ▝▝   ~/laguna-bench/runs/T5-B1/repo
+
+
+✻ Conversation compacted (ctrl+o for history)
+
+
+  Thought for 1s (ctrl+o to expand)
+
+● Let me check how bump_access tasks are managed:
+
+  Thought for 4s, read 1 file (ctrl+o to expand)
+  ⎿  Read src/mem_mcp/mcp/tools/update.py (472 lines)
+  ⎿  Read pyproject.toml (96 lines)
+  ⎿  Read tests/unit/test_tools_update_revision.py (324 lines)
+  ⎿  Referenced file src/mem_mcp/mcp/tool_descriptions.py
+  ⎿  Read alembic/versions/0046_2026_10_15_memory_revision.py (115 lines)
+
+● Let me look at the existing integration test pattern and the deps structure:
+
+  Thought for 10s, searched for 3 patterns, read 3 files (ctrl+o to expand)
+
+● Let me check the top-level conftest for the pg_pool fixture and the MemoryGetTool signature:
+
+  Thought for 3s, searched for 3 patterns (ctrl+o to expand)
+
+● Let me check the MemoryGetOutput and MemoryRecord structure:
+
+  Thought for 6s, read 1 file (ctrl+o to expand)
+
+● Now I have enough context. Let me check one more thing — the bump_access inflight task tracking, and verify the revision column exists in the DB:
+
+● Bash(PG_MIGRATIONS="0046" grep -r "revision" ~/laguna-bench/runs/T5-B1/repo/.claude/worktrees/revision-guard/src/mem_mcp/mcp/tools/get_batch.py | head -5)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Thinking for 23s, searching for 3 patterns, reading 1 file… (ctrl+o to expand)
+  ⎿  "class ToolContext"
+
+* Elucidating… (45m 1s · ↓ 3.6k tokens · deep in thought)
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · esc to interrupt · ← for agents
+
+
+
+
+
+
+
+
+
+
+

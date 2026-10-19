@@ -1,0 +1,260 @@
+      68 +            ):
+      69                  raise JsonRpcError(
+      70                      -32602, "map already archived (no-reopen)", data={"code": "map_not_live"}
+      71                  )
+     ...
+      86                      -32602, "root node cannot be resolved", data={"errors": [{"path": "node_id"}]}
+      87                  )
+      88
+      88 -            # Resolve the target node's team_id for insert_reference FK
+      89 -            target_team = await service.fetch_node_team_id(conn, memory_id=inp.node_id)
+      90 -
+      89          # Validate resolved_by_memory_id (outside the tenant_tx so we can
+      90          # use system_tx for resolve_reference_target).
+      91          if inp.resolved_by_memory_id is not None:
+     ...
+      110                      ) from exc
+      111
+      112          # All validation passed — perform the write atomically.
+      115 -        # Acquire a row lock on the target membership to prevent TOCTOU races
+      116 -        # between concurrent reads and resolves.
+      113 +        # Acquire the FOR UPDATE lock via lock_live_map (serialises resolve
+      114 +        # vs close). The membership-level lock from lock_live_map protects
+      115 +        # the window between validation and write.
+      116          async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
+      118 -            # 0. FOR UPDATE lock: serialises concurrent resolves for the same node
+      119 -            locked = await service.lock_membership(
+      120 -                conn,
+      121 -                memory_id=inp.node_id,
+      122 -                root_memory_id=root_id,
+      123 -                tenant_id=ctx.tenant_id,
+      124 -            )
+      125 -            if locked is None:
+      126 -                # Should not happen if validation above was correct, but guard anyway.
+      117 +            # 0. Re-check live (map could have closed between txs)
+      118 +            if not await service.lock_live_map(
+      119 +                conn, root_memory_id=root_id, tenant_id=ctx.tenant_id
+      120 +            ):
+      121                  raise JsonRpcError(
+      128 -                    -32602,
+      129 -                    "node is not a member of this map",
+      130 -                    data={"errors": [{"path": "node_id"}]},
+      122 +                    -32602, "map already archived (no-reopen)", data={"code": "map_not_live"}
+      123                  )
+      124
+      133 -            # 1. Update the membership row
+      134 -            await service.set_branch_status(
+      125 +            # 1. Update the membership row (now with tenant_id; returns bool)
+      126 +            ok = await service.set_branch_status(
+      127                  conn,
+      128                  memory_id=inp.node_id,
+      129                  root_memory_id=root_id,
+      130 +                tenant_id=ctx.tenant_id,
+      131                  status=inp.disposition,
+      132                  resolution_summary=inp.resolution_summary,
+      133                  resolved_by_memory_id=inp.resolved_by_memory_id,
+      134                  resolved_by_party=inp.resolved_by_party,
+      135              )
+      136 +            if not ok:
+      137 +                raise JsonRpcError(
+      138 +                    -32602,
+      139 +                    "failed to set branch status (node may be root or already locked)",
+      140 +                    data={"errors": [{"path": "node_id"}]},
+      141 +                )
+      142
+      143              # 2. If a resolving node is named: insert the edge
+      144 +            # Fetch team_id inside this write tx (needs tenant_id filter).
+      145 +            target_team = await service.fetch_node_team_id(
+      146 +                conn, memory_id=inp.node_id, tenant_id=ctx.tenant_id
+      147 +            )
+      148              reference_kind = None
+      149              if inp.resolved_by_memory_id is not None:
+      150                  reference_kind = DISPOSITION_TO_REFERENCE_KIND[inp.disposition]
+
+  Thought for 2s (ctrl+o to expand)
+
+● Now update the migration file to rename constraints:
+
+  Thought for 2s, read 1 file (ctrl+o to expand)
+
+● Update(alembic/versions/0044_2026_10_16_mindmap_branch_status.py)
+  ⎿  Added 1 line, removed 1 line
+      40          sa.text("""
+      41          ALTER TABLE memory_map_membership
+      42              ADD COLUMN resolution_summary TEXT NULL
+      43 -                        CONSTRAINT resolution_summary_length
+      43 +                        CONSTRAINT memory_map_membership_resolution_summary_check
+      44                              CHECK (
+      45                                  resolution_summary IS NULL
+      46                                  OR char_length(resolution_summary) BETWEEN 1 AND 500
+
+  Thought for 1s (ctrl+o to expand)
+
+● Update(alembic/versions/0044_2026_10_16_mindmap_branch_status.py)
+  ⎿  Added 1 line, removed 1 line
+      58          sa.text("""
+      59          ALTER TABLE memory_map_membership
+      60              ADD COLUMN resolved_by_party TEXT NULL
+      61 -                        CONSTRAINT resolved_by_party_check
+      61 +                        CONSTRAINT memory_map_membership_resolved_by_party_check
+      62                              CHECK (resolved_by_party IN ('owner', 'model'))
+      63          """)
+      64      )
+
+  Thought for 1s (ctrl+o to expand)
+
+● Update(alembic/versions/0044_2026_10_16_mindmap_branch_status.py)
+  ⎿  Added 1 line, removed 1 line
+      73      op.execute(
+      74          sa.text("""
+      75          ALTER TABLE memory_map_membership
+      76 -            ADD CONSTRAINT membership_status_consistency
+      76 +            ADD CONSTRAINT memory_map_membership_status_consistency_check
+      77              CHECK (
+      78                  (status = 'open'
+      79                   AND resolution_summary IS NULL
+
+  Thought for 1s (ctrl+o to expand)
+
+● Update(alembic/versions/0044_2026_10_16_mindmap_branch_status.py)
+  ⎿  Added 3 lines, removed 3 lines
+       99  def downgrade() -> None:
+      100      op.execute(
+      101          sa.text(
+      102 -            "ALTER TABLE memory_map_membership DROP CONSTRAINT IF EXISTS membership_status_consistency"
+      102 +            "ALTER TABLE memory_map_membership DROP CONSTRAINT IF EXISTS memory_map_membership_status_consistency_check"
+      103          )
+      104      )
+      105      op.execute(
+      106          sa.text(
+      107 -            "ALTER TABLE memory_map_membership DROP CONSTRAINT IF EXISTS resolved_by_party_check"
+      107 +            "ALTER TABLE memory_map_membership DROP CONSTRAINT IF EXISTS memory_map_membership_resolved_by_party_check"
+      108          )
+      109      )
+      110      op.execute(
+      111          sa.text(
+      112 -            "ALTER TABLE memory_map_membership DROP CONSTRAINT IF EXISTS resolution_summary_length"
+      112 +            "ALTER TABLE memory_map_membership DROP CONSTRAINT IF EXISTS memory_map_membership_resolution_summary_check"
+      113          )
+      114      )
+      115      op.execute(
+
+  Thought for 2s (ctrl+o to expand)
+
+● Now delete the debug test files using Python:
+
+● Bash(python3 -I /tmp/_cleanup.py)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 2s (ctrl+o to expand)
+
+● Let me read the unit test to update it for the new service function signatures:
+
+  Thought for 2s, read 1 file (ctrl+o to expand)
+
+● The unit tests are all model-level (DB-free) and should pass. Now let me check the integration test:
+
+  Thought for 4s, read 1 file (ctrl+o to expand)
+
+● Good. The integration tests exercise the tool layer (same interfaces). Let me run the tests:
+
+● Bash(python3 -I -m pytest tests/unit/test_mindmap_resolve_get_models.py tests/integration/test_mindmap_resolve_e2e.py -q --tb=short 2>&1)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 5s (ctrl+o to expand)
+
+● Bash is locked, so I can't run tests or delete debug files directly. Let me verify the code compiles by checking for import errors, then provide the final report.
+
+  Here is the Work Order 3 completion report:
+
+  ---
+
+  Work Order 3 — Completion Report
+
+  ┌─────┬────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  #  │                  Item                  │                                                                                Status                                                                                │
+  ├─────┼────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 1   │ Revert write.py + Python-side          │ write.py was already reverted in prior pass (confirmed via git status: no change to write.py). Added RESPONSIBLE_PARTIES to __init__.py. Rewrote fetch_open_loop_ids │
+  │     │ filtering                              │  to use _as_dict() + Python-side filtering with RESPONSIBLE_PARTIES.                                                                                                 │
+  ├─────┼────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 2   │ Delete debug test files                │ MANUAL — Bash is locked; cannot delete files. Delete these three files manually: tests/integration/test_debug_open_loops.py, tests/integration/test_jsonb_cast.py,   │
+  │     │                                        │ tests/integration/test_jsonb_minimal.py.                                                                                                                             │
+  ├─────┼────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 3   │ set_branch_status with tenant filter + │ service.py:set_branch_status now takes tenant_id, has AND node_role <> 'root' in WHERE, uses RETURNING memory_id, returns bool. Tool updated to pass tenant_id and   │
+  │     │  RETURNING + root guard                │ check return value. lock_membership removed; lock_live_map added (FOR UPDATE on memory_maps row, returns bool if live).                                              │
+  ├─────┼────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 4   │ fetch_node_team_id needs tenant_id     │ Added tenant_id param and AND tenant_id = $2 filter. Moved call inside write tx in mindmap_resolve.py.                                                               │
+  │     │ filter                                 │                                                                                                                                                                      │
+  ├─────┼────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 5   │ deleted_at / tenant filters on member  │ fetch_window_members now joins memories m with m.tenant_id = $2 and m.deleted_at IS NULL on both since=None and since=N branches.                                    │
+  │     │ queries                                │                                                                                                                                                                      │
+  ├─────┼────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 6   │ Single fetch_window_members function   │ fetch_members_cursor + fetch_settled_members removed. Single fetch_window_members(conn, *, root_memory_id, tenant_id, since=None) replaces both. mindmap_get.py      │
+  │     │                                        │ updated to use it, splitting by status in Python. fetch_touched_member_ids simplified (no since=None branch). New fetch_member_ids function added.                   │
+  ├─────┼────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 7   │ fetch_edges_touching service function  │ New function fetch_edges_touching(conn, *, member_ids, touched_ids) added. Used in mindmap_get.py to filter edges.                                                   │
+  ├─────┼────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 8   │ Migration constraint names             │ Renamed: resolution_summary_length → memory_map_membership_resolution_summary_check, membership_status_consistency → memory_map_membership_status_consistency_check, │
+  │     │                                        │  resolved_by_party_check → memory_map_membership_resolved_by_party_check. Downgrade section updated.                                                                 │
+  ├─────┼────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 9   │ Additional integration tests           │ Not started — debug test files exist but are being deleted as per item 2. New integration tests would need to be written after bash is available.                    │
+  ├─────┼────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 10  │ Full verification suite                │ Cannot run — bash locked. Provide test commands for manual execution.                                                                                                │
+  └─────┴────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Files changed:
+
+  ┌───────────────────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │                           File                            │                                                                         Changes                                                                          │
+  ├───────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │                                                           │ Replaced fetch_members_cursor/fetch_settled_members/lock_membership with fetch_window_members/lock_live_map. Added                                       │
+  │ src/mem_mcp/mindmap/service.py                            │ fetch_member_ids/fetch_edges_touching. Updated set_branch_status (tenant_id, RETURNING bool, root guard). Updated fetch_open_loop_ids (Python-side       │
+  │                                                           │ filtering). Updated fetch_node_team_id (tenant_id filter). Simplified fetch_touched_member_ids (no since=None).                                          │
+  ├───────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ src/mem_mcp/mindmap/__init__.py                           │ Added RESPONSIBLE_PARTIES: Final[tuple[str, ...]] constant.                                                                                              │
+  ├───────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ src/mem_mcp/mcp/tools/mindmap_get.py                      │ Replaced fetch_members_cursor + fetch_settled_members + fetch_internal_edges calls with fetch_window_members + fetch_member_ids + fetch_edges_touching.  │
+  ├───────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ src/mem_mcp/mcp/tools/mindmap_resolve.py                  │ Replaced lock_membership with lock_live_map (in both tx blocks). Added tenant_id to set_branch_status call. Moved fetch_node_team_id inside write tx     │
+  │                                                           │ with tenant_id. Added bool check on set_branch_status return.                                                                                            │
+  ├───────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ alembic/versions/0044_2026_10_16_mindmap_branch_status.py │ Renamed 3 constraints; updated downgrade.                                                                                                                │
+  └───────────────────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Verification commands (must be run manually):
+
+  # Unit tests (model validation)
+  cd ~/laguna-bench/runs/T4-Q1/repo
+  python3 -I -m pytest tests/unit/test_mindmap_resolve_get_models.py -q --tb=short
+
+  # Integration tests (e2e with DB)
+  python3 -I -m pytest tests/integration/test_mindmap_resolve_e2e.py -q --tb=short
+
+  # Full mindmap test suite
+  python3 -I -m pytest tests/ -k mindmap -q --tb=short
+
+  # Lint
+  python3 -I -m ruff check src/mem_mcp/mindmap/service.py src/mem_mcp/mcp/tools/mindmap_get.py src/mem_mcp/mcp/tools/mindmap_resolve.py tests/
+
+  # Migration: verify it applies cleanly
+  python3 -I -m alembic upgrade head  # then downgrade to verify
+
+  Left open / uncertain:
+
+  1. Items 9-10 (additional tests, verification) could not be completed because bash is locked. These require running the test suite to confirm nothing is broken.
+  2. The log_event function in service.py still uses json.dumps() for the payload field — this is the same JSONB double-encoding issue affecting write.py, which is out of scope for this work order.
+  3. Debug test files (test_debug_open_loops.py, test_jsonb_cast.py, test_jsonb_minimal.py) could not be deleted. They must be removed manually.
+
+✻ Sautéed for 3m 20s · done 1:57 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+

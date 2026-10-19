@@ -1,0 +1,260 @@
+         |                                   ^^^^^^^^^^^^^^ RUF100
+     163 |             async with system_tx(ctx.db_pool) as audit_conn:
+     … +37 lines (ctrl+o to expand)
+
+  Thought for 20s (ctrl+o to expand)
+
+● Update(src/mem_mcp/mcp/tools/_admin_base.py)
+  ⎿  Added 1 line, removed 1 line
+      159                      details={**details_base, **extra},
+      160                  )
+      161                  return output
+      162 -        except Exception as exc:  # noqa: BLE001 — re-raised after audit
+      162 +        except Exception as exc:  # re-raised after audit
+      163              async with system_tx(ctx.db_pool) as audit_conn:
+      164                  await ctx.deps.audit.audit(
+      165                      audit_conn,
+
+● Update(src/mem_mcp/mcp/tools/admin_find_user.py)
+  ⎿  Added 1 line, removed 1 line
+      55          return None, None, {"query_len": len(inp.query)}
+      56
+      57      async def run(
+      58 -        self, conn: "asyncpg.Connection", ctx: ToolContext, inp: AdminFindUserInput
+      58 +        self, conn: asyncpg.Connection, ctx: ToolContext, inp: AdminFindUserInput
+      59      ) -> BaseModel:
+      60          assert isinstance(inp, AdminFindUserInput)
+      61          try:
+
+● Update(src/mem_mcp/mcp/tools/admin_get_user.py)
+  ⎿  Added 1 line, removed 1 line
+      16  from typing import TYPE_CHECKING, Any, ClassVar
+      17  from uuid import UUID
+      18
+      19 -from pydantic import BaseModel, ConfigDict, Field
+      19 +from pydantic import BaseModel, ConfigDict
+      20
+      21  from mem_mcp.admin.errors import NotFoundError
+      22  from mem_mcp.admin.service import UserDetail, get_user
+
+● Update(src/mem_mcp/mcp/tools/admin_get_user.py)
+  ⎿  Added 1 line, removed 1 line
+      59          return inp.tenant_id, "tenant", {}
+      60
+      61      async def run(
+      62 -        self, conn: "asyncpg.Connection", ctx: ToolContext, inp: AdminGetUserInput
+      62 +        self, conn: asyncpg.Connection, ctx: ToolContext, inp: AdminGetUserInput
+      63      ) -> BaseModel:
+      64          assert isinstance(inp, AdminGetUserInput)
+      65          try:
+
+  Thought for 6s (ctrl+o to expand)
+
+● Bash(ruff check src/mem_mcp/admin/ src/mem_mcp/mcp/tools/_admin_base.py src/mem_mcp/mcp/tools/admin_find_user.py src/mem_mcp/mcp/tools/admin_get_user.py src/mem_mcp/…)
+  ⎿  32 | | from typing import TYPE_CHECKING, Any, ClassVar
+     33 | | from uuid import UUID
+     34 | |
+     … +27 lines (ctrl+o to expand)
+
+  Thought for 27s (ctrl+o to expand)
+
+● Two mypy issues: run override narrows inp, and ToolContext must be imported from _base (explicit re-export). Let me fix both tool files:
+
+● Update(src/mem_mcp/mcp/tools/admin_find_user.py)
+  ⎿  Added 2 lines, removed 1 line
+      17  from mem_mcp.audit.logger import AuditAction
+      18  from mem_mcp.auth.permissions import Permission
+      19  from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+      20 -from mem_mcp.mcp.tools._admin_base import AdminTool, ToolContext
+      20 +from mem_mcp.mcp.tools._admin_base import AdminTool
+      21 +from mem_mcp.mcp.tools._base import ToolContext
+      22
+      23  if TYPE_CHECKING:
+      24      import asyncpg  # type: ignore[import-untyped]
+
+● Update(src/mem_mcp/mcp/tools/admin_find_user.py)
+  ⎿  Added 1 line, removed 1 line
+      56          return None, None, {"query_len": len(inp.query)}
+      57
+      58      async def run(
+      59 -        self, conn: asyncpg.Connection, ctx: ToolContext, inp: AdminFindUserInput
+      59 +        self, conn: asyncpg.Connection, ctx: ToolContext, inp: BaseModel
+      60      ) -> BaseModel:
+      61          assert isinstance(inp, AdminFindUserInput)
+      62          try:
+
+● Update(src/mem_mcp/mcp/tools/admin_get_user.py)
+  ⎿  Added 2 lines, removed 1 line
+      24  from mem_mcp.auth.permissions import Permission
+      25  from mem_mcp.mcp.errors import JsonRpcError
+      26  from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+      27 -from mem_mcp.mcp.tools._admin_base import AdminTool, ToolContext
+      27 +from mem_mcp.mcp.tools._admin_base import AdminTool
+      28 +from mem_mcp.mcp.tools._base import ToolContext
+      29
+      30  if TYPE_CHECKING:
+      31      import asyncpg  # type: ignore[import-untyped]
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  laguna-s-2.1 · API Usage Billing
+ ▝▝   ▝▝   ~/laguna-bench/runs/T1-B1/repo
+
+
+✻ Conversation compacted (ctrl+o for history)
+
+
+  Thought for 1s (ctrl+o to expand)
+
+● Bash execution of the app import was blocked (sandbox "don't ask" mode blocks arbitrary python -c importing the full app). I'll rely on the sanctioned pytest path. Let me read what I need to build the test fixtures
+  correctly first:
+
+  Thought for 3s, read 2 files (ctrl+o to expand)
+  ⎿  Read src/mem_mcp/mcp/tools/_admin_base.py (176 lines)
+  ⎿  Read src/mem_mcp/mcp/tools/admin_get_user.py (75 lines)
+  ⎿  Read src/mem_mcp/mcp/tools/admin_find_user.py (78 lines)
+  ⎿  Referenced file src/mem_mcp/main.py
+  ⎿  Read tools/lint_tenant_scope.py (225 lines)
+
+● Good, the implementation files are intact. Now let me inspect the test infrastructure (fixtures, pool, audit logger, rbac) so the tests wire up correctly:
+
+  Thought for 3s, read 2 files (ctrl+o to expand)
+
+● Now let me look at the test fixtures and the _base module (ToolContext, ToolDeps, registry):
+
+  Thought for 7s, searched for 1 pattern, read 3 files (ctrl+o to expand)
+
+● Let me check how existing tool tests construct ToolContext with ToolDeps/audit, and the registry dispatch:
+
+  Thought for 3s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Let me see how existing tests build a ToolContext with ToolDeps + DbAuditLogger:
+
+  Thought for 4s, searched for 1 pattern (ctrl+o to expand)
+
+● Let me check the audit_log schema and tenant_system_roles table shape for test assertions:
+
+  Thought for 6s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Let me read the admin service I authored and the relevant schema columns:
+
+  Thought for 6s, read 3 files (ctrl+o to expand)
+
+● Now the schema details for audit_log, tenants, tenant_identities, roles_catalog, teams, team_role_assignments:
+
+  Thought for 4s, searched for 2 patterns, read 1 file (ctrl+o to expand)
+
+● tenant_identities lacks workspace_domain/default_team_id in the initial schema. I authored the service using those columns (per the work order). Let me confirm they exist in a later migration and check
+  roles_catalog/teams/team_role_assignments schemas:
+
+  Thought for 3s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Now teams and team_role_assignments schema (0015, 0022):
+
+  Thought for 1m 56s, read 2 files (ctrl+o to expand)
+
+● Let me confirm JsonRpcError's base class and the tenant_system_roles columns, then check an existing security test's structure:
+
+  Thought for 21s, read 3 files (ctrl+o to expand)
+
+● Let me check pyproject.toml for pytest markers/asyncio config and tools/lint_tenant_scope.py test:
+
+  Thought for 2m 23s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● I have everything needed. JsonRpcError subclasses Exception (so the except Exception in __call__ catches the -32602 from run() and audits "error"). Now I'll write the three test files plus the lint exemption case.
+
+● Write(tests/unit/test_admin_service_helpers.py)
+  ⎿  Wrote 208 lines to tests/unit/test_admin_service_helpers.py
+       1 """Unit (DB-free) tests for mem_mcp.admin helpers + AdminTool contract.
+       2
+       3 Covers:
+       4   - ``_escape_like`` and ``_clamp_limit`` (pure functions).
+       5   - ``find_users`` input gating (``ValueError`` before any SQL).
+       6   - ``AdminTool.__init_subclass__`` guards (system.* permission, admin.* action,
+       7     no ``__call__`` override, valid subclass is accepted).
+       8
+       9 No DB: the linter and escape/clamp math are transport-agnostic and must be
+      10 verifiable without Postgres.
+     … +198 lines (ctrl+o to expand)
+
+  Thought for 12s (ctrl+o to expand)
+
+● Let me fix the gating test class — use a clean AsyncMock for the valid-length case and a proper padded-query assertion:
+
+● Update(tests/unit/test_admin_service_helpers.py)
+  ⎿  Added 1 line, removed 1 line
+      11  """
+      12  from __future__ import annotations
+      13
+      14 -from unittest.mock import MagicMock
+      14 +from unittest.mock import AsyncMock, MagicMock
+      15  from uuid import uuid4
+      16
+      17  import pytest
+
+● Update(tests/unit/test_admin_service_helpers.py)
+  ⎿  Added 15 lines, removed 18 lines
+       98          with pytest.raises(ValueError, match="too short"):
+       99              await find_users(MagicMock(), query="   ")  # type: ignore[arg-type]
+      100
+      101 -    async def test_empty_after_strip_raises(self) -> None:
+      101 +    async def test_padded_query_stripped_then_rejected(self) -> None:
+      102 +        # "  a  " strips to "a" (len 1) → still too short.
+      103          with pytest.raises(ValueError, match="too short"):
+      103 -            await find_users(MagicMock(), query="  a  "[:0])  # type: ignore[arg-type]
+      104 +            await find_users(MagicMock(), query="  a  ")  # type: ignore[arg-type]
+      105
+      105 -    async def test_valid_length_does_not_raise_value_error(self, pg_pool=None) -> None:
+      106 -        # "ab" satisfies MIN_QUERY_LEN; it WILL touch the DB (conn.fetch), so we
+      107 -        # only assert the ValueError gate is NOT the failure for a 2-char query.
+      108 -        # Without a real pool this would raise on the (mock) fetch — guard that.
+      109 -        try:
+      110 -            await find_users(MagicMock(), query="ab")  # type: ignore[arg-type]
+      111 -        except ValueError:  # pragma: no cover - the gate should not fire here
+      112 -            pytest.fail("2-char query must pass the length gate")
+      113 -        except TypeError:
+      114 -            # MagicMock is not awaitable by asyncpg fetch → expected without a
+      115 -            # real connection; the only thing this test excludes is ValueError.
+      116 -            pass
+      117 -        except Exception:
+      118 -            # Any non-ValueError failure is fine: the gate passed; the mock conn
+      119 -            # just can't actually fetch. We only care the ValueError gate is clean.
+      120 -            pass
+      106 +    async def test_valid_length_passes_gate_and_queries_db(self) -> None:
+      107 +        # "ab" satisfies MIN_QUERY_LEN; use an AsyncMock so the fetch is
+      108 +        # deterministic and we assert the SQL path was actually entered (the
+      109 +        # length gate did NOT fire).
+      110 +        conn = AsyncMock()
+      111 +        conn.fetch.return_value = []
+      112 +        users = await find_users(conn, query="ab")  # type: ignore[arg-type]
+      113 +        assert users == []
+      114 +        args, _ = conn.fetch.call_args
+      115 +        # (sql, pattern, limit) — pattern must be "%" + escaped(q) + "%".
+      116 +        assert args[1] == "%ab%"
+      117 +        assert args[2] == DEFAULT_LIMIT
+      118
+      119
+      120  # ---------------------------------------------------------------------------
+
+  Thought for 6s (ctrl+o to expand)
+
+● Update(tests/unit/test_admin_service_helpers.py)
+  ⎿  Removed 1 line
+      12  from __future__ import annotations
+      13
+      14  from unittest.mock import AsyncMock, MagicMock
+      15 -from uuid import uuid4
+      15
+      16  import pytest
+      17
+
+  Thought for 3s (ctrl+o to expand)
+
+● Now the integration test for the service layer:
+
+✽ Moonwalking… (45m 1s · ↓ 34.7k tokens)
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · esc to interrupt · ← for agents
+

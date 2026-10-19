@@ -1,0 +1,260 @@
+● The implementation and new tests are written, but nothing has been run: Bash was denied in this session's "don't ask" mode, so I couldn't execute pytest, ruff, mypy or the baseline git stash comparison.
+
+  What changed
+
+  - src/mem_mcp/memory/versioning.py
+    - New memory_revision(id, updated_at), UpdateConflictError, lock_memory_for_update (the FOR UPDATE lookup) and resolve_current_id (recursive CTE, tenant-filtered, and non-deleted is_current preferred).
+  - src/mem_mcp/mcp/tools/get.py
+    - MemoryRecord.revision plus an after-validator that fills it from (id, updated_at).
+    - model_dump(mode="json") is the tool output path, so the field serializes.
+  - src/mem_mcp/mcp/tools/update.py
+    - Models: expected_revision input and revision output.
+    - Conflict checks: after the not-found/deleted checks, a superseded target gives -32000 update_conflict with current_id, and a stale expected_revision gives -32000 with current_revision and current_id.
+      UpdateConflictError is mapped with raise ... from e.
+    - Writes: the supersede UPDATE is conditional on is_current = true. The INSERT returns updated_at. Both in-place UPDATEs use GREATEST(now(), updated_at + interval '1 microsecond').
+  - src/mem_mcp/mcp/tool_descriptions.py
+    - Documented expected_revision, the output revision, and the conflict contract.
+  - tests/integration/test_update_concurrency.py (new)
+    - Covers your tests 1–7. It uses its own pool with max_size=14 and drains the access-bump tasks before closing.
+
+  Not done or checked
+
+  - Verification commands:
+    - pytest tests/unit/test_tools_update.py plus the new tests
+    - pytest tests/unit tests/integration against a baseline
+    - ruff check src tests and mypy
+    - The "tests 1, 2 and 5 fail on the original code" check.
+  - Mock compatibility:
+    - I used .get() for is_current and updated_at.
+    - The mock tests have fetchval and INSERT results without a datetime, so I fall back to datetime.now(UTC) when it isn't one.
+    - I haven't confirmed the existing unit tests pass.
+  - Unchecked callers:
+    - I did not edit the plugin SDK MemoryClient.update or web/handlers/memories.py.
+    - From reading, the SDK wraps -32000 as PluginValidationError(code="update_conflict"), and the web handler routes via _jsonrpc_to_http. I haven't checked how _jsonrpc_to_http maps -32000.
+  - bump_access: the SQL I read only sets last_accessed_at and access_count, so a read doesn't change updated_at. I didn't check whether a DB trigger touches updated_at.
+  - Sandbox tests: the new tests are unrun and may need small fixture fixes, such as the MemoryWriteInput type annotations or the cleanup table list.
+
+  If you allow Bash (or run ! pytest -q -p no:cacheprovider tests/unit/test_tools_update.py tests/integration/test_update_concurrency.py yourself), I can finish the verification and the stash comparison.
+
+✻ Cogitated for 1m 41s · done 6:17 AM
+
+❯ Work order 2 — verify order 1 and one small fix
+
+  The order-1 code review looks good. Two things now:
+
+  A. Small fix
+
+  src/mem_mcp/web/handlers/memories.py::_jsonrpc_to_http maps every -32000 to 403. An update conflict is not an
+  authz failure: when exc.code == -32000 and exc.data is a dict with data["code"] == "update_conflict", map
+  to HTTP 409. Leave all other mappings unchanged.
+
+  B. Run everything (this is required — you must actually execute the commands)
+
+  You have a Bash tool; please use it (if a command is refused, retry with a plain command such as
+  pytest -q -p no:cacheprovider tests/unit/test_tools_update.py, and report the exact refusal text if it still fails).
+
+  1. pytest -q -p no:cacheprovider tests/unit/test_tools_update.py tests/integration/test_update_concurrency.py
+     — fix any failure in the NEW tests or in the implementation (do not edit existing tests).
+  2. Prove the new tests catch the bugs: git stash push src/ (keep the new test file), run
+     pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py, record which tests fail,
+     then git stash pop. Expected: tag-add/remove, decision fork, superseded-id and same-expected-revision tests
+     fail (revision-related ones may fail on attribute errors — that's fine). Report the results.
+  3. Baseline vs. now for the full suite: git stash push src/ tests/integration/test_update_concurrency.py
+     (note: an untracked file needs -u; alternatively move it aside temporarily), run
+     pytest -q -p no:cacheprovider tests/unit tests/integration 2>&1 | tail -40, save the list of failing test
+     ids; restore; rerun with the change; report both failing sets and the diff (must be no new failures).
+     Also run pytest -q -p no:cacheprovider (whole suite incl. tests/security) once with the change and compare
+     in the same way if time permits.
+  4. ruff check src tests and ruff format --check on touched files, and mypy — fix issues in touched files.
+  5. Run the new concurrency test file 3 times in a row to check it is not flaky.
+
+  Report exact commands and pass/fail counts.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_018DA3WSAKDoiEc9UNpoDKVX
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Bash(pytest -q -p no:cacheprovider tests/unit/test_tools_update.py tests/integration/test_update_concurrency.py 2>&1 | tail -40)
+  ⎿  .................                                                        [100%]
+     17 passed in 1.00s
+
+● Update(src/mem_mcp/web/handlers/memories.py)
+  ⎿  Added 4 lines, removed 1 line
+      67      if exc.code == -32602:
+      68          status = 404 if exc.data and "not found" in exc.message.lower() else 400
+      69      elif exc.code == -32000:
+      70 -        status = 403  # scope errors, quota, etc.
+      70 +        if isinstance(exc.data, dict) and exc.data.get("code") == "update_conflict":
+      71 +            status = 409  # optimistic-concurrency / superseded target, not an authz failure
+      72 +        else:
+      73 +            status = 403  # scope errors, quota, etc.
+      74      elif exc.code == -32603:
+      75          status = 500
+      76      return HTTPException(
+
+● Bash(git stash push src/ && pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py 2>&1 | tail -25; git stash pop && git status --short)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Bash(git stash push src/)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Bash(pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py)
+  ⎿  .......                                                                  [100%]
+     7 passed in 0.93s
+
+● Bash(ruff check src tests)
+  ⎿  All checks passed!
+
+● Bash(mypy)
+  ⎿  Error: Exit code 1
+     tests/integration/test_update_concurrency.py:156: error: Value of type "dict[str, Any] | None" is not indexable  [index]
+     tests/integration/test_update_concurrency.py:207: error: Value of type "dict[str, Any] | None" is not indexable  [index]
+     tests/unit/test_web_memories_handler.py:309: error: Missing named argument "revision" for "MemoryUpdateOutput"  [call-arg]
+     Found 3 errors in 2 files (checked 332 source files)
+
+  Read 2 files (ctrl+o to expand)
+
+● Fixing two things: an existing unit test builds MemoryUpdateOutput without revision (so I'll give it a default), and mypy typing in my new test.
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 2 lines, removed 1 line
+      78      id: UUID
+      79      version: int
+      80      is_new_version: bool
+      81 -    revision: str
+      81      tags: list[str] | None
+      82 +    # Default keeps pre-existing constructors working; the tool always sets it.
+      83 +    revision: str = ""
+      84      request_id: str
+      85
+      86
+
+● Update(tests/integration/test_update_concurrency.py)
+  ⎿  Added 5 lines, removed 1 line
+      153
+      154
+      155  def _is_conflict(r: Any) -> bool:
+      156 -    return isinstance(r, JsonRpcError) and r.code == -32000 and r.data["code"] == "update_conflict"
+      156 +    return (
+      157 +        isinstance(r, JsonRpcError)
+      158 +        and r.code == -32000
+      159 +        and (r.data or {}).get("code") == "update_conflict"
+      160 +    )
+      161
+      162
+      163  async def test_concurrent_tag_add_and_remove_lose_nothing(env: dict[str, Any]) -> None:
+
+● Bash(sed -n 200,215p tests/integration/test_update_concurrency.py)
+  ⎿      v1 = await _write(ctx, f"decision {uuid4()}", "decision")
+         res = await asyncio.gather(
+             *[_try(ctx, id=v1, content=f"revised {i} {uuid4()}") for i in range(N)]
+     … +11 lines (ctrl+o to expand)
+
+● Update(tests/integration/test_update_concurrency.py)
+  ⎿  Added 1 line, removed 1 line
+      208      assert len(losses) == N - 1
+      209      for r in losses:
+      210          assert _is_conflict(r)
+      211 -        assert r.data["current_id"] == str(wins[0].id)
+      211 +        assert (r.data or {})["current_id"] == str(wins[0].id)
+      212      current, children = await _chain_state(env["pool"], env["tenant"], v1)
+      213      assert (current, children) == (1, 1)
+      214
+
+● Bash(mypy)
+  ⎿  Success: no issues found in 332 source files
+
+● Bash(ruff format --check src/mem_mcp/memory/versioning.py src/mem_mcp/mcp/tools/update.py src/mem_mcp/mcp/tools/get.py src/mem_mcp/mcp/tool_descriptions.py src/mem_m…)
+  ⎿  Error: Exit code 1
+     Would reformat: src/mem_mcp/memory/versioning.py
+     Would reformat: tests/integration/test_update_concurrency.py
+     2 files would be reformatted, 4 files already formatted
+
+● Bash(ruff format src/mem_mcp/memory/versioning.py tests/integration/test_update_concurrency.py && ruff check src tests && mypy)
+  ⎿  2 files reformatted
+     All checks passed!
+     Success: no issues found in 332 source files
+
+● Bash(for i in 1 2 3; do pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py 2>&1 | tail -2; done)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Bash(pytest -q -p no:cacheprovider 2>&1 | tail -40)
+  ⎿  SKIPPED [6] tests/security/test_sqli_probes.py:122: requires --live-aws flag to run (uses live AWS resources)
+     SKIPPED [1] tests/security/test_token_reuse.py:16: requires --live-aws flag to run (uses live AWS resources)
+     SKIPPED [1] tests/security/test_token_reuse.py:31: requires --live-aws flag to run (uses live AWS resources)
+     … +37 lines (ctrl+o to expand)
+
+● Bash(pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py)
+  ⎿  .......                                                                  [100%]
+     7 passed in 0.99s
+
+● Bash(pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py)
+  ⎿  .......                                                                  [100%]
+     7 passed in 0.70s
+
+● Bash(pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py tests/unit/test_tools_update.py tests/unit/test_web_memories_handler.py)
+  ⎿  ..........................                                               [100%]
+     =============================== warnings summary ===============================
+     tests/unit/test_web_memories_handler.py::test_list_memories_invalid_session_returns_401
+     … +28 lines (ctrl+o to expand)
+
+● Part A is done and the new tests pass, but I couldn't run the stash-based comparisons because git stash was refused. That leaves the baseline and "tests fail on original code" checks undone.
+
+  A. Fix
+
+  - _jsonrpc_to_http: src/mem_mcp/web/handlers/memories.py now maps -32000 with data["code"] == "update_conflict" to 409. Other -32000 errors still map to 403.
+  - MemoryUpdateOutput.revision: it now has a default of "" (the tool always sets it). The existing tests/unit/test_web_memories_handler.py builds MemoryUpdateOutput without revision, and mypy flagged it. This diverges
+    slightly from the spec's required revision: str.
+
+  B. Results
+
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────────┐
+  │                                                             Command                                                              │                                      Result                                      │
+  ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ pytest -q -p no:cacheprovider tests/unit/test_tools_update.py tests/integration/test_update_concurrency.py                       │ 17 passed                                                                        │
+  ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ pytest … tests/integration/test_update_concurrency.py tests/unit/test_tools_update.py tests/unit/test_web_memories_handler.py    │ 26 passed                                                                        │
+  │ (after the 409 fix)                                                                                                              │                                                                                  │
+  ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ ruff check src tests                                                                                                             │ clean                                                                            │
+  ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ mypy                                                                                                                             │ no issues in 332 files (the 3 errors it first reported are fixed)                │
+  ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ ruff format --check on touched files                                                                                             │ versioning.py and the new test file needed reformatting, now applied             │
+  ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Flakiness: tests/integration/test_update_concurrency.py run 3 times                                                              │ 7 passed, 7 passed, 7 passed. The first of the three came from before the        │
+  │                                                                                                                                  │ format/typing edits.                                                             │
+  ├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────────┤
+  │ Full suite pytest -q -p no:cacheprovider with the change                                                                         │ 18 failed, 1354 passed, 31 skipped, 16 errors                                    │
+  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────────┘
+
+  Not done
+
+  - Steps 2 and 3 (stash comparisons): the Bash tool refused git stash push src/ both in a compound command and on its own, with: "Permission to use Bash has been denied because Claude Code is running in don't ask mode."
+    I did not try to emulate the stash by hand-reverting files, since that would sidestep the refusal. As a result I have:
+    - no confirmation that tests 1, 2 and 5 fail on the original code;
+    - no baseline failure set to diff against.
+  - Full-suite failures:
+    - The 18 failures and 16 errors are in team/RBAC/schema fixtures (test_team_api, test_enterprise_*, test_roles_catalog, test_slugs_schema, test_effective_access_recompute, and so on).
+    - One is tests/security/test_scope_enforcement.py::TestStatsToolScopes::test_stats_tool_requires_read_scope.
+    - None touch memory_update, so they look like the known pre-existing failures. This is inferred from the test names, not verified.
+  - Cleanup: the src/ stash was never created, so nothing needs popping.
+
+  If you run ! git stash push src/ yourself, I can run the new test file and the full-suite baseline, then restore and diff.
+
+✻ Cogitated for 1m 9s · done 6:19 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ ! git stash push src/
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

@@ -1,0 +1,3 @@
+```json
+{"action":"retry","guidance":"The tests pass, but the harness rejects the module-level `pytestmark = pytest.mark.skipif(...)` at test_workflow.py:46. Delete it. Don't replace it with another skip, xfail or importorskip.\nCheck how neighbouring DB tests (tests/unit/mindmap/test_workflow_crud.py, test_workflow_moves.py) get a database. Use the same fixtures from conftest, and no env-var skip. If the DB is missing, the test should fail loudly.\nDon't weaken any assertion. Run `pytest tests/unit/mindmap/test_workflow.py -q` and confirm the tests run (0 skipped), then run ruff and mypy on the file.","new_tasks":[]}
+```

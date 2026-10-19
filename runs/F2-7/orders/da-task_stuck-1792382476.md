@@ -1,0 +1,3 @@
+```json
+{"action":"retry","guidance":"The RED FLAG is in tests/unit/mindmap/test_workflow_moves.py:12, `import asyncpg  # type: ignore[import-untyped]`. It isn't in src.\nRemove the ignore. Import asyncpg the way tests/unit/test_memory_references_schema.py does (plain `import asyncpg`), and run mypy on the test file to confirm.\nIf mypy still complains, put the import under `if TYPE_CHECKING:` with `from __future__ import annotations`, or annotate the fixtures with `Any`.\nAlso revert the `conn: Any` change in workflow_moves.py and use the same typed form as work_items.py/workflow_crud.py. Keep src typed unless that is impossible.\nDon't touch the mypy config. Re-run ruff, mypy and pytest.","new_tasks":[]}
+```

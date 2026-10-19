@@ -1,0 +1,11 @@
+{
+  "key": "wp1-t3-peer",
+  "status": "ok",
+  "compactions": 0,
+  "rc": 0,
+  "session_id": "ef6bb57b-97bc-4339-b0fb-98274bc3bc73",
+  "wall_s": 30,
+  "ctx_max": 36861,
+  "result": "I read the diff and the new `workflow_moves.py`. I did not run the tests, because the shell asked for approval on the combined command. My findings come from reading only.\n\nVERDICT: ISSUES\n1. src/mem_mcp/mindmap/workflow_moves.py:~sign_workflow_move: the sign-off check only requires team membership (`role is None`) and, when `signoff_roles` is empty, accepts any role. A viewer can therefore sign and count toward `signoff_min`. The move path requires `TEAM_WRITE_MEMORY`. The plan's rules also exclude only the owner and proposer, so check whether viewers should be allowed to sign.\n2. src/mem_mcp/mindmap/workflow_moves.py (sign, `current != req[\"from_stage\"]` branch): the code marks the request `cancelled` and then raises `StageConflictError`. The exception rolls back the surrounding `tenant_tx`, which undoes the cancel and the just-inserted signoff and history rows. The stale request stays pending forever, and each later signature hits the same error.\n3. src/mem_mcp/mindmap/work_items.py:460 (`mark_work_item`): the acceptance says `mark_work_item` routes via `move_work_item` when `workflow_id IS NOT NULL`. It is untouched, and `set_work_item_kind` only gets a pending-sign-off guard. It does not go through `move_work_item`/`propose_move`. This may be defensible, since marking creates the item and a kind change is not a stage move. But it departs from the acceptance and the plan, and no test covers it.\n4. src/mem_mcp/mindmap/workflow_moves.py (`sign_workflow_move`): the workflow id is recovered from the latest `work_item_history` 'signoff_requested' row, matched on stage names. This is fragile. `workflow_signoff_requests` does not store `workflow_id`, so a remap or a repeated from/to pair could pick the wrong workflow. A proper fix needs a request-level `workflow_id` column.",
+  "stderr_tail": ""
+}

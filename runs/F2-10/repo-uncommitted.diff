@@ -1,0 +1,71 @@
+diff --git a/src/mem_mcp/mindmap/workflow_moves.py b/src/mem_mcp/mindmap/workflow_moves.py
+index bbb0f08..d15ec37 100644
+--- a/src/mem_mcp/mindmap/workflow_moves.py
++++ b/src/mem_mcp/mindmap/workflow_moves.py
+@@ -447,7 +447,9 @@ async def sign_workflow_move(
+     updated = await conn.fetchrow(
+         "SELECT * FROM work_items WHERE memory_id=$1 AND tenant_id=$2", node_id, tenant_id
+     )
+-    map_row = await (await __import__("mem_mcp.mindmap.service", fromlist=["get_map_row"]).get_map_row)(conn, root_memory_id=root_memory_id)
++    from mem_mcp.mindmap import service as _svc
++
++    map_row = await _svc.get_map_row(conn, root_memory_id=updated["root_memory_id"])
+     return wi.WorkItem(
+         memory_id=updated["memory_id"],
+         root_memory_id=updated["root_memory_id"],
+diff --git a/tests/unit/mindmap/test_workflow_errors.py b/tests/unit/mindmap/test_workflow_errors.py
+index 6f90139..d6bc0d1 100644
+--- a/tests/unit/mindmap/test_workflow_errors.py
++++ b/tests/unit/mindmap/test_workflow_errors.py
+@@ -1,15 +1,22 @@
+ from __future__ import annotations
+ 
++import subprocess
+ import sys
+ 
+ import pytest
+ 
+-import mem_mcp.mindmap.workflow_errors as we
+-
+-# Ensure importing the module did not pull in the work_items module.
+-assert "mem_mcp.mindmap.work_items" not in sys.modules, (
+-    "workflow_errors must not import work_items at import time"
++# Import isolation must be checked in a fresh process: by the time this suite runs,
++# other tests may have already imported mem_mcp.mindmap.work_items.
++_proc = subprocess.run(
++    [sys.executable, "-c",
++     "import sys; import mem_mcp.mindmap.workflow_errors; "
++     "assert 'mem_mcp.mindmap.work_items' not in sys.modules"],
++    capture_output=True,
++    text=True,
+ )
++assert _proc.returncode == 0, _proc.stderr
++
++import mem_mcp.mindmap.workflow_errors as we
+ 
+ 
+ def test_workflow_error_base() -> None:
+diff --git a/tests/unit/mindmap/test_workflow_moves.py b/tests/unit/mindmap/test_workflow_moves.py
+index ae9231d..538e279 100644
+--- a/tests/unit/mindmap/test_workflow_moves.py
++++ b/tests/unit/mindmap/test_workflow_moves.py
+@@ -8,18 +8,15 @@ import pytest
+ from mem_mcp.db import tenant_tx
+ from mem_mcp.mindmap import work_items
+ from mem_mcp.mindmap.workflow_crud import (
+-    WorkflowNotFoundError,
+     activate_workflow,
+     create_team_workflow,
+ )
+ from mem_mcp.mindmap.workflow_errors import (
+-    MoveBlockedError,
+     ReasonRequiredError,
+-    SignoffNotAllowedError,
+     SignoffRequiredError,
+     TransitionNotFoundError,
+ )
+-from mem_mcp.mindmap.workflow_moves import WorkflowSignoffRequest, sign_workflow_move
++from mem_mcp.mindmap.workflow_moves import sign_workflow_move
+ from mem_mcp.teams.assignments import assign_role
+ 
+ pytestmark = pytest.mark.asyncio

@@ -1,0 +1,260 @@
+
+  1. **Lost tag edits.** Agent A adds tag `x` and agent B adds tag `y` to the same
+     node at the same moment; afterwards the node has only one of them.
+     (`tags_op="add"`/`"remove"` merges in Python against a row it read earlier.)
+  2. **Forked version chains.** Two agents update the content of the same
+     `decision` (a versioned type) concurrently; both calls "succeed" and the chain
+     now has **two current versions** superseding the same parent. The same fork
+     happens without any concurrency if a caller updates an id that has already
+     been superseded (it still holds an old id).
+  3. **Blind overwrites.** Agent A reads a node, thinks for a minute, writes its
+     rewrite; meanwhile agent B rewrote the node. A's write silently discards B's.
+     There is no way for a caller to say "only apply this if the memory is still
+     what I read".
+
+  Relevant code: `src/mem_mcp/mcp/tools/update.py` (memory_update),
+  `src/mem_mcp/mcp/tools/get.py` (memory_get, `MemoryRecord`),
+  `src/mem_mcp/memory/versioning.py`, `src/mem_mcp/db/tenant_tx.py`.
+
+  ## Required behaviour
+
+  ### Revision tokens (optimistic concurrency)
+
+  - Every memory has a **revision**: an opaque string that changes whenever the
+    memory is changed by `memory_update` (content, tags, type or metadata — any
+    successful update yields a new revision; two successive updates never yield
+    the same revision).
+  - `memory_get` exposes it as `memory.revision` (a `revision` field on
+    `MemoryRecord`, so it also appears on history records and anywhere else
+    `MemoryRecord` is returned). `MemoryRecord` must stay constructible from its
+    existing fields alone (no new required constructor argument), and a record
+    built that way must still report a non-empty string `revision` (including in
+    `model_dump()`).
+  - `memory_update` output gains `revision`: the revision of the row that now holds
+    the memory (on the versioned path, the **new** row's revision — it must equal
+    what `memory_get(new_id)` reports).
+  - `memory_update` input gains optional `expected_revision: str | None`. When
+    given and it does not equal the memory's current revision, the update is
+    refused and **nothing changes**. When omitted, behaviour is as today
+    (subject to the rules below).
+  - The check and the write must be atomic: if N callers concurrently send
+    updates with the same (currently valid) `expected_revision`, **exactly one**
+    succeeds and the other N−1 are refused.
+
+  ### Serialized updates (no lost updates even without a token)
+
+  - Concurrent `memory_update` calls on the same memory must behave as if they ran
+    one after another: concurrent `tags_op="add"` / `"remove"` calls all take
+    effect (none is lost); in-place content updates are last-writer-wins.
+  - A version chain never has more than one current row. Updating a memory that is
+    no longer current (it has been superseded, e.g. by a versioned content update
+    or a note→decision type promotion) is refused — whether the caller is late by
+    a millisecond (concurrent) or by a day (sequential). Of N concurrent content
+    updates to the same current `decision`, exactly one creates version 2; the
+    others are refused.
+
+  ### Conflict error contract
+
+  A refused update raises `JsonRpcError` with code **-32000** (application error)
+  and `data["code"] == "update_conflict"`, plus:
+  - `data["current_revision"]` — the memory's current revision (when refused for a
+    stale `expected_revision`), so the caller can re-read, merge and retry;
+  - `data["current_id"]` — the id (string) of the current version of the chain
+    (when refused because the target was superseded).
+
+  Not-found / deleted targets keep their existing -32602 errors.
+
+  Document the new parameter and the conflict contract in the `memory_update`
+  tool description (`mcp/tool_descriptions.py`).
+
+  ## Constraints
+
+  - Correctness must come from the database (row locking / conditional writes /
+    constraints), not from in-process locks — the server runs several workers.
+  - Keep the existing layering (`tenant_tx`, `JsonRpcError`). If you need a schema
+    change, add a new Alembic migration (`alembic/versions/`, next revision after
+    the current head); the scoring harness runs `alembic upgrade head` on a fresh
+    database before tests. A solution without a migration is fine.
+  - Backward compatible: existing callers that never send `expected_revision`
+    keep working; existing unit tests for `memory_update` (mock-based, in
+    `tests/unit/test_tools_update.py`) and the web/plugin callers must keep
+    passing. Do not change the plugin SDK's `MemoryClient.update` signature.
+  - Do not modify existing tests. Add your own, including **real concurrency
+    tests against Postgres** (e.g. `asyncio.gather` of several updates, each on its
+    own pooled connection — create a pool larger than the default `pg_pool`
+    fixture's 4 connections) that fail without your fix.
+  - The rest of the suite must not get new failures (some tests are red before
+    you start — pre-existing; leave them).
+
+  ## Running tests
+
+  `MEM_MCP_TEST_DSN` (and `MEM_MCP_DB_MAINT_DSN` for alembic) point at a fresh
+  migrated Postgres. Run e.g. `pytest -q -p no:cacheprovider tests/unit tests/integration`.
+  To create memories in DB-backed tests, set up a tenant + team + primary identity
+  with `default_team_id` (see `tests/integration/test_mindmap_e2e.py`) and use
+  `MemoryWriteTool` with a stub embedder. Note `memory_get` fires a background
+  access-count update; let it drain before closing a pool you created.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_01C2BgRtc8e9PGwTNfPNSXcj
+
+  Searched for 2 patterns, read 3 files (ctrl+o to expand)
+
+● Bash(wc -l tests/unit/test_tools_update.py && sed -n 1,120p tests/unit/test_tools_update.py && grep -n "fetchrow\|fetchval\|execute\|side_effect\|return_value" tests…)
+  ⎿  347 tests/unit/test_tools_update.py
+     """Tests for memory.update tool (T-7.2)."""
+     … +133 lines (ctrl+o to expand)
+
+● Bash(sed -n 130,240p tests/unit/test_tools_update.py; grep -rn "is_current\|superseded_by\|ON memories\|UNIQUE" alembic/versions/0001_initial_schema.py | head -30; g…)
+  ⎿      async def test_update_decision_content_change_creates_version(
+             self, monkeypatch: pytest.MonkeyPatch
+         ) -> None:
+     … +151 lines (ctrl+o to expand)
+
+● Bash(cat src/mem_mcp/db/tenant_tx.py | head -80; grep -rln "updated_at" alembic/versions | head; grep -rn "TRIGGER" alembic/versions | grep -i memor | head; sed -n 1…)
+  ⎿  """Tenant-scoped and system-scoped DB transactions.
+
+     The mem-mcp tenant isolation contract (LLD §5.2, spec §5.2):
+     … +132 lines (ctrl+o to expand)
+
+● Reviewed the code; writing the first work order for the executor now.
+
+● Write(~/laguna-bench/runs/T5-B2/orders/order-1.md)
+  ⎿  Wrote 58 lines to ../orders/order-1.md
+       1 # Work order 1 — No lost updates on `memory_update` (revision tokens + DB-serialized updates)
+       2
+       3 Read `CLAUDE.md` and `CONVENTIONS.md` first. Keep layering (`tenant_tx`, `JsonRpcError`). No in-process locks: correctness must come from Postgres (the server runs several workers).
+       4
+       5 ## Problems to fix
+       7 2. Concurrent versioned content updates of the same `decision`/`fact` fork the chain (two current rows superseding the same parent). Same fork happens sequentially when a caller updates an id that is alre
+         ady superseded.
+       8 3. No optimistic concurrency: callers can't say "only apply if still what I read".
+       9
+      10 Files: `src/mem_mcp/mcp/tools/update.py`, `src/mem_mcp/mcp/tools/get.py` (`MemoryRecord`), `src/mem_mcp/memory/versioning.py`, `src/mem_mcp/mcp/tool_descriptions.py`.
+     … +69 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh B T5-B2 ~/laguna-bench/runs/T5-B2/orders/order-1.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +21 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Bash(git status --short && git diff src/)
+  ⎿   M src/mem_mcp/mcp/tool_descriptions.py
+      M src/mem_mcp/mcp/tools/get.py
+      M src/mem_mcp/mcp/tools/update.py
+     … +386 lines (ctrl+o to expand)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Bash(sed -n 1,340p tests/integration/test_update_concurrency.py; sed -n 500,628p tests/integration/test_update_concurrency.py)
+  ⎿  # mypy: disable-error-code="attr-defined"
+     # BaseTool.__call__ is declared to return BaseModel, so mypy cannot see the
+     # concrete output models' fields. Suppressed at module level rather than with
+     … +466 lines (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/T5-B2/orders/order-2.md)
+  ⎿  Wrote 25 lines to ../orders/order-2.md
+       1 # Work order 2 — fixes after review of order 1
+       3 Good work on the core implementation. Please fix the following. Don't modify pre-existing tests.
+       4
+       6 1. `compute_revision` (`memory/versioning.py`): `int(ts.timestamp())` goes through a float and can round up near a second boundary (µs=999999), making two different timestamps collide. Compute epoch micro
+         s exactly with integer arithmetic, e.g. `(ts - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(microseconds=1)`. Add a unit test with `microsecond=999999` vs the next second's `microsecond=999999` (they mu
+       7 2. Fix the typo "Opague" in `get.py`.
+       8 3. Tool description (`mcp/tool_descriptions.py`, `memory_update`): you rewrote the existing guidance. Restore the original first paragraph, "Call when" paragraph and "Do not call for decision or fact type
+          -32000, `data.code="update_conflict"`, `current_revision` for stale tokens, `current_id` (+`current_revision`) when the target was superseded — e.g. by a versioned content update or a note→decision promo
+         tion — re-read/merge/retry, nothing written on refusal). Don't describe the token's internal derivation ("id + updated_at") — just call it opaque.
+      10 ## Missing integration tests (`tests/integration/test_update_concurrency.py`)
+     … +30 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh B T5-B2 ~/laguna-bench/runs/T5-B2/orders/order-2.md)
+  ⎿  {
+       "status": "ok",
+       "exit_code": 0,
+     … +21 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Bash(git status --short && git diff src/mem_mcp/memory/versioning.py src/mem_mcp/mcp/tool_descriptions.py | head -120; grep -n "Opague\|Opaque" src/mem_mcp/mcp/tools…)
+  ⎿   M src/mem_mcp/mcp/tool_descriptions.py
+      M src/mem_mcp/mcp/tools/get.py
+      M src/mem_mcp/mcp/tools/update.py
+     … +73 lines (ctrl+o to expand)
+
+● Source fixes landed; checking the new tests, then I'll send a verification-only order (full suite + fail-without-fix proof were skipped).
+
+● Bash(grep -n "async def test_\|_drain\|sleep" tests/integration/test_update_concurrency.py; grep -n "fork" -A75 tests/integration/test_update_concurrency.py | sed -n…)
+  ⎿  60:    Stub embedder sleeps 0.02s to widen the race window inside the FOR UPDATE
+     66:            await asyncio.sleep(0.02)
+     188:async def _drain_access_tasks() -> None:
+     … +155 lines (ctrl+o to expand)
+
+● Bash(sed -n 80,100p src/mem_mcp/memory/access_tracking.py; grep -rn "updated_at" src/mem_mcp/mcp/tools/write.py src/mem_mcp/mindmap 2>/dev/null | head)
+  ⎿              await conn.execute(
+                     f"""
+                     UPDATE memories
+     … +20 lines (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/T5-B2/orders/order-3.md)
+  ⎿  Wrote 14 lines to ../orders/order-3.md
+       1 # Work order 3 — verification only (no source changes expected)
+       2
+       3 The code from orders 1–2 looks good. Two verification steps from order 2 were not done. Please do them now and report exact outputs. Only change code if a step reveals a real problem (then explain it).
+       5 1. **Prove the new integration tests fail without the fix.**
+       6    - `git stash push -- src/` (stash ONLY src changes; tests stay).
+       7    - `pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py` — report the pass/fail per test and the failure reason in one line each. In particular I need to see that `test_6_concurre
+         nt_fork_decision`, `test_8_concurrent_tags_add_remove`, `test_8_concurrent_distinct_removes` (and the distinct-adds test if present) fail on assertions (lost tags / multiple successes / forked chain), not
+       8    - `git stash pop`; then `git status --short` and confirm all 4 src files are modified again.
+       9 2. **Full-suite regression check.**
+      10    - With changes: `pytest -q -p no:cacheprovider tests/unit tests/integration 2>&1 | tail -60` — collect the list of FAILED/ERROR node ids.
+     … +7 lines (ctrl+o to expand)
+
+● Bash(~/laguna-bench/bin/run_executor.sh B T5-B2 ~/laguna-bench/runs/T5-B2/orders/order-3.md)
+  ⎿  {
+       "status": "timeout",
+       "exit_code": 124,
+     … +20 lines (ctrl+o to expand)
+  ⎿  (timeout 2h 5m)
+
+● Executor timed out; checking that the stash didn't leave src reverted.
+
+● Bash(git status --short && git stash list && git diff --stat)
+  ⎿   M src/mem_mcp/mcp/tool_descriptions.py
+      M src/mem_mcp/mcp/tools/get.py
+      M src/mem_mcp/mcp/tools/update.py
+     … +10 lines (ctrl+o to expand)
+
+● Bash(git diff src/mem_mcp/memory/versioning.py src/mem_mcp/mcp/tools/get.py; git diff src/mem_mcp/mcp/tools/update.py | grep "^[+-]" | head -150)
+  ⎿  diff --git a/src/mem_mcp/mcp/tools/get.py b/src/mem_mcp/mcp/tools/get.py
+     index b2eb530..a06c806 100644
+     --- a/src/mem_mcp/mcp/tools/get.py
+     … +175 lines (ctrl+o to expand)
+
+● The timed-out run overwrote the reviewed source with a regressed version — the chain walk direction is wrong again, target["is_current"] breaks mock tests, float rounding reappears, and the superseded-with-no-live case
+  wrongly falls through to a write. I'm sending a recovery order to fix these regressions.
+
+● Write(~/laguna-bench/runs/T5-B2/orders/order-4.md)
+  ⎿  Wrote 29 lines to ../orders/order-4.md
+      1 # Work order 4 — RESTORE the reviewed source; it was overwritten
+      2
+      3 During order 3 (which timed out) the `src/` files were replaced with a different, regressed implementation. The current working tree is NOT the version I reviewed and approved after order 2. Problems in th
+        e current tree:
+      4 - `_find_current_in_chain` queries `WHERE superseded_by = $1` — it walks the chain **backwards** (finds the predecessor), so `current_id` is wrong.
+      6 - `target["is_current"]`, `target["updated_at"]`, `new_row["updated_at"]` use `[]` — the mock-based tests in `tests/unit/test_tools_update.py` pass rows without these keys → KeyError. Must use `.get()` wit
+        h defaults (is_current→True).
+      7 - `compute_revision` is back to float `dt.timestamp() * 1_000_000` (rounding collisions); signature changed to `str` id.
+      8 - `expected_revision` check runs before the superseded check, so a superseded target with a token gets no `current_id`.
+      9 - `MemoryUpdateOutput.revision` became required; the explanatory comments/docstring were lost.
+     … +30 lines (ctrl+o to expand)
+
+  Bash(~/laguna-bench/bin/run_executor.sh B T5-B2 ~/laguna-bench/runs/T5-B2/orders/order-4.md)
+  ⎿  Running… (28s · timeout 2h 5m)
+     (ctrl+b to run in background)
+
+✢ Thinking… (1h 59m 57s · ↓ 17.2k tokens)
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · esc to interrupt · ← for agents                                                                                                                                               /rc
+

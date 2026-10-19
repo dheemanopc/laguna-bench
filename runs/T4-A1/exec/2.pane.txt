@@ -1,0 +1,260 @@
+● Update(src/mem_mcp/mcp/tool_descriptions.py)
+  ⎿  Added 12 lines, removed 3 lines
+      425  Pass map_key to log the link as a map event. Required scope: memory.write.
+      426
+      427  Example: mindmap_link(source_memory_id="<challenge>", target_memory_id="<position>", reference_kind="displaced-from", map_key="caching-strategy").""",
+      428 -    "mindmap_get": """Read a map's current state — its root, all nodes, the edges between them, review status, and open loops.
+      428 +    "mindmap_get": """Read a map's current state — its root, open nodes, the edges between them, review status, open loops, and a change cursor.
+      429
+      430 -Call when: resuming a map mid-conversation; the user asks "where were we", "what have we got so far", "what's still open"; before graduating, to review what was built. open_loops lists nodes whose turn
+          -is the owner's (waiting on the user). Required scope: memory.read.
+      430 +Cheap by default: only OPEN nodes come back in `nodes`, with content cut to 200 chars (truncated=true marks a cut). Settled branches (resolved/dropped, see mindmap_resolve) appear as compact `resolved`
+          +entries with their resolution_summary. Every response carries a `cursor`; pass it back as `since` next time to get only the nodes touched since then (nothing changed → empty nodes/edges, same cursor). L
+          +evers: include="all" returns settled nodes in full too (with status); depth="full" returns whole node content. open_loops lists open nodes with a responsible_party (owner or model) — the resume surface,
+          + always over the whole map.
+      431
+      432 -Example: "Where did we get to on caching?" → mindmap_get(map_key="caching-strategy").""",
+      432 +Call when: resuming a map mid-conversation; the user asks "where were we", "what have we got so far", "what's still open"; before graduating, to review what was built. Do not call for: re-reading a map
+          +you already hold — use since=<cursor> instead of a full read. Required scope: memory.read.
+      433 +
+      434 +Example: "Where did we get to on caching?" → mindmap_get(map_key="caching-strategy"); later → mindmap_get(map_key="caching-strategy", since=42).""",
+      435 +    "mindmap_resolve": """Settle one branch of a live map as resolved or dropped, with a short summary of why.
+      436 +
+      437 +Stores the status on the node (the only source of truth for "settled" — a resolves-under edge from mindmap_link does not settle anything), removes it from open_loops, and logs a resolve/drop event whose
+          + id is returned as `cursor`. Optionally pass resolved_by_memory_id (the node that carries the resolution): a resolves-under (or dropped-under for disposition="dropped") edge from it to the settled node
+          +is recorded in the same step. resolution_summary is required (1-500 chars). Settling is one-way and map-local.
+      438 +
+      439 +Call when: a branch is settled — the user accepted a position, a challenge was answered, or a thread was abandoned on purpose ("drop that one"). Do not call for: closing the whole map or resolving its r
+          +oot (use mindmap_close); nodes of another map; archived maps; branches already settled. Required scope: memory.write.
+      440 +
+      441 +Example: mindmap_resolve(map_key="caching-strategy", node_id="<challenge>", resolution_summary="Ops burden accepted; Redis is managed.", resolved_by_memory_id="<position>").""",
+      442      "mindmap_review": """Run the structural reviewer pass over a map and reset its write-counter.
+      443
+      444  Call when mindmap_write_node returns review_due=true (every 15 owned writes), or before graduating. Returns the map's full structure (nodes, edges, recent events) for you — or a review sub-agent — to sm
+           oke-test for structural problems: orphan positions, unaddressed challenges, nodes that bundle multiple decisions, mislabeled ratifications. The reviewer looks at the MAP ONLY, never the transcript — it
+           catches mistakes, not cheating. It is advisory; it flags, it does not block. Required scope: memory.write.
+
+● Core code is in place; now docs and tests.
+
+  Read 2 files (ctrl+o to expand)
+
+● Update(docs/mindmap-v1-build-design.md)
+  ⎿  Added 1 line
+      131  | `mindmap_write_node` | owned capture | takes **map key** + content + `node_role` (position/challenge/decision) + optional ratification + optional links; writes a core memory, inserts exclusive members
+           hip, bumps `writes_since_review`, logs event. Past a soft byte threshold → returns a **split-suggested** flag (split into linked nodes, never trim). At `writes_since_review >= review_threshold` → return
+           s a sticky `review_due` flag. |
+      132  | `mindmap_link` | typed edge | insert into `memory_references` with a map `reference_kind` |
+      133  | `mindmap_get` | resume/inspect | return the map graph: root, member nodes, edges, open loops (whose-turn), pending flags, state |
+      134 +| `mindmap_resolve` | branch status | settle ONE open branch of a live map as `resolved`/`dropped` with a required ≤500-char `resolution_summary`; optional resolving node → `resolves-under`/`dropped-und
+          +er` edge; logs a `resolve`/`drop` event, returns its id as `cursor`. Root cannot be resolved (use `mindmap_close`); archived maps are immutable. |
+      135  | `mindmap_review` | reviewer | run the map-only structural pass (advisory), surface flags, reset `writes_since_review` to 0 |
+      136  | `mindmap_close` | `close_map` + graduation | propose significant decisions → **human confirms** → for each: new KB `memory_write` (type `decision`) with a `promoted-from` edge to the archived node, ca
+           rrying trajectory + ratification metadata → mint spec-index node → `state='archived'`. |
+      137
+
+● Update(docs/mindmap-v1-build-design.md)
+  ⎿  Added 27 lines
+      188  | 6 | Graduation: propose → confirm → promote-with-`promoted-from` → archive | confirmed decisions become KB decisions referencing archived nodes; archived excluded from search, walkable via refs |
+      189  | 7 | Reviewer + ratification gradient + split-flag | counter hits 15 → sticky `review_due`; `mindmap_review` clears it; gradient + split-flag logged and surfaced |
+      190
+      191 +## Branch status & cheap reads
+      192 +
+      193 +Until now only `mindmap_close` settled anything (the whole map), so open loops
+      194 +only grew and `mindmap_get` re-sent every node in full. Migration `0044` adds
+      195 +per-node status to `memory_map_membership`:
+      196 +
+      197 +```
+      198 +status                 text not null default 'open'   -- open | resolved | dropped
+      199 +resolution_summary     text null                      -- 1..500 chars
+      200 +resolved_by_memory_id  uuid null references memories(id) on delete set null
+      201 +resolved_by_party      text null                      -- owner | model
+      202 +resolved_at            timestamptz null
+      203 +```
+      204 +
+      205 +A CHECK keeps it consistent: `open` ⇒ all resolution columns NULL; settled ⇒
+      206 +summary, party and time present. **Status is the only source of truth for
+      207 +"settled"** — never inferred from `reference_kind`; a `resolves-under` edge
+      208 +drawn by `mindmap_link` alone does not settle a node. `memory_map_events` gets an
+      209 +`(root_memory_id, id)` index; the event id is the map's **cursor**.
+      210 +
+      211 +`mindmap_get` reads are cheap by default: `include="open"` (settled branches as
+      212 +compact `resolved` entries), `depth="summary"` (content cut at
+      213 +`SUMMARY_CHARS=200` + `…`, `truncated=true`), always a `cursor`; `since=<cursor>`
+      214 +returns only nodes touched since (nothing changed → empty). `include="all"` and
+      215 +`depth="full"` opt out. `open_loops` = open members with
+      216 +`metadata.responsible_party` ∈ {owner, model}, computed over the whole map.
+      217 +
+      218  ## ADRs to record
+      219
+      220  - **ADR-0007** — `position`/`challenge` node types added to core; non-versioned
+
+● Update(skills/mindmap-driver/SKILL.md)
+  ⎿  Added 15 lines
+      33  **Atomicity:** one idea per node. If `split_suggested` comes back true, split
+      34  the node into linked nodes — never trim or compress.
+      35
+      36 +## Settle branches & read cheaply
+      37 +When a branch is done, call `mindmap_resolve` with `node_id`, a short required
+      38 +`resolution_summary` (≤500 chars), `disposition` `resolved` (default) or
+      39 +`dropped`, and optionally `resolved_by_memory_id` (the node carrying the
+      40 +resolution — an edge is drawn for you). Status is stored on the node; an edge
+      41 +from `mindmap_link` alone does NOT settle it. The root is settled with
+      42 +`mindmap_close`, not here.
+      43 +
+      44 +`mindmap_get` is cheap by default (open nodes, content cut at 200 chars,
+      45 +settled branches listed compactly under `resolved`). Keep the returned `cursor`
+      46 +and pass it as `since` on the next read to get only what changed. Use
+      47 +`include="all"` to see settled nodes in full and `depth="full"` for whole
+      48 +content. `open_loops` is the resume surface: open nodes whose turn is the
+      49 +`owner`'s or the `model`'s.
+      50 +
+      51  ## Ratify
+      52  When the user endorses a position, record it on the node:
+      53  `ratification_strength` ∈ `survived-challenge` > `explicit-endorse` >
+
+● Write(tests/unit/test_mindmap_resolve_models.py)
+  ⎿  Wrote 104 lines to tests/unit/test_mindmap_resolve_models.py
+       1 """DB-free tests for mindmap_resolve input validation and mindmap_get read levers."""
+       2
+       3 from __future__ import annotations
+       4
+       5 from uuid import uuid4
+       6
+       7 import pytest
+       8 from pydantic import ValidationError
+       9
+      10 from mem_mcp.mcp.tools.mindmap_get import MindmapGetInput, summarize_content
+     … +94 lines (ctrl+o to expand)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Write(tests/integration/test_mindmap_resolve_e2e.py)
+  ⎿  Wrote 473 lines to tests/integration/test_mindmap_resolve_e2e.py
+      1 """End-to-end tests for mindmap branch status: mindmap_resolve + cheap mindmap_get reads.
+      2
+      3 Real tools against a live Postgres pool. Covers settle/drop, every refusal path
+      4 (each must leave the DB untouched), status-vs-edge independence, open_loops,
+      5 include/depth levers, the since/cursor flow and the migration-0044 CHECKs.
+      6 Fixture modelled on tests/integration/test_mindmap_e2e.py (UUID-suffixed names).
+      7 """
+      8
+      9 from __future__ import annotations
+     … +463 lines (ctrl+o to expand)
+
+● The code, migration, docs and tests are written, but I couldn't run any of them because Bash is denied in this session ("don't ask mode"). Nothing is verified yet.
+
+  Files written
+  - alembic/versions/0044_2026_10_15_mindmap_branch_status.py: the new memory_map_membership columns, named CHECKs, the (root_memory_id, id) events index, and a working downgrade().
+  - src/mem_mcp/mindmap/service.py: log_event now returns the event id. It also gains current_cursor, fetch_member, settle_member and touched_since, the MapNodeNotFoundError and NodeNotOpenError exceptions, and
+    fetch_members returns the status columns.
+  - src/mem_mcp/mindmap/__init__.py: SUMMARY_CHARS = 200.
+  - src/mem_mcp/mcp/tools/mindmap_resolve.py: the new tool, registered in src/mem_mcp/main.py.
+  - src/mem_mcp/mcp/tools/mindmap_get.py: since, include, depth, status, truncated, cursor, resolved, the open_loops fix, and a summarize_content helper.
+  - src/mem_mcp/mcp/tool_descriptions.py: updated mindmap_get and new mindmap_resolve entries.
+  - docs/mindmap-v1-build-design.md and skills/mindmap-driver/SKILL.md: tool table row, "Branch status & cheap reads" section, and driver guidance.
+  - tests/unit/test_mindmap_resolve_models.py and tests/integration/test_mindmap_resolve_e2e.py: new files; no existing tests were touched.
+
+  Not done
+  - alembic upgrade head, plus the downgrade/upgrade round-trip.
+  - pytest on the new tests and the full suite, and the baseline-vs-change comparison of pre-existing failures.
+  - ruff check, ruff format --check, mypy, and the tenant-scope linter test.
+
+  Open points
+  - When resolved_by_memory_id is given, the accessibility check runs before the map/state/membership checks, because it has to happen in a system_tx before the write transaction. An inaccessible resolver on an archived
+    map therefore reports memory_not_accessible, not map_not_live. The self-reference check also runs first.
+  - I haven't yet confirmed that mindmap_close accepts an empty confirmed_decisions list, which the archived-map test relies on.
+
+  Allow Bash, or run ! alembic upgrade head && pytest -q -p no:cacheprovider tests/unit tests/integration yourself. Then I can finish verification and fix whatever fails.
+
+✻ Brewed for 2m 54s · done 11:52 PM
+
+❯ Work order 2 — verify order 1, plus two small fixes
+
+  Good work on order 1; the design is right. Nothing has been run yet, so verification is the priority.
+  Bash should now be usable. If it is still denied, say so in the first line of your report and stop.
+
+  Fixes
+
+  1. src/mem_mcp/mcp/tools/mindmap_resolve.py: validate the map and node before the resolver access
+     check, so that an unknown map, an archived map, a non-member node, the root or an already-settled node
+     gets its own error even when resolved_by_memory_id is also given (a stray resolver id must never hide
+     a "wrong map" error). Suggested flow:
+     (a) a read tenant_tx: team → map → live → member → not root → open (the existing errors);
+     (b) if a resolver is given: self-check, then the system_tx resolve_reference_target check;
+     (c) a write tenant_tx: re-check map live, then settle_member (conditional UPDATE →
+     NodeNotOpenError → node_not_open), insert_reference, log_event, all in that one tx.
+     In (c), re-fetch the member to get team_id, or carry it over from (a). Add a test: resolve on a node
+     of another map AND with a valid resolver → -32602 with path node_id, nothing changed.
+  2. service.MapNodeNotFoundError is unused. Remove it or use it. Don't leave dead code.
+
+  Verify (exact commands, report the results)
+
+  1. alembic upgrade head, then alembic downgrade -1 && alembic upgrade head.
+  2. pytest -q -p no:cacheprovider tests/unit/test_mindmap_resolve_models.py tests/integration/test_mindmap_resolve_e2e.py tests/integration/test_mindmap_e2e.py. Everything must pass. Fix the code (or your
+     new tests, if a test itself is wrong) until it does.
+  3. pytest -q -p no:cacheprovider tests/unit tests/integration, then the full pytest -q -p no:cacheprovider.
+     For every failure, decide whether it is pre-existing: check it against git stash -u → run that
+     test → git stash pop (the DB being at 0044 doesn't affect the old code), or reason from the error
+     if it's obviously a known fixture collision. List the failures and say which are new. There must be
+     no new failures, including registry/tool-count/description-completeness tests and
+     tests/unit/test_lint_tenant_scope.py.
+  4. ruff check src tests, ruff format --check on the files you touched (format them if needed),
+     and mypy (project config). No new errors in touched files.
+
+  Report: changes made, and each command with its exact pass/fail counts.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_012orJeBzHVTGpLQLV2XyNyL
+
+● Bash(git status --short && alembic upgrade head 2>&1 | tail -5)
+  ⎿   A alembic/versions/0044_2026_10_15_mindmap_branch_status.py
+      M docs/mindmap-v1-build-design.md
+      M skills/mindmap-driver/SKILL.md
+     … +8 lines (ctrl+o to expand)
+
+● Update(src/mem_mcp/mindmap/service.py)
+  ⎿  Removed 4 lines
+      147      )
+      148
+      149
+      150 -class MapNodeNotFoundError(Exception):
+      151 -    """The node is not a (live) member of this map."""
+      152 -
+      153 -
+      150  class NodeNotOpenError(Exception):
+      151      """The node's branch is already settled (resolved/dropped) — settling is one-way."""
+      152
+
+  Read 1 file (ctrl+o to expand)
+
+● Bash(python - <<'EOF'
+      p='src/mem_mcp/mcp/tools/mindmap_resolve.py'…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Bash is still denied, so I can't apply fix 1 or run any verification. Fix 2 is already in the working tree.
+
+  Done
+  - Fix 2: I removed the unused MapNodeNotFoundError from src/mem_mcp/mindmap/service.py.
+
+  Not done
+  - Fix 1 (reordering the checks in mindmap_resolve.py, plus the new "other map's node with a valid resolver" test). I had no way to write the file except through a Bash heredoc, which was denied. I can redo it with the
+    Write tool if you want to proceed that way.
+  - Every verification step: the migration upgrade and downgrade round-trip, the three pytest runs, the pre-existing-failure comparison via git stash, ruff check, ruff format --check, and mypy.
+
+  An earlier Bash call in this turn (git status and alembic upgrade head) did run, but its alembic output was empty, so I can't tell whether the migration actually applied. That call and this one were both subject to the
+  same permission mode, so it seems intermittent.
+
+  To proceed, either allow Bash for this session or run these yourself and paste the output:
+  ! alembic upgrade head && alembic downgrade -1 && alembic upgrade head
+  ! pytest -q -p no:cacheprovider tests/unit/test_mindmap_resolve_models.py tests/integration/test_mindmap_resolve_e2e.py tests/integration/test_mindmap_e2e.py
+  Tell me which you prefer, and whether I should apply fix 1 with the Write tool in the meantime.
+
+✻ Baked for 27s · done 11:53 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Bash is allowed now, go ahead
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

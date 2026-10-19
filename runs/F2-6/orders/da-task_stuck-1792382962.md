@@ -1,0 +1,3 @@
+```json
+{"action":"retry","guidance":"1) Remove the added `pytest.mark.skipif(not os.getenv(\"MEM_MCP_TEST_DSN\"), ...)` at line 25 and the unused `import os`. The harness rejects any skip, xfail or importorskip. The DSN is always set here, so the tests run unconditionally.\n2) Around line 428, `if m1_item is not None:` can skip the role_restricted board assertion without anyone noticing. Replace it with `assert m1_item is not None`, then the blocked_reason assertion. If m1's board doesn't contain the item, fix the setup so it does (for example pass the right map or team scope), and don't drop the check.\n3) Keep the other assertions. Run `pytest tests/integration/test_mindmap_workflow_web_e2e.py -q`, confirm 0 skipped, then run ruff and mypy.","new_tasks":[]}
+```

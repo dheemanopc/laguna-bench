@@ -1,0 +1,61 @@
+NOTICE:  database "lb_t6green_1014090" does not exist, skipping
+......................................xxxxxx....F....................... [ 43%]
+..............................xxx....................................... [ 86%]
+.......................                                                  [100%]
+=================================== FAILURES ===================================
+_______ TestOutputFields.test_non_default_field_values_asserted_exactly ________
+
+self = <tests.integration.test_memory_list_behaviour.TestOutputFields object at 0x702f135b8bf0>
+list_tenant = {'identity_id': UUID('87cfce38-d4df-4ca5-8c01-c8b8498aab42'), 'pool': <asyncpg.pool.Pool object at 0x702f13183a00>, 'tenant_id': UUID('1f8f7f14-22cc-4ab8-b140-9cde232f5c1d')}
+
+    async def test_non_default_field_values_asserted_exactly(
+        self, list_tenant: Any
+    ) -> None:
+        """A memory with non-default values for every writable field must be
+        returned with those exact values."""
+        t = list_tenant
+        deleted = datetime.now(tz=UTC)
+        expires = datetime.now(tz=UTC) + timedelta(days=1)
+        created = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+        async with t["pool"].acquire() as conn:
+            async with conn.transaction():
+                mem_id = await _insert_memory(
+                    conn,
+                    t["tenant_id"],
+                    "custom field content",
+                    type="challenge",
+                    tags=["x", "y"],
+                    created_at=created,
+                    updated_at=created + timedelta(hours=1),
+                    deleted_at=deleted,
+                    expires_at=expires,
+                    indexable=False,
+                    embedding_status="failed_unknown",
+                    is_current=False,
+                )
+    
+        ctx = _build_ctx(t["pool"], t["tenant_id"], t["identity_id"])
+        out = await MemoryListTool()(
+            ctx, MemoryListInput(include_deleted=True, include_expired=True, include_history=True)
+        )
+        assert len(out.results) == 1
+        item = out.results[0]
+        assert item.id == mem_id
+        assert item.content == "custom field content"
+        assert item.type == "challenge"
+        assert item.tags == ["x", "y"]
+        assert item.version == 1
+        assert item.is_current is False
+        assert item.deleted_at == deleted
+        assert item.expires_at == expires
+        assert item.indexable is False
+>       assert item.embedding_status == "pending"
+E       AssertionError: assert 'failed_unknown' == 'pending'
+E         
+E         - pending
+E         + failed_unknown
+
+tests/integration/test_memory_list_behaviour.py:1152: AssertionError
+=========================== short test summary info ============================
+FAILED tests/integration/test_memory_list_behaviour.py::TestOutputFields::test_non_default_field_values_asserted_exactly
+1 failed, 157 passed, 9 xfailed in 3.79s

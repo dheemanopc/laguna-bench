@@ -1,0 +1,205 @@
+NOTICE:  database "sc_t1_h_1334467" does not exist, skipping
+..F..FFF.......F.......F.......F.F.                                      [100%]
+=================================== FAILURES ===================================
+_________________ TestPermissionGate.test_system_admin_allowed _________________
+
+self = <tests.integration.test_admin_tools.TestPermissionGate object at 0x7ba5ecb153a0>
+admin_ctx = ToolContext(request_id='9fa47247-6d2d-49e1-96ae-c5ffbdd237d2', tenant_id=UUID('509c10f7-218f-41bb-a23c-fff5c36d0137'),...uotas object at 0x7ba5ecb9e2a0>, nli=<mem_mcp.memory.contradiction.NoopContradictionChecker object at 0x7ba5ecb9e570>))
+
+    async def test_system_admin_allowed(self, admin_ctx: ToolContext) -> None:
+        """The same call succeeds once the caller holds system_admin."""
+        tool = AdminFindUserTool()
+        output = await tool(admin_ctx, AdminFindUserInput(query="admin-"))
+>       assert output.count >= 1  # type: ignore[attr-defined]
+               ^^^^^^^^^^^^
+
+tests/integration/test_admin_tools.py:149: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = AdminFindUserOutput(users=[AdminUserSummary(tenant_id=UUID('0aadd21b-abd0-47b6-982f-4d593fb520a8'), display_name=None,...', is_primary=True, system_role='system_admin', last_seen_at=None)], request_id='9fa47247-6d2d-49e1-96ae-c5ffbdd237d2')
+item = 'count'
+
+    def __getattr__(self, item: str) -> Any:
+        private_attributes = object.__getattribute__(self, '__private_attributes__')
+        if item in private_attributes:
+            attribute = private_attributes[item]
+            if hasattr(attribute, '__get__'):
+                return attribute.__get__(self, type(self))  # type: ignore
+    
+            try:
+                # Note: self.__pydantic_private__ cannot be None if self.__private_attributes__ has items
+                return self.__pydantic_private__[item]  # type: ignore
+            except KeyError as exc:
+                raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}') from exc
+        else:
+            # `__pydantic_extra__` can fail to be set if the model is not yet fully initialized.
+            # See `BaseModel.__repr_args__` for more details
+            try:
+                pydantic_extra = object.__getattribute__(self, '__pydantic_extra__')
+            except AttributeError:
+                pydantic_extra = None
+    
+            if pydantic_extra and item in pydantic_extra:
+                return pydantic_extra[item]
+            else:
+                if hasattr(self.__class__, item):
+                    return super().__getattribute__(item)  # Raises AttributeError if appropriate
+                else:
+                    # this is the current error
+>                   raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
+E                   AttributeError: 'AdminFindUserOutput' object has no attribute 'count'
+
+../../../../../wt/lead/.venv/lib/python3.12/site-packages/pydantic/main.py:1042: AttributeError
+__________ TestAuditTrail.test_denial_records_the_missing_permission ___________
+
+self = <tests.integration.test_admin_tools.TestAuditTrail object at 0x7ba5ecb16ab0>
+plain_ctx = ToolContext(request_id='61b8803d-f0a5-4c34-82e2-9768401aff15', tenant_id=UUID('bf1cc6c3-7e05-4041-8dfd-db436e6d7223'),...uotas object at 0x7ba5ecb9fb60>, nli=<mem_mcp.memory.contradiction.NoopContradictionChecker object at 0x7ba5ecb9fb90>))
+pg_pool = <asyncpg.pool.Pool object at 0x7ba5ecccb640>
+
+    async def test_denial_records_the_missing_permission(
+        self, plain_ctx: ToolContext, pg_pool: Any
+    ) -> None:
+        import json
+    
+        with pytest.raises(JsonRpcError):
+            await AdminGetUserTool()(plain_ctx, AdminGetUserInput(tenant_id=uuid4()))
+    
+        rows = await _audit_rows(pg_pool, plain_ctx.tenant_id)
+        details = rows[0]["details"]
+        if isinstance(details, str):
+            details = json.loads(details)
+>       assert details["via"] == "mcp"
+               ^^^^^^^^^^^^^^
+E       KeyError: 'via'
+
+tests/integration/test_admin_tools.py:188: KeyError
+_____________ TestFindUsers.test_matches_email_case_insensitively ______________
+
+self = <tests.integration.test_admin_tools.TestFindUsers object at 0x7ba5ecb16d80>
+admin_ctx = ToolContext(request_id='038fd9f6-231d-41da-b113-3faa043689a1', tenant_id=UUID('88556d10-48cd-4aa2-83c0-350ebd60d779'),...uotas object at 0x7ba5ecb9f290>, nli=<mem_mcp.memory.contradiction.NoopContradictionChecker object at 0x7ba5ecb9f2f0>))
+pg_pool = <asyncpg.pool.Pool object at 0x7ba5eccca980>
+
+    async def test_matches_email_case_insensitively(
+        self, admin_ctx: ToolContext, pg_pool: Any
+    ) -> None:
+        async with system_tx(pg_pool) as conn:
+            rows = await find_users(conn, query="ADMIN-")
+>       assert any(r.tenant_id == str(admin_ctx.tenant_id) for r in rows)
+E       assert False
+E        +  where False = any(<generator object TestFindUsers.test_matches_email_case_insensitively.<locals>.<genexpr> at 0x7ba5eca95fc0>)
+
+tests/integration/test_admin_tools.py:198: AssertionError
+____________________ TestFindUsers.test_rejects_short_query ____________________
+
+self = <tests.integration.test_admin_tools.TestFindUsers object at 0x7ba5ecb15430>
+pg_pool = <asyncpg.pool.Pool object at 0x7ba5ecccb4c0>
+
+    async def test_rejects_short_query(self, pg_pool: Any) -> None:
+        async with system_tx(pg_pool) as conn:
+>           with pytest.raises(ValueError):
+E           Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/integration/test_admin_tools.py:202: Failed
+____________________ TestGetUser.test_resolves_system_roles ____________________
+
+self = <tests.integration.test_admin_tools.TestGetUser object at 0x7ba5ecb44920>
+admin_ctx = ToolContext(request_id='ea86d4bb-898f-4ff8-b145-51b9571aa0d6', tenant_id=UUID('a1a8102d-73a1-4797-982b-70c456c8bffd'),...uotas object at 0x7ba5ecb9c950>, nli=<mem_mcp.memory.contradiction.NoopContradictionChecker object at 0x7ba5ecb9e240>))
+pg_pool = <asyncpg.pool.Pool object at 0x7ba5eccc9f00>
+
+    async def test_resolves_system_roles(self, admin_ctx: ToolContext, pg_pool: Any) -> None:
+        async with system_tx(pg_pool) as conn:
+            detail = await get_user(conn, tenant_id=admin_ctx.tenant_id)
+>       assert "system_admin" in detail.system_roles
+                                 ^^^^^^^^^^^^^^^^^^^
+
+tests/integration/test_admin_tools.py:238: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = AdminUserDetail(tenant_id=UUID('a1a8102d-73a1-4797-982b-70c456c8bffd'), display_name=None, email='admin-a1a8102d-73a1-...UUID('b4108576-6466-45de-86ce-f15784cf478f'), is_primary=True, system_role='system_admin', last_seen_at=None, teams=[])
+item = 'system_roles'
+
+    def __getattr__(self, item: str) -> Any:
+        private_attributes = object.__getattribute__(self, '__private_attributes__')
+        if item in private_attributes:
+            attribute = private_attributes[item]
+            if hasattr(attribute, '__get__'):
+                return attribute.__get__(self, type(self))  # type: ignore
+    
+            try:
+                # Note: self.__pydantic_private__ cannot be None if self.__private_attributes__ has items
+                return self.__pydantic_private__[item]  # type: ignore
+            except KeyError as exc:
+                raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}') from exc
+        else:
+            # `__pydantic_extra__` can fail to be set if the model is not yet fully initialized.
+            # See `BaseModel.__repr_args__` for more details
+            try:
+                pydantic_extra = object.__getattribute__(self, '__pydantic_extra__')
+            except AttributeError:
+                pydantic_extra = None
+    
+            if pydantic_extra and item in pydantic_extra:
+                return pydantic_extra[item]
+            else:
+                if hasattr(self.__class__, item):
+                    return super().__getattribute__(item)  # Raises AttributeError if appropriate
+                else:
+                    # this is the current error
+>                   raise AttributeError(f'{type(self).__name__!r} object has no attribute {item!r}')
+E                   AttributeError: 'AdminUserDetail' object has no attribute 'system_roles'. Did you mean: 'system_role'?
+
+../../../../../wt/lead/.venv/lib/python3.12/site-packages/pydantic/main.py:1042: AttributeError
+_ TestGateCannotBeBypassed.test_every_admin_tool_declares_a_system_permission __
+
+self = <tests.unit.test_admin_tools.TestGateCannotBeBypassed object at 0x7ba5ecb9ca70>
+
+    def test_every_admin_tool_declares_a_system_permission(self) -> None:
+        """A tool with no required_permission would gate on nothing."""
+        for tool_cls in ADMIN_TOOLS:
+            assert issubclass(tool_cls, AdminTool)
+            perm = tool_cls.required_permission
+>           assert isinstance(perm, Permission)
+E           AssertionError: assert False
+E            +  where False = isinstance('system.manage_tenants', Permission)
+
+tests/unit/test_admin_tools.py:36: AssertionError
+____________________ TestClampLimit.test_default_when_none _____________________
+
+self = <tests.unit.test_admin_tools.TestClampLimit object at 0x7ba5ecb9d910>
+
+    def test_default_when_none(self) -> None:
+>       assert _clamp_limit(None) == 20
+               ^^^^^^^^^^^^^^^^^^
+
+tests/unit/test_admin_tools.py:78: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+limit = None
+
+    def _clamp_limit(limit: int) -> int:
+        """Clamp a caller-supplied limit to [1, MAX_LIMIT]; defaults to DEFAULT_LIMIT when < 1."""
+>       if limit < 1:
+           ^^^^^^^^^
+E       TypeError: '<' not supported between instances of 'NoneType' and 'int'
+
+src/mem_mcp/admin/service.py:100: TypeError
+__________________________ TestClampLimit.test_floor ___________________________
+
+self = <tests.unit.test_admin_tools.TestClampLimit object at 0x7ba5ecb9dc10>
+
+    def test_floor(self) -> None:
+>       assert _clamp_limit(0) == 1
+E       assert 20 == 1
+E        +  where 20 = _clamp_limit(0)
+
+tests/unit/test_admin_tools.py:84: AssertionError
+=========================== short test summary info ============================
+FAILED tests/integration/test_admin_tools.py::TestPermissionGate::test_system_admin_allowed
+FAILED tests/integration/test_admin_tools.py::TestAuditTrail::test_denial_records_the_missing_permission
+FAILED tests/integration/test_admin_tools.py::TestFindUsers::test_matches_email_case_insensitively
+FAILED tests/integration/test_admin_tools.py::TestFindUsers::test_rejects_short_query
+FAILED tests/integration/test_admin_tools.py::TestGetUser::test_resolves_system_roles
+FAILED tests/unit/test_admin_tools.py::TestGateCannotBeBypassed::test_every_admin_tool_declares_a_system_permission
+FAILED tests/unit/test_admin_tools.py::TestClampLimit::test_default_when_none
+FAILED tests/unit/test_admin_tools.py::TestClampLimit::test_floor - assert 20...
+8 failed, 27 passed in 0.96s

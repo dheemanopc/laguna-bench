@@ -1,0 +1,260 @@
+      127 +                    action=cast(AuditAction, self.audit_action),
+      128                      result="denied",
+      129                      tenant_id=ctx.tenant_id,
+      130                      identity_id=ctx.identity_id,
+     ...
+      151                  async with system_tx(ctx.db_pool) as audit_conn:
+      152                      await deps.audit.audit(
+      153                          audit_conn,
+      154 -                        action=self.audit_action,
+      154 +                        action=cast(AuditAction, self.audit_action),
+      155                          result="error",
+      156                          tenant_id=ctx.tenant_id,
+      157                          identity_id=ctx.identity_id,
+
+  Thought for 4s (ctrl+o to expand)
+
+● Let me verify the _admin_base.py casts landed correctly in __call__:
+
+  Thought for 4m 52s, read 1 file (ctrl+o to expand)
+
+● mypy runs and is definitive. Key findings:
+  1. _admin_base.py cast fix was needed (the 3 arg-type errors confirm it) — done.
+  2. test_admin_tools.py: the stub # type: ignore[misc] on class lines are unused (the real errors are [misc] "Cannot override ClassVar with instance variable" on the required_permission: Any = lines, and _NoRun needs
+     instantiation to trigger the abstract TypeError, and dispatch is async but was called without await).
+  3. test_admin_service.py:117: the # type: ignore[arg-type] is unused (remove).
+  4. teams.deleted_at exists (migration 0001 line 160) — get_user's SQL is valid.
+
+  The prior session's "refined" plan (stub models, exact __call__ signature) was never actually written to disk — the file has the older Any+ignore version. Let me rewrite test_admin_tools.py cleanly (mypy-correct:
+  ClassVar[Permission], no unused ignores, await on async dispatch, proper None-guards, _NoRun() instantiation):
+
+● Write(tests/unit/test_admin_tools.py)
+  ⎿  Added 44 lines, removed 16 lines
+      10
+      11  from __future__ import annotations
+      12
+      13 -from typing import Any
+      13 +from typing import Any, ClassVar
+      14  from unittest.mock import MagicMock
+      15  from uuid import uuid4
+      16
+      17  import pytest
+      18
+      19 -from mem_mcp.admin.errors import NotFoundError
+      19 +from mem_mcp.audit.logger import DbAuditLogger
+      20 +from mem_mcp.auth.permissions import Permission
+      21  from mem_mcp.mcp.errors import JsonRpcError
+      22  from mem_mcp.mcp.registry import ToolRegistry
+      23  from mem_mcp.mcp.tools._admin_base import AdminTool
+     ...
+      31      AdminGetUserInput,
+      32      AdminGetUserTool,
+      33  )
+      33 -from mem_mcp.audit.logger import DbAuditLogger
+      34 -from mem_mcp.auth.permissions import Permission
+      34
+      35  pytestmark = pytest.mark.asyncio
+      36
+     ...
+      106  # DB-free: AdminTool base-class guards
+      107  # --------------------------------------------------------------------------
+      108
+      109 +# The stub subclasses below deliberately fail AdminTool.__init_subclass__ (or
+      110 +# abc) in a specific way. They use ClassVar[Permission] so they type-check as
+      111 +# valid attribute overrides of AdminTool's class variables; the validation
+      112 +# happens at runtime in __init_subclass__, not in mypy.
+      113 +_STUB_INPUT: type = ...
+      114 +_STUB_OUTPUT: type = ...
+      115
+      116 +
+      117 +def _stub_input() -> type:
+      118 +    from pydantic import BaseModel, ConfigDict
+      119 +
+      120 +    class _StubInput(BaseModel):
+      121 +        model_config = ConfigDict(extra="forbid")
+      122 +
+      123 +    return _StubInput
+      124 +
+      125 +
+      126 +def _stub_output() -> type:
+      127 +    from pydantic import BaseModel, ConfigDict
+      128 +
+      129 +    class _StubOutput(BaseModel):
+      130 +        model_config = ConfigDict(extra="forbid")
+      131 +
+      132 +    return _StubOutput
+      133 +
+      134 +
+      135  class TestAdminToolGuards:
+      136      def test_requires_required_permission(self) -> None:
+      137          with pytest.raises(TypeError, match="must define required_permission"):
+      138
+      115 -            class _NoPerm(AdminTool):  # type: ignore[misc]
+      139 +            class _NoPerm(AdminTool):
+      140                  name = "x"
+      141                  audit_action = "admin.x"
+      142                  InputModel = object  # type: ignore[assignment]
+     ...
+      145      def test_rejects_team_scoped_permission(self) -> None:
+      146          with pytest.raises(ValueError, match="system-scoped"):
+      147
+      124 -            class _TeamPerm(AdminTool):  # type: ignore[misc]
+      148 +            class _TeamPerm(AdminTool):
+      149                  name = "x"
+      126 -                required_permission: Any = Permission.TEAM_VIEW
+      150 +                required_permission: ClassVar[Permission] = Permission.TEAM_VIEW
+      151                  audit_action = "admin.x"
+      152                  InputModel = object  # type: ignore[assignment]
+      153                  OutputModel = object  # type: ignore[assignment]
+     ...
+      155      def test_rejects_non_admin_audit_action(self) -> None:
+      156          with pytest.raises(ValueError, match="start with 'admin.'"):
+      157
+      134 -            class _BadAction(AdminTool):  # type: ignore[misc]
+      158 +            class _BadAction(AdminTool):
+      159                  name = "x"
+      136 -                required_permission: Any = Permission.SYSTEM_MANAGE_TENANTS
+      160 +                required_permission: ClassVar[Permission] = Permission.SYSTEM_MANAGE_TENANTS
+      161                  audit_action = "memory.write"
+      162                  InputModel = object  # type: ignore[assignment]
+      163                  OutputModel = object  # type: ignore[assignment]
+     ...
+      165      def test_rejects_call_override(self) -> None:
+      166          with pytest.raises(TypeError, match="must not override __call__"):
+      167
+      144 -            class _CallOverride(AdminTool):  # type: ignore[misc]
+      168 +            class _CallOverride(AdminTool):
+      169                  name = "x"
+      146 -                required_permission: Any = Permission.SYSTEM_MANAGE_TENANTS
+      151 -                async def __call__(self, ctx: Any, inp: Any) -> Any:  # type: ignore[override]
+      175 +                async def __call__(self, ctx: Any, inp: Any) -> Any:
+      176                      ...
+      177
+      178      def test_subclass_without_run_is_abstract(self) -> None:
+      179          # perm + action valid, but no run() → abc forbids instantiation.
+      180          with pytest.raises(TypeError, match="abstract"):
+      181
+      158 -            class _NoRun(AdminTool):  # type: ignore[misc]
+      182 +            class _NoRun(AdminTool):
+      183                  name = "x"
+      160 -                required_permission: Any = Permission.SYSTEM_MANAGE_TENANTS
+      184 +                required_permission: ClassVar[Permission] = Permission.SYSTEM_MANAGE_TENANTS
+      185                  audit_action = "admin.x"
+      186                  InputModel = object  # type: ignore[assignment]
+      187                  OutputModel = object  # type: ignore[assignment]
+      188
+      189 +            _NoRun()  # type: ignore[type-abstract]
+      190 +
+      191      def test_real_tools_instantiate(self) -> None:
+      192          assert AdminFindUserTool().name == "memsys_admin_find_user"
+      193          assert AdminGetUserTool().name == "memsys_admin_get_user"
+     ...
+      216          assert defs["memsys_admin_find_user"]["required_scope"] == "memory.read"
+      217          assert "query" in defs["memsys_admin_find_user"]["inputSchema"]["properties"]
+      218
+      193 -    def test_scope_gate_fires_before_tool(self) -> None:
+      219 +    async def test_scope_gate_fires_before_tool(self) -> None:
+      220          """No memory.read scope → -32000 insufficient_scope (no tool call)."""
+      221          r = ToolRegistry()
+      222          r.register(AdminFindUserTool)
+      223          ctx = _ctx(tenant_id=uuid4(), db_pool=MagicMock(), scopes=frozenset())
+      224          with pytest.raises(JsonRpcError) as exc_info:
+      199 -            r.dispatch(ctx, "memsys_admin_find_user", {"query": "ab"})  # type: ignore[arg-type]
+      225 +            await r.dispatch(ctx, "memsys_admin_find_user", {"query": "ab"})
+      226          assert exc_info.value.code == -32000
+      227 +        assert exc_info.value.data is not None
+      228          assert exc_info.value.data["code"] == "insufficient_scope"
+      229
+      230
+     ...
+      303          assert exc_info.value.code == -32603
+      304          assert exc_info.value.data == {"missing_permission": "system.manage_tenants"}
+      305          row = await _audit_row(pg_pool, ctx)
+      306 +        assert row is not None
+      307          assert row["result"] == "denied"
+  ⎿  Read tests/unit/test_admin_tools.py (308 lines)
+  ⎿  Read src/mem_mcp/mcp/tools/_admin_base.py (178 lines)
+  ⎿  Referenced file src/mem_mcp/mcp/tool_descriptions.py
+  ⎿  Referenced file src/mem_mcp/main.py
+  ⎿  Read src/mem_mcp/admin/service.py (215 lines)
+
+  Thought for 9s (ctrl+o to expand)
+
+● I accidentally left dead helpers (_STUB_INPUT/_stub_input/_stub_output) in the rewrite — removing them:
+
+● Update(tests/unit/test_admin_tools.py)
+  ⎿  Removed 22 lines
+      110  # abc) in a specific way. They use ClassVar[Permission] so they type-check as
+      111  # valid attribute overrides of AdminTool's class variables; the validation
+      112  # happens at runtime in __init_subclass__, not in mypy.
+      113 -_STUB_INPUT: type = ...
+      114 -_STUB_OUTPUT: type = ...
+      115 -
+      116 -
+      117 -def _stub_input() -> type:
+      118 -    from pydantic import BaseModel, ConfigDict
+      119 -
+      120 -    class _StubInput(BaseModel):
+      121 -        model_config = ConfigDict(extra="forbid")
+      122 -
+      123 -    return _StubInput
+      124 -
+      125 -
+      126 -def _stub_output() -> type:
+      127 -    from pydantic import BaseModel, ConfigDict
+      128 -
+      129 -    class _StubOutput(BaseModel):
+      130 -        model_config = ConfigDict(extra="forbid")
+      131 -
+      132 -    return _StubOutput
+      133 -
+      134 -
+      113  class TestAdminToolGuards:
+      114      def test_requires_required_permission(self) -> None:
+      115          with pytest.raises(TypeError, match="must define required_permission"):
+
+  Thought for 9s (ctrl+o to expand)
+
+● Now test_admin_service.py. I need its exact current content (the summary references line numbers but I haven't seen the full file):
+
+  Thought for 9s, read 1 file (ctrl+o to expand)
+
+● I have the actual file now (the prior summary's line numbers were from a different working version). Let me run the authoritative checks — mypy and ruff — on the changed files in parallel:
+
+● Bash(python -m mypy src/mem_mcp/mcp/tools/_admin_base.py tests/unit/test_admin_tools.py tests/unit/test_admin_service.py 2>&1 | tail -40)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Bash(python -m ruff check tests/unit/test_admin_tools.py tests/unit/test_admin_service.py src/mem_mcp/mcp/tools/_admin_base.py 2>&1 | tail -40)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 2m 54s (ctrl+o to expand)
+
+● I can't run mypy/ruff (Bash is denied in this environment), so I need to read the project config to resolve rule details authoritatively. Let me check pyproject.toml for ruff/mypy settings, and verify the
+  _admin_base.py success-path audit line:
+
+  Thought for 4m 3s, read 2 files (ctrl+o to expand)
+
+● Now I have the config. Key facts:
+  - ruff: select = ["E","F","W","I","B","UP","N","RUF"], no PGH → bare # type: ignore is allowed by ruff, but the codebase consistently uses coded ignores.
+  - mypy: strict = true, warn_unused_ignores = true → every # type: ignore[code] in tests must be genuinely used.
+
+  Critically, my Read shows _admin_base.py line 169 (the success-path audit) is still uncast (action=self.audit_action) while lines 127/154 (denied/error) are cast — the prior session's replace_all only hit 2 of 3. Let
+  me confirm the denied/error lines are cast so I only fix the success one:
+
+● Reading 1 file… (ctrl+o to expand)
+  ⎿  src/mem_mcp/mcp/tools/_admin_base.py
+
+✶ Cascading… (1h 57m 47s · ↓ 48.5k tokens · still thinking)
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · esc to interrupt · ← for agents
+

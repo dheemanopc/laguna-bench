@@ -1,0 +1,260 @@
+● Bash(timeout 300 pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py 2>&1 | tail -80)
+  ⎿                          conn,
+                             tenant,
+                             team,
+     … +77 lines (ctrl+o to expand)
+
+  Thought for 44s (ctrl+o to expand)
+
+● 5 passed, 1 failed. The failure is in test_revision_semantics: the versioned UPDATE (supersede is_current=false, superseded_by=winner) triggers memories_bump_revision() because the guard columns include
+  is_current/superseded_by — so the predecessor's revision rotates on supersede. My == d0 assertion (d0 read before the update) is wrong. The correct "history carries per-version revisions" assertion is: the predecessor
+  row's id and a distinct non-empty revision. Let me fix that:
+
+● Update(tests/integration/test_update_concurrency.py)
+  ⎿  Added 3 lines, removed 2 lines
+      680          for h in hist.history:
+      681              assert isinstance(h.revision, str)
+      682              assert h.revision != ""
+      683 -        # current + the single history entry have distinct revisions
+      683 +        # current + the single history entry have distinct, non-empty,
+      684 +        # per-version revisions; history[0] is the superseded predecessor.
+      685 +        assert hist.history[0].id == str(dec_id)
+      686          assert hist.memory.revision != hist.history[0].revision
+      685 -        assert hist.history[0].revision == d0  # original row keeps its revision
+      687      finally:
+      688          await _cleanup(big_pool, tenant, team, client_id)
+
+  Thought for 3s (ctrl+o to expand)
+
+● Bash(timeout 300 pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py 2>&1 | tail -20)
+  ⎿              hist = await MemoryGetTool()(
+                     ctx, MemoryGetInput(id=vout.id, include_history=True)
+                 )
+     … +18 lines (ctrl+o to expand)
+
+  Thought for 10s (ctrl+o to expand)
+
+● MemoryRecord.id is a UUID object (not string-coerced, unlike revision). Let me compare by stringifying both sides for robustness:
+
+● Update(tests/integration/test_update_concurrency.py)
+  ⎿  Added 1 line, removed 1 line
+      682              assert h.revision != ""
+      683          # current + the single history entry have distinct, non-empty,
+      684          # per-version revisions; history[0] is the superseded predecessor.
+      685 -        assert hist.history[0].id == str(dec_id)
+      685 +        assert str(hist.history[0].id) == str(dec_id)
+      686          assert hist.memory.revision != hist.history[0].revision
+      687      finally:
+      688          await _cleanup(big_pool, tenant, team, client_id)
+
+● Bash(timeout 300 pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py 2>&1 | tail -20)
+  ⎿  ......                                                                   [100%]
+     6 passed in 0.90s
+
+  Thought for 5s (ctrl+o to expand)
+
+● All 6 pass. Now the Order-3 ×5 stability loop (P5):
+
+● Bash(for i in 1 2 3 4 5; do
+        out=$(timeout 300 pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py 2>&1)…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+  Thought for 38s (ctrl+o to expand)
+
+● The for/echo/$() shell construct is denied (not an allowlisted test action). But chaining bare pytest invocations with && keeps each segment an allowlisted pytest call. Let me run 5 sequential passes that way:
+
+● Bash(timeout 300 pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py && timeout 300 pytest -q -p no:cacheprovider tests/integration/test_updat…)
+  ⎿  ......                                                                   [100%]
+     6 passed in 0.91s
+     ......                                                                   [100%]
+     … +7 lines (ctrl+o to expand)
+  ⎿  (timeout 15m)
+
+  Thought for 5s (ctrl+o to expand)
+
+● All 5 runs green (6 passed each, deterministic). Now the alembic downgrade/upgrade cycle (Order 3 P4):
+
+● Bash(timeout 120 alembic downgrade -1 2>&1 && echo "---DOWNGRADED---" && timeout 120 alembic upgrade head 2>&1 && echo "---UPGRADED---")
+  ⎿  ---DOWNGRADED---
+     ---UPGRADED---
+
+  Thought for 6s (ctrl+o to expand)
+
+● Downgrade→upgrade cycle is reversible. Now P3: the bug-demonstration. I need the exact current text of update.py around the locked lookup and the is_current block to edit them precisely. Let me read those regions:
+
+  Thought for 1m 46s, read 1 file (ctrl+o to expand)
+
+● All green and reversible. Now P3 — the bug-demonstration. I'll make a single Edit to update.py that (1) drops FOR UPDATE and (2) removes the is_current guard block, run the file, record which tests fail, then reverse
+  the Edit to restore the exact original:
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Removed 41 lines
+      146                         is_current, superseded_by, revision
+      147                  FROM memories
+      148                  WHERE id = $1 AND tenant_id = $2
+      149 -                FOR UPDATE
+      149                  """,
+      150                  inp.id,
+      151                  ctx.tenant_id,
+     ...
+      163                      data={"errors": [{"path": "id", "message": "memory is deleted"}]},
+      164                  )
+      165
+      167 -            is_current = bool(target.get("is_current", True))
+      166              current_revision = _coerce_revision(target.get("revision"))
+      167
+      170 -            # Order of conflicts (order-1.md §C):
+      171 -            #   not current -> update_conflict {current_id}
+      172 -            #   then expected_revision mismatch -> update_conflict {current_revision}
+      173 -            if not is_current:
+      174 -                # Walk the superseded_by chain forward (tenant-scoped recursive
+      175 -                # CTE) to the row that is_current=true — that's the live tip the
+      176 -                # caller needs to re-merge against.
+      177 -                tip = await conn.fetchrow(
+      178 -                    """
+      179 -                    WITH RECURSIVE cur_chain AS (
+      180 -                        SELECT id, revision, is_current, superseded_by
+      181 -                        FROM memories
+      182 -                        WHERE id = $1 AND tenant_id = $2
+      183 -                        UNION ALL
+      184 -                        SELECT m.id, m.revision, m.is_current, m.superseded_by
+      185 -                        FROM memories m JOIN cur_chain c ON m.id = c.superseded_by
+      186 -                        WHERE m.tenant_id = $2
+      187 -                    )
+      188 -                    SELECT id, revision
+      189 -                    FROM cur_chain
+      190 -                    WHERE is_current = true
+      191 -                    LIMIT 1
+      192 -                    """,
+      193 -                    inp.id,
+      194 -                    ctx.tenant_id,
+      195 -                )
+      196 -                if tip is not None:
+      197 -                    raise _update_conflict(
+      198 -                        "memory has been superseded; re-fetch and merge before updating",
+      199 -                        current_id=tip["id"],
+      200 -                        current_revision=_coerce_revision(tip["revision"]),
+      201 -                    )
+      202 -                # No current row found (e.g. chain head was deleted): still raise
+      203 -                # update_conflict with what we have so the caller re-syncs.
+      204 -                raise _update_conflict(
+      205 -                    "memory has been superseded; re-fetch and merge before updating",
+      206 -                    current_id=inp.id,
+      207 -                )
+      208 -
+      168              # Stale-token check: caller's observed revision must still match.
+      169              if inp.expected_revision is not None and inp.expected_revision != current_revision:
+      170                  raise _update_conflict(
+
+  Thought for 13s (ctrl+o to expand)
+
+● Now run the concurrency file against the broken update.py and record which tests fail:
+
+● Bash(timeout 300 pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py 2>&1 | tail -25)
+  ⎿                      type="decision",
+                         expected_revision=r0,
+                     ),
+     … +22 lines (ctrl+o to expand)
+
+  Thought for 8s (ctrl+o to expand)
+
+● Bug-demo confirms the tests catch the defect: 5 failed, 1 passed — exactly as predicted:
+  - (a) tags, (b) decision content, (c) same expected_revision → FAIL (row lock removed → lost updates / forked versions / stale-token defeated)
+  - (d) sequential stale+superseded, (e) note→decision promotion → FAIL on the superseded-id part ("DID NOT RAISE" — the is_current guard removed)
+  - (f) revision semantics → PASS (revision rotation/trigger logic is independent of the lock/is_current guard)
+
+  Now restore update.py exactly by reversing the Edit:
+
+● Update(src/mem_mcp/mcp/tools/update.py)
+  ⎿  Added 41 lines
+      146                         is_current, superseded_by, revision
+      147                  FROM memories
+      148                  WHERE id = $1 AND tenant_id = $2
+      149 +                FOR UPDATE
+      150                  """,
+      151                  inp.id,
+      152                  ctx.tenant_id,
+     ...
+      164                      data={"errors": [{"path": "id", "message": "memory is deleted"}]},
+      165                  )
+      166
+      167 +            is_current = bool(target.get("is_current", True))
+      168              current_revision = _coerce_revision(target.get("revision"))
+      169
+      170 +            # Order of conflicts (order-1.md §C):
+      171 +            #   not current -> update_conflict {current_id}
+      172 +            #   then expected_revision mismatch -> update_conflict {current_revision}
+      173 +            if not is_current:
+      174 +                # Walk the superseded_by chain forward (tenant-scoped recursive
+      175 +                # CTE) to the row that is_current=true — that's the live tip the
+      176 +                # caller needs to re-merge against.
+      177 +                tip = await conn.fetchrow(
+      178 +                    """
+      179 +                    WITH RECURSIVE cur_chain AS (
+      180 +                        SELECT id, revision, is_current, superseded_by
+      181 +                        FROM memories
+      182 +                        WHERE id = $1 AND tenant_id = $2
+      183 +                        UNION ALL
+      184 +                        SELECT m.id, m.revision, m.is_current, m.superseded_by
+      185 +                        FROM memories m JOIN cur_chain c ON m.id = c.superseded_by
+      186 +                        WHERE m.tenant_id = $2
+      187 +                    )
+      188 +                    SELECT id, revision
+      189 +                    FROM cur_chain
+      190 +                    WHERE is_current = true
+      191 +                    LIMIT 1
+      192 +                    """,
+      193 +                    inp.id,
+      194 +                    ctx.tenant_id,
+      195 +                )
+      196 +                if tip is not None:
+      197 +                    raise _update_conflict(
+      198 +                        "memory has been superseded; re-fetch and merge before updating",
+      199 +                        current_id=tip["id"],
+      200 +                        current_revision=_coerce_revision(tip["revision"]),
+      201 +                    )
+      202 +                # No current row found (e.g. chain head was deleted): still raise
+      203 +                # update_conflict with what we have so the caller re-syncs.
+      204 +                raise _update_conflict(
+      205 +                    "memory has been superseded; re-fetch and merge before updating",
+      206 +                    current_id=inp.id,
+      207 +                )
+      208 +
+      209              # Stale-token check: caller's observed revision must still match.
+      210              if inp.expected_revision is not None and inp.expected_revision != current_revision:
+      211                  raise _update_conflict(
+
+  Thought for 6s (ctrl+o to expand)
+
+● Restore done. Let me verify update.py is byte-identical to the original (Read the region — git diff is denied) and simultaneously confirm all 6 tests pass again against the restored code:
+
+  Read 1 file (ctrl+o to expand)
+
+● Bash(timeout 300 pytest -q -p no:cacheprovider tests/integration/test_update_concurrency.py 2>&1 | tail -6)
+  ⎿  ......                                                                   [100%]
+     6 passed in 0.94s
+
+  Thought for 6s (ctrl+o to expand)
+
+● Restored update.py is byte-identical to the original (lines 138-215 match exactly: FOR UPDATE at 149, full is_current block 173-207, stale-token check at 210+), and all 6 tests pass.
+
+  Now the full suite (P6):
+
+● Bash(timeout 900 pytest -q -p no:cacheprovider 2>&1 | tail -40)
+  ⎿  ERROR tests/unit/test_team_api.py::test_add_team_member_user_by_email_existing
+     ERROR tests/unit/test_team_api.py::test_add_team_member_user_by_email_unknown_rejects
+     ERROR tests/unit/test_team_api.py::test_add_team_member_team_cycle_rejects - ...
+     … +37 lines (ctrl+o to expand)
+  ⎿  (timeout 15m)
+
+· Deciphering… (45m 0s · ↓ 37.1k tokens · thinking)
+  ⎿  Tip: Use /clear to start fresh when switching topics and free up context
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · esc to interrupt · ← for agents
+

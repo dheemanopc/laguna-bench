@@ -1,0 +1,78 @@
+ ▐▛███▛█   Claude Code v2.1.292
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   ~/laguna-bench/runs/F2-3/repo
+
+
+❯ You are the ARCHITECT supervising an engineer who does all of the work on the feature below. This is the plan gate
+  (round 2). Review: the engineer's integration plan ~/laguna-bench/runs/F2-3/repo/docs/feature/03-plan.md: are the work packages complete (every requirement delivered by some WP), correctly ordered, each with
+  a test plan that would catch real defects?
+  Read as much as you need (the repository at ~/laguna-bench/runs/F2-3/repo, the engineer's documents under ~/laguna-bench/runs/F2-3/repo/docs/feature, earlier reviews and
+  orders in ~/laguna-bench/runs/F2-3/orders). Judge against the REQUEST, the existing codebase and its conventions. Spend your effort READING;
+  keep your OUTPUT SHORT. Write to ~/laguna-bench/runs/F2-3/orders/review-plan-2.md — first line exactly "VERDICT: APPROVE" or "VERDICT: REVISE", then at most 5
+  numbered findings, most important first, each one line with evidence (file:line, doc section or gate line). Hard cap 250
+  words. APPROVE only if the stage is good enough to build on; minor nits go in findings without blocking. No code, no
+  rewrites, no praise. Then end your turn.
+
+  === REQUEST ===
+  F2 — Team workflows for work items (real feature, from Anand's backlog)
+
+  Raw product idea (as written in the backlog — not yet a spec):
+
+  > Mind-map work items exist now, but every team works differently. A team should be able to define
+  > its own workflow — the stages a work item moves through, which moves are allowed, and what a move
+  > needs before it happens (for example a reason, or sign-off from someone other than the owner,
+  > possibly from more than one person). Items should never get stuck or lose their history when a
+  > team changes its workflow. People need to see and move their team's work on a board in the web
+  > app, see why a move is blocked, and see what is waiting on them. Agents must be able to do the
+  > same through the MCP tools.
+
+  Context: work items were added recently (migrations 0046/0047, src/mem_mcp/mindmap/, the work-item
+  MCP tools). Mind maps are described in docs/mindmap-v1-build-design.md and the ADRs; the web app is under web/.
+  Follow the existing patterns of this codebase.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_019GZrHgiozaJKXEMWGq248V
+
+  Searched for 4 patterns, read 4 files (ctrl+o to expand)
+
+● I'm checking whether team creation fills user_effective_team_access right away, because the plan's new RLS policies depend on it.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Write(~/laguna-bench/runs/F2-3/orders/review-plan-2.md)
+  ⎿  Wrote 7 lines to ../orders/review-plan-2.md
+      1 VERDICT: REVISE
+      3 1. The RLS-basis predicate is self-defeating (plan:27). `tenant_id = safe_current_tenant_id() AND can_access_team_resource(...)` is the same as same-tenant only, because the helper returns true whenever ca
+        ller = resource tenant (0035:68-75). That means team-wide reads and moves across tenants (R6/R8/Risk 6) can never work. It also breaks history inserts, which carry the item's tenant (analysis:144), so tena
+        nt B can never move tenant A's item. Use the OR shape that 0033:88-92 uses: `can_access_team_resource(safe_current_tenant_id(), tenant_id, team_id)`. Note that the helper is granted to mem_app, not PUBLIC
+      4 2. The plan's tests can't catch defect 1. WP0's `test_create_team_member_can_read_write_move` (plan:125-131) uses a single tenant, so it passes through the same-tenant clause. WP0 needs a DB-level test whe
+        re tenant B, a member of the team, reads, updates and inserts history on tenant A's item. Add a negative test for a non-member in the same team as well.
+         that actually runs.
+      6 4. WP2 changes `mark`/`assign`/`set_kind` (stamping `workflow_id`, plus the `__entry__` check at plan:147) with no test. Add one: a new item is stamped with the live version and an invalid initial status i
+        s rejected.
+         WP1's "move before commit" race test (plan:183) needs a deterministic two-connection setup.
+     … +4 lines (ctrl+o to expand)
+
+● I wrote the review to ~/laguna-bench/runs/F2-3/orders/review-plan-2.md, and the verdict is REVISE. The engineer answered all five points from the first plan review on paper, but the new RLS rule for work
+  items blocks the cross-tenant access the feature needs.
+
+  The new policies combine "same tenant as the caller" AND can_access_team_resource(...) (plan:27). That helper already returns true whenever the caller's tenant owns the row (0035:68-75), so the combined check works out
+  to "same tenant only." As a result:
+  - Blocked reads: a team member from another tenant can't see the team's items, so the team-wide board and "waiting on me" can't work.
+  - Blocked moves: that member can't move another tenant's item, because history rows are stored under the item's tenant.
+
+  The fix is to use the helper alone, which matches the either/or shape the existing memories policy uses (0033:88-92).
+
+  The plan's tests would also miss this. The new test that's meant to prove create-team members can read and move items uses one tenant, so it passes on the same-tenant rule.
+
+  The other findings:
+  - Personal-team hook: the plan says it runs as a privileged system transaction, but its test claims it runs under RLS as the app role.
+  - Untested tools: the changes to the mark, assign and set_kind tools have no tests.
+  - Nits: two typos in file and table names, a conflict over whether the web layer calls domain modules or the MCP tool classes, and a race test that needs a deterministic two-connection setup.
+
+✻ Baked for 38s · done 10:23 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

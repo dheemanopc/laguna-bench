@@ -1,0 +1,260 @@
+      146 +        )
+      147 +        node_id: UUID = out.node_id
+      148 +        return node_id
+      149 +
+      150      async def resolve(self, node_id: UUID, **kw: Any) -> Any:
+      151          kw.setdefault("map_key", self.map_key)
+      152          kw.setdefault("resolution_summary", "settled")
+
+● Update(tests/integration/test_mindmap_resolve_e2e.py)
+  ⎿  Added 2 lines, removed 4 lines
+      176          async with conn.transaction():
+      177              s = await _setup(conn)
+      178      ctx = _ctx(pg_pool, s["tenant"], s["client_id"])
+      179 -    opened = await MindmapOpenTool()(
+      179 +    opened: Any = await MindmapOpenTool()(
+      180          ctx,
+      181 -        MindmapOpenInput(
+      182 -            title=f"resolve-{uuid4().hex[:6]}", root_question="What do we settle?"
+      183 -        ),
+      181 +        MindmapOpenInput(title=f"resolve-{uuid4().hex[:6]}", root_question="What do we settle?"),
+      182      )
+      183      try:
+      184          yield _Env(pg_pool, ctx, opened.map_key, opened.root_memory_id)
+
+● Update(tests/integration/test_mindmap_resolve_e2e.py)
+  ⎿  Added 1 line, removed 11 lines
+      261
+      262
+      263  async def test_node_of_other_map_refused_and_untouched(env: _Env) -> None:
+      264 -    other = await MindmapOpenTool()(
+      265 -        env.ctx, MindmapOpenInput(title=f"other-{uuid4().hex[:6]}", root_question="Other?")
+      266 -    )
+      267 -    foreign = (
+      268 -        await MindmapWriteNodeTool()(
+      269 -            env.ctx,
+      270 -            MindmapWriteNodeInput(
+      271 -                map_key=other.map_key, content="foreign", node_role="position"
+      272 -            ),
+      273 -        )
+      274 -    ).node_id
+      264 +    foreign = await env.foreign_node()
+      265      with pytest.raises(JsonRpcError) as exc:
+      266          await env.resolve(foreign)
+      267      assert exc.value.code == -32602
+
+● Update(tests/integration/test_mindmap_resolve_e2e.py)
+  ⎿  Added 1 line, removed 9 lines
+      276
+      277  async def test_other_map_node_with_valid_resolver_reports_node_error(env: _Env) -> None:
+      278      """A valid resolver id must not mask a "not a member of this map" error."""
+      279 -    other = await MindmapOpenTool()(
+      280 -        env.ctx, MindmapOpenInput(title=f"other-{uuid4().hex[:6]}", root_question="Other?")
+      281 -    )
+      282 -    foreign = (
+      283 -        await MindmapWriteNodeTool()(
+      284 -            env.ctx,
+      285 -            MindmapWriteNodeInput(map_key=other.map_key, content="foreign", node_role="position"),
+      286 -        )
+      287 -    ).node_id
+      279 +    foreign = await env.foreign_node()
+      280      resolver = await env.node("a perfectly valid resolver")
+      281      with pytest.raises(JsonRpcError) as exc:
+      282          await env.resolve(foreign, resolved_by_memory_id=resolver)
+
+● Update(tests/integration/test_mindmap_resolve_e2e.py)
+  ⎿  Added 5 lines
+      190      return (exc.value.data or {}).get("code")
+      191
+      192
+      193 +def _path(exc: pytest.ExceptionInfo[JsonRpcError]) -> Any:
+      194 +    """`path` of the first entry in data["errors"]."""
+      195 +    return (exc.value.data or {})["errors"][0]["path"]
+      196 +
+      197 +
+      198  async def test_resolve_with_resolving_node(env: _Env) -> None:
+      199      challenge = await env.node("challenge", node_role="challenge")
+      200      answer = await env.node("answer")
+
+● Update(tests/integration/test_mindmap_resolve_e2e.py)
+  ⎿  Added 5 lines, removed 5 lines
+      270      with pytest.raises(JsonRpcError) as exc:
+      271          await env.resolve(foreign)
+      272      assert exc.value.code == -32602
+      273 -    assert exc.value.data["errors"][0]["path"] == "node_id"
+      273 +    assert _path(exc) == "node_id"
+      274      assert (await env.membership(foreign))["status"] == "open"
+      275      n = await env.row(
+      276          "SELECT count(*) AS n FROM memory_map_events WHERE memory_id = $1 AND event = 'resolve'",
+     ...
+      286      with pytest.raises(JsonRpcError) as exc:
+      287          await env.resolve(foreign, resolved_by_memory_id=resolver)
+      288      assert exc.value.code == -32602
+      289 -    assert exc.value.data["errors"][0]["path"] == "node_id"
+      289 +    assert _path(exc) == "node_id"
+      290      assert (await env.membership(foreign))["status"] == "open"
+      291      assert (await env.membership(resolver))["status"] == "open"
+      292      refs = await env.row(
+     ...
+      302      with pytest.raises(JsonRpcError) as exc:
+      303          await env.resolve(n, map_key=f"no-such-{uuid4().hex[:8]}")
+      304      assert exc.value.code == -32602
+      305 -    assert exc.value.data["errors"][0]["path"] == "map_key"
+      305 +    assert _path(exc) == "map_key"
+      306      assert (await env.membership(n))["status"] == "open"
+      307
+      308
+     ...
+      310      with pytest.raises(JsonRpcError) as exc:
+      311          await env.resolve(env.root)
+      312      assert exc.value.code == -32602
+      313 -    assert exc.value.data["errors"][0]["path"] == "node_id"
+      313 +    assert _path(exc) == "node_id"
+      314      assert (await env.membership(env.root))["status"] == "open"
+      315
+      316
+     ...
+      372      with pytest.raises(JsonRpcError) as exc:
+      373          await env.resolve(n, resolved_by_memory_id=n)
+      374      assert exc.value.code == -32602
+      375 -    assert exc.value.data["errors"][0]["path"] == "resolved_by_memory_id"
+      375 +    assert _path(exc) == "resolved_by_memory_id"
+      376      assert (await env.membership(n))["status"] == "open"
+      377
+      378
+
+● Bash(ruff format src/mem_mcp/mcp/tools/mindmap_get.py tests/integration/test_mindmap_resolve_e2e.py)
+  ⎿  2 files reformatted
+
+● Formatting is applied (that's the change on disk, from my own ruff format). Re-running the checks on the touched files now.
+
+● Bash(pytest -q -p no:cacheprovider tests/unit/test_mindmap_resolve_models.py tests/integration/test_mindmap_resolve_e2e.py tests/integration/test_mindmap_e2e.py test…)
+  ⎿  ................................................                         [100%]
+     48 passed in 2.11s
+
+● Bash(ruff check src tests)
+  ⎿  All checks passed!
+
+● Bash(ruff format --check src tests)
+  ⎿  313 files already formatted
+
+● Bash(mypy)
+  ⎿  Error: Exit code 1
+     src/mem_mcp/mindmap/service.py:65: error: Returning Any from function declared to return "UUID | None"  [no-any-return]
+     src/mem_mcp/mindmap/service.py:76: error: Returning Any from function declared to return "UUID | None"  [no-any-return]
+     tests/unit/test_job_pool_codec.py:12: error: Skipping analyzing "asyncpg": module is installed, but missing library stubs or py.typed marker  [import-untyped]
+     tests/unit/test_job_pool_codec.py:12: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
+     tests/unit/test_job_pool_codec.py:28: error: Function is missing a type annotation for one or more parameters  [no-untyped-def]
+     tests/unit/test_job_pool_codec.py:29: error: Missing type arguments for generic type "dict"  [type-arg]
+     tests/unit/test_job_pool_codec.py:31: error: Function is missing a type annotation  [no-untyped-def]
+     tests/unit/test_job_pool_codec.py:45: error: Function is missing a type annotation for one or more parameters  [no-untyped-def]
+     tests/unit/test_job_pool_codec.py:50: error: Function is missing a type annotation for one or more parameters  [no-untyped-def]
+     … +32 lines (ctrl+o to expand)
+
+● Bash(pytest -q -p no:cacheprovider --tb=no)
+  ⎿  Error: Exit code 1
+     ................................................sssssssss............... [  5%]
+     .....F...ssssssssssssssssss...ss........................................ [ 10%]
+     ........................................................................ [ 16%]
+     ss...................................................................... [ 21%]
+     ..........................F.F..........................................F [ 26%]
+     FFFE.FFFFFFFFFFFFFFFFFFFFF.............................................. [ 31%]
+     ........................................................................ [ 37%]
+     ........................................................................ [ 42%]
+     ........................................................................ [ 47%]
+     … +100 lines (ctrl+o to expand)
+
+● I found an unexpected failure in test_stats_tool_requires_read_scope. Let me check whether my tool registration changes caused this. · summary
+
+● Bash(pytest -q -p no:cacheprovider tests/security/test_scope_enforcement.py)
+  ⎿  Error: Exit code 1
+     ....................F..                                                  [100%]
+     =================================== FAILURES ===================================
+     ___________ TestStatsToolScopes.test_stats_tool_requires_read_scope ____________
+
+     self = <tests.security.test_scope_enforcement.TestStatsToolScopes object at 0x787d0a04c1a0>
+
+         @pytest.mark.security
+         @pytest.mark.asyncio
+         async def test_stats_tool_requires_read_scope(self) -> None:
+     … +17 lines (ctrl+o to expand)
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● The mindmap work is verified: the new and existing mindmap tests, the tenant-scope lint test, ruff check and ruff format --check all pass, and no new mypy errors come from my code. The one thing I couldn't do is the
+  git stash baseline comparison, which was denied. For the suite-wide failures I'm relying on inspection.
+
+  Changes this round
+
+  - Fix 1 (mindmap_resolve.py): the checks now run in the order you suggested.
+    - (a) A read tenant_tx runs team → map → live → member → not root → open.
+    - (b) If a resolver is given, the self-check runs, then the system_tx access check.
+    - (c) The write tenant_tx re-runs the same checks, then settle_member, insert_reference and log_event.
+    - A stray resolver id can no longer mask a map or node error.
+  - Fix 2: I removed the unused MapNodeNotFoundError from service.py.
+  - New test: test_other_map_node_with_valid_resolver_reports_node_error checks that another map's node plus a valid resolver gives -32602 with path node_id, and that no node status or edge changes.
+  - Test bug found and fixed: the inaccessible-resolver test inserted a memory with visibility='private', which violates memories_visibility_check. It now uses 'team'.
+  - Typing and format cleanup: the new test file's helpers are typed, and ruff format reformatted mindmap_get.py and the new test file.
+
+  Commands
+
+  ┌───────────────────────────────────────────────────────────────────────────────────────────┬────────────────────────────────┬────────────────────────────────────────────────────┐
+  │                                          Command                                          │             Status             │                       Result                       │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ alembic upgrade head                                                                      │ ran                            │ no output                                          │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ alembic current                                                                           │ ran                            │ 0044_mindmap_branch_status (head)                  │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ pytest -q -p no:cacheprovider tests/unit/test_mindmap_resolve_models.py                   │ ran                            │ 15 passed                                          │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ pytest … test_mindmap_resolve_e2e.py test_mindmap_e2e.py (first run)                      │ ran                            │ 18 passed, 1 failed (the 'private' test bug above) │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ same, after the fix                                                                       │ ran                            │ 19 passed                                          │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ same four mindmap files plus tests/unit/test_lint_tenant_scope.py, after final formatting │ ran                            │ 48 passed                                          │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ pytest … tests/unit tests/integration                                                     │ ran                            │ 37 failed, 1221 passed, 2 skipped, 15 errors       │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ full pytest -q -p no:cacheprovider --tb=no                                                │ ran                            │ 38 failed, 1266 passed, 31 skipped, 15 errors      │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ ruff check src tests                                                                      │ ran                            │ all checks passed                                  │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ ruff format --check src tests                                                             │ ran (after formatting 2 files) │ 313 files already formatted                        │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ mypy                                                                                      │ ran                            │ 39 errors in 5 files, none from code I added       │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ git stash -u baseline comparison                                                          │ denied                         │ not done                                           │
+  ├───────────────────────────────────────────────────────────────────────────────────────────┼────────────────────────────────┼────────────────────────────────────────────────────┤
+  │ alembic downgrade -1, then upgrade head                                                   │ not run                        │ the order-3 list had no downgrade step             │
+  └───────────────────────────────────────────────────────────────────────────────────────────┴────────────────────────────────┴────────────────────────────────────────────────────┘
+
+  The first alembic upgrade head of this round produced no output, so the "ran" is backed only by alembic current showing 0044 at head. I did not exercise downgrade().
+
+  Failures and whether they are new
+
+  - No failure touches mindmap code. Only three test files reference mindmap or memory_map, and all of them pass: tests/integration/test_mindmap_e2e.py, tests/integration/test_mindmap_resolve_e2e.py and
+    tests/unit/test_mindmap_resolve_models.py.
+  - Failures and errors in tests/unit and tests/integration are all teams, enterprise, RBAC, roles-catalog and slug-schema tests, hitting fixture collisions. Examples are hard-coded user1@example.com (tenants_email_key)
+    and teams_created_by_tenant_id_fkey on teardown. By inspection they are pre-existing, but I could not prove it with a stash run.
+  - tests/security/test_scope_enforcement.py::TestStatsToolScopes::test_stats_tool_requires_read_scope is the 38th failure. It is not caused by this change: it registers only MemoryStatsTool in its own ToolRegistry and
+    dispatches "memory.stats", which returns -32601 "method not found" (the test expects -32000). Nothing I changed touches that tool or the registry code.
+  - No registry or description-completeness test failed. tests/unit/test_lint_tenant_scope.py is green.
+
+  mypy detail
+
+  - src errors in files I touched: service.py:65 and :76 (resolve_map_root and find_live_map_seeded_from returning Any) are in functions I did not change. _mindmap_common.py:36 is likewise untouched.
+  - Test-file errors: the rest are in existing test files. tests/integration/test_mindmap_e2e.py has the same BaseModel attribute-access noise as before.
+  - My new test file: no mypy errors remain in it.
+
+  Still open
+
+  - To close the baseline question, run ! git stash -u && pytest -q -p no:cacheprovider --tb=no -rfE; git stash pop yourself, or approve the stash.
+  - Run the migration round-trip (alembic downgrade -1, then alembic upgrade head) to exercise downgrade().
+
+✻ Brewed for 3m 1s · done 11:56 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

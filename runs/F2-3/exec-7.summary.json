@@ -1,0 +1,20 @@
+{
+  "status": "ok",
+  "exit_code": 0,
+  "call": 7,
+  "wall_s": 438,
+  "files_changed": [
+    "docs/feature/01-analysis.md",
+    "docs/feature/02-design.md",
+    "docs/feature/03-plan.md"
+  ],
+  "executor_report": "Stage 3 is complete. `docs/feature/03-plan.md` is written.\n\n## Report\n\n**What changed (files):**\n- CREATED `docs/feature/03-plan.md` — the Stage 3 integration plan. No source/test code was written (Stages 4–5 remain).\n\n**Build order (6 packages):** WP0 Migration → WP1 Domain (`mindmap/workflows.py` + `work_items.py` edits) → WP2 MCP surface (9 new tools + 4 modified + registration/descriptions/audit/error mapping) → WP3 Web API (`mindmaps.py` endpoints + `ensure_default_workflow` wired into the three team-creation hooks: `identity/personal_team.py`, `web/handlers/teams.py`, `mcp/tools/create_team.py`) → WP4 Web UI (Next.js board/waiting pages + `server-api.ts`) → WP5 Verification sweep.\n\n**Each WP carries:** scope, exact file CREATE/MODIFY list, the requirement numbers it delivers (R1–R14), and a concrete test plan — each test named with what it proves (e.g. `test_non_member_cannot_read_team_board` → 404 not 403, team-scoped not global; `test_completion_revalidates_status` → race guard; `test_rebase_requires_current_status_mapping` → R4/rebase-conflict). The plan re-derives every cited line number from the reads done this turn (`create_team.py:136`, `auth/rbac.py:28`, `main.py:567/525-528`, `web/handlers/mindmaps.py:100`, `create_team.py:108` INSERT + `assign_role` at 132, `personal_team.py:78` INSERT + GUC at 73-76).\n\n**How verified:** This stage is docs-only (\"Still no code\" per the Stage 3 brief), so the per-package check is structural consistency — each touch-point line number in the plan was cross-checked against the fresh reads this turn. `pytest`/`ruff`/`mypy`/`alembic upgrade head` are the WP5 entry point, deferred to Stages 4–5; running them now would only exercise the unmodified baseline (the migration doesn't exist yet). I did not run `pytest -q` because no code has been written to test.\n\n**Left open / notes:**\n- The three team-creation hooks wire `ensure_default_workflow` in a `system_tx` context. In `create_team.py` the INSERTs already run under `tenant_tx` (line 61) with the GUC set — I cited the post-`assign_role` line (132) as the hook site so the back-fill + seed can be one transaction. In `ensure_personal_team`, it runs under an already-`SET LOCAL app.current_tenant_id` `system_tx` (73-76) — hook site ~82. No semantic change to either, just the seed call appended. Flagged in the plan for the architect to confirm transaction boundaries.\n- Default-workflow seeding for *existing* pre-feature teams is done as a back-fill pass inside the 0048 migration (WP0 tests assert it), not as a lazy on-read side effect — chosen to keep the frozen-version invariant true for every item at day 0.\n- No new `Permission` enum value is required (the plan reuses `TEAM_WRITE_MEMORY`/`TEAM_MANAGE_SETTINGS`); if the architect prefers a dedicated `team.manage_workflow` perm, that is a one-line addition to `auth/permissions.py` + `ROLE_PERMISSIONS` and doesn't move any WP.",
+  "turns": 4,
+  "is_error": null,
+  "tokens": {
+    "in": 512353,
+    "out": 9488
+  },
+  "stderr_tail": null,
+  "next": "Review with: git -C <repo> diff (and git -C <repo> status). Send fixes via a NEW order file + run_executor.sh."
+}

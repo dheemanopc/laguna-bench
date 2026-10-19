@@ -1,0 +1,260 @@
+      382  - `pytest tests/security -q` — `test_workflow_visibility.py` + existing
+      383    `test_rls_failclosed.py`/`test_team_tool_authz.py` green (no cross-team
+      321 -  leakage from the widened policies).
+      322 -- `alembic upgrade head` on `MEM_MCP_DB_MAINT_DSN` against a scratch DB
+      323 -  followed by the migration back-fill assertions in WP0 — confirms the
+      324 -  `down_revision` chain (`0047_work_item_history_rls_fix`) and the
+      325 -  `SET NOT NULL`-after-back-fill ordering.
+      384 +  leakage from the widened `can_access_team_resource` policies).
+      385 +- `alembic upgrade head` on `MEM_MCP_DB_MAINT_DSN` against a scratch DB, then the
+      386 +  WP0 back-fill/CREATE-policy assertions — confirms the `down_revision` chain
+      387 +  (`0047_work_item_history_rls_fix`) and the `SET NOT NULL`-after-back-fill
+      388 +  ordering.
+      389 +- `npx playwright test` (web UI only) — WP4 specs green.
+      390  - `mypy` + `ruff check src tests` — clean (CONVENTIONS §Style: `from __future__
+      391    import annotations`, full annotations, ~100 cols).
+
+● Stage 3 plan revised — docs/feature/03-plan.md updated.
+
+  1. RLS-basis: WP0 policies now use UEA can_access_team_resource (0035:58-76), not the legacy team_members-reading current_user_active_team_ids(); added test_create_team_member_can_read_write_move (DB) +
+     test_create_team_caller_board_read_write (web) proving a memsys_create_team membership reads/inserts/moves where legacy would miss it.
+  2. change_type CHECK now admits workflow_changed (rebase) alongside signoff_requested/signoff_decided; test asserts all three insert.
+  3. Added team_workflows INSERT policy + INSERT-only team_workflow_versions; test_team_workflows_insert_policy_under_rls + test_*_seeds_default_workflow (each runs ensure_default_workflow as mem_app under RLS) cover it.
+  4. Approver eligibility now resolved via get_team_role (UEA, active-membership); new test_signoff_rejects_inactive_approver proves an inactive teammate's approval doesn't count.
+  5. WP4 adds Playwright tooling (web/playwright.config.ts, @playwright/test, web/tests/board.spec.ts) so e2e tests actually run (gated via npx playwright test, data contract also asserted in WP3's FastAPI tests); the
+     WP2 "board shows the badge" clause was moved out (MCP now returns signoff_state; badge render is a WP4 Playwright assert).
+
+✻ Crunched for 3m 4s · done 10:23 PM
+
+❯ The architect reviewed your plan and asked for revisions:
+
+  VERDICT: REVISE
+
+  1. The RLS-basis predicate is self-defeating (plan:27). tenant_id = safe_current_tenant_id() AND can_access_team_resource(...) is the same as same-tenant only, because the helper returns true whenever caller =
+  resource tenant (0035:68-75). That means team-wide reads and moves across tenants (R6/R8/Risk 6) can never work. It also breaks history inserts, which carry the item's tenant (analysis:144), so tenant B can never move
+  tenant A's item. Use the OR shape that 0033:88-92 uses: can_access_team_resource(safe_current_tenant_id(), tenant_id, team_id). Note that the helper is granted to mem_app, not PUBLIC (0035:81).
+  2. The plan's tests can't catch defect 1. WP0's test_create_team_member_can_read_write_move (plan:125-131) uses a single tenant, so it passes through the same-tenant clause. WP0 needs a DB-level test where tenant B, a
+  member of the team, reads, updates and inserts history on tenant A's item. Add a negative test for a non-member in the same team as well.
+  3. WP3 contradicts itself on the personal team. The plan says the hook runs inside system_tx (plan:268-269), but the test claims it runs as mem_app under RLS (plan:303-307). Pick one, and test the path that actually
+  runs.
+  4. WP2 changes mark/assign/set_kind (stamping workflow_id, plus the __entry__ check at plan:147) with no test. Add one: a new item is stamped with the live version and an invalid initial status is rejected.
+  5. Nits: memmap_workflow_get.py (plan:213) and team_workflows_versions (plan:91) are typos. WP3 dispatches to MCP tool classes, but the header says web handlers call domain modules (plan:10-11 vs 255). WP1's "move
+  before commit" race test (plan:183) needs a deterministic two-connection setup.
+
+  Revise docs/feature/03-plan.md accordingly (no code). When done, end your turn with a 3-line summary of what you changed.
+
+  Thought for 1m 0s (ctrl+o to expand)
+
+● I'll fix each point. Let me first confirm the exact typo occurrences and the contradictory lines.
+
+  Thought for 1m 9s, searched for 1 pattern (ctrl+o to expand)
+
+● Now I'll apply the targeted revisions.
+
+● Update(docs/feature/03-plan.md)
+  ⎿  Added 8 lines, removed 5 lines
+       6  <noreply@anthropic.com>` (CLAUDE.md).
+       7
+       8  Conventions assumed (CONVENTIONS.md): domain modules take an `asyncpg.Connection`
+       9 -and raise their own exceptions; tools are thin and map errors via
+      10 -`map_work_item_error`; web handlers call the same domain modules the MCP tools
+      11 -do (one source of truth); `pg_pool` fixture + UUID-suffixed names +
+      12 -self-cleanup in tests; `tenant_tx`/`system_tx` for transactions; RLS + explicit
+      13 -`team_id`/`tenant_id` predicates enforced by `tools/lint_tenant_scope.py`
+       9 +and raise their own exceptions; tools are thin (`assert isinstance`,
+      10 +`async with tenant_tx`, call a domain module, `map_work_item_error`); web handlers
+      11 +dispatch to the **same MCP tool classes** the transport does — constructing a
+      12 +`ToolContext` from the session and mapping `JsonRpcError → HTTPException` via
+      13 +`_http_from_jsonrpc` (mindmaps.py:66-77) — so rules live in one place (the tool
+      14 +classes + domain modules, never in the router). `pg_pool` fixture + UUID-suffixed
+      15 +names + self-cleanup in tests; `tenant_tx`/`system_tx` for transactions; RLS +
+      16 +explicit `team_id`/`tenant_id` predicates enforced by `tools/lint_tenant_scope.py`
+      17  (run via `tests/unit/test_lint_tenant_scope.py::test_real_codebase_is_clean`).
+      18
+      19  ## RLS basis (addresses the design-review-3 blocker)
+
+  Thought for 13s (ctrl+o to expand)
+
+● Update(docs/feature/03-plan.md)
+  ⎿  Added 17 lines, removed 10 lines
+      22  function `current_user_active_team_ids()` (0033:49-60), which reads the
+      23  `team_members` table — a table `memsys_create_team` does not write to (it only
+      24  writes `team_role_assignments`, per `create_team.py:132`+`auth/rbac.py:28`).
+      25 -Instead the read+write predicates for the new team access are UEA-based through
+      26 -`can_access_team_resource(p_caller_tenant, p_resource_tenant, p_resource_team)`
+      27 -(0035:58-76, `SECURITY DEFINER`, `GRANT PUBLIC`, boolean → usable in `USING`/`WITH
+      28 -CHECK`), keeping `tenant_id = safe_current_tenant_id()` (0034:66-78) as the
+      29 -tenant-isolation clause. Concretely the widened read shape is
+      30 -`tenant_id = safe_current_tenant_id() AND can_access_team_resource(current_setting('app.current_tenant_id')::uuid, tenant_id, team_id)`
+      31 -and the write `WITH CHECK` mirrors it. Tenant isolation is therefore preserved
+      32 -and the escape only opens to active RBAC members of the team (security-tested).
+      33 -`current_user_active_team_ids` remains cited only as *reference* for the legacy
+      34 -`memories_select` read path, not as a building block for the new policies.
+      25 +Instead the read+write predicates for the new team access are the single boolean
+      26 +`can_access_team_resource(safe_current_tenant_id(), tenant_id, team_id)` (the
+      27 +helper reads `app.current_tenant_id` internally — 0035:68-75). It returns true on
+      28 +the **OR** of (a) caller tenant = resource tenant — which preserves the existing
+      29 +same-tenant access — and (b) caller is an active UEA member of the resource
+      30 +team. This is what lets tenant B read/move items owned by tenant A in a shared
+      31 +team (R6/R8) while still blocking a tenant that is only a non-member (Risk 6/7).
+      32 +It is **not** conjoined with `tenant_id = safe_current_tenant_id()`: that would
+      33 +collapse back to same-tenant-only and make the team scope a no-op (the defect
+      34 +called out in review 1 — the predicate that reads
+      35 +`tenant_id = safe_current_tenant_id() AND can_access_team_resource(...)` is
+      36 +self-defeating because the helper already returns true whenever caller = resource
+      37 +tenant). The function is `SECURITY DEFINER` and `GRANT`-ed to `mem_app`
+      38 +(0035:81, **not** `PUBLIC`); policies execute under that grant, so the predicate
+      39 +is usable in `USING`/`WITH CHECK` for the `mem_app` RLS role. `current_user_active_team_ids`
+      40 +remains cited only as *reference* for the legacy `memories_select` read path,
+      41 +not as a building block for the new policies.
+      42
+      43  Touch-point map (exact paths):
+      44
+
+  Thought for 10s (ctrl+o to expand)
+
+● Update(docs/feature/03-plan.md)
+  ⎿  Added 12 lines, removed 7 lines
+      132      role with `app.current_tenant_id` set to a member's tenant, and asserts it can
+      133      INSERT one `team_workflow_versions` row + one `team_workflows` pointer, but
+      134      cannot UPDATE the version row (INSERT-only). Proves §5 hook + frozen v1.
+      135 -  - `test_create_team_member_can_read_write_move` (design-review-3 test) —
+      136 -    creates a team via the same membership shape `memsys_create_team` uses
+      137 -    (`team_role_assignments` only, no `team_members` row), then as that member's
+      138 -    tenant inserts a `work_items` row, SELECTs it (team-wide read), and UPDATEs
+      139 -    it (a status move). Proves the UEA-based `can_access_team_resource` read+write
+      140 -    policies replace the legacy `team_members`-reading convention end-to-end at
+      141 -    the DB layer.
+      135 +  - `test_create_team_member_can_read_write_move` (design-review-3 test, and the
+      136 +    regression test for review-1's predicate defect) — creates a team via the same
+      137 +    membership shape `memsys_create_team` uses (`team_role_assignments` only, no
+      138 +    `team_members` row), with **two tenants**: tenant A inserts a `work_items`
+      139 +    row; tenant B (also an active member of the team) SELECTs it (team-wide read),
+      140 +    UPDATEs its status (cross-tenant move), and INSERTs a `work_item_history` row
+      141 +    on A's item — asserts B succeeds at all three. Then tenant C, in a *different*
+      142 +    team (a non-member of A's team), is asserted to be blocked from reading A's
+      143 +    item. Proves the OR-shape predicate lets cross-tenant teammates
+      144 +    read/move/insert-history while blocking non-members — and so cannot pass with
+      145 +    the `tenant_id = safe_current_tenant_id() AND can_access_team_resource(...)`
+      146 +    shape the single-tenant version would let sneak through.
+      147    - `test_signoff_requests_rls_team_isolation` (security-style) — tenant X
+      148      cannot SELECT another team's `work_item_signoff_requests` via the
+      149      `can_access_team_resource(…, team_id)` predicate. Proves Risk 6 doesn't
+
+  Thought for 6s (ctrl+o to expand)
+
+● Update(docs/feature/03-plan.md)
+  ⎿  Added 2 lines, removed 1 line
+      281    `move|approve|reject|rebase`; all via the `_http_from_jsonrpc` bridge
+      282    66-77).
+      283  - MODIFY `src/mem_mcp/identity/personal_team.py` (call `ensure_default_workflow`
+      284 -  after line 82, within the existing `system_tx` + `SET LOCAL` 73-76),
+      284 +  after line 82; this hook runs under `system_tx` + `SET LOCAL app.current_tenant_id`
+      285 +  (73-76), i.e. RLS-bypassed — seed outcome asserted, not the RLS write path),
+      286    `src/mem_mcp/web/handlers/teams.py` `create_team` (after line 175),
+      287    `src/mem_mcp/mcp/tools/create_team.py` `CreateTeamTool` (after `assign_role`,
+      288    line 132).
+
+● Update(docs/feature/03-plan.md)
+  ⎿  Added 15 lines, removed 8 lines
+      315    - `test_rebase_action_requires_current_status_in_map` — `action:"rebase"`
+      316      without the current status in `status_map` → 422 `rebase_conflict`; with it
+      317      → 200 and the item is on the new version. Proves E4/R4.
+      318 -- `tests/integration/test_team_creation_seeds_workflow.py` (new) — each runs the
+      319 -  actual `ensure_default_workflow` function **as `mem_app` under RLS**
+      320 -  (`SET LOCAL app.current_tenant_id` + the RLS role), not system-bypassed:
+      321 -  - `test_mcp_create_team_seeds_default_workflow`,
+      322 -    `test_web_create_team_seeds_default_workflow`,
+      323 -    `test_personal_team_ensure_default_workflow` — after each of the three hooks,
+      324 -    the new team has exactly one `team_workflows` pointer + v1. Proves §5 + the
+      325 -    team_workflows INSERT policy under RLS.
+      318 +- `tests/integration/test_team_creation_seeds_workflow.py` (new) — covers the
+      319 +  **actual** path each hook runs on (not a fake one):
+      320 +  - `test_mcp_create_team_seeds_default_workflow` — `memsys_create_team` runs the
+      321 +    hook under `tenant_tx` (RLS active, `app.current_tenant_id` = caller's tenant,
+      322 +    role = `mem_app`); asserts the seed INSERTs are permitted by the
+      323 +    `team_workflows`/`team_workflow_versions` INSERT policies (not bypassed) and
+      324 +    land exactly one pointer + v1. Proves §5 + the INSERT policy under RLS.
+      325 +  - `test_web_create_team_seeds_default_workflow` — same contract via the web
+      326 +    `create_team` handler (asserts that handler's tx role the same way as MCP,
+      327 +    i.e. RLS active).
+      328 +  - `test_personal_team_ensure_default_workflow` — `ensure_personal_team` runs the
+      329 +    hook under `system_tx` (73-76), i.e. RLS-bypassed; this test asserts the
+      330 +    *outcome* only (rows exist) and explicitly notes it does NOT exercise the RLS
+      331 +    write policy, unlike the MCP/web cases above. Proves §5 seed on the bypassed
+      332 +    path.
+      333  - `tests/security/test_workflow_visibility.py`:
+      334    - `test_non_member_cannot_read_team_board` — tenant Z (not in team Y) GETs
+      335      `/teams/Y/board` → 404 (opaque, not 403). Proves Risk 6/7.
+
+  Thought for 5s (ctrl+o to expand)
+
+● Update(docs/feature/03-plan.md)
+  ⎿  Added 1 line, removed 1 line
+      224  that is a render concern, moved to WP4).
+      225
+      226  **Files.**
+      227 -- CREATE `memmap_workflow_get.py`, `mindmap_workflow_update.py`,
+      227 +- CREATE `mindmap_workflow_get.py`, `mindmap_workflow_update.py`,
+      228    `mindmap_workflow_rebase.py`, `mindmap_work_get.py`, `mindmap_work_list.py`,
+      229    `mindmap_work_history.py`, `mindmap_work_signoff_list.py`,
+      230    `mindmap_work_signoff_approve.py`, `mindmap_work_signoff_reject.py` (under
+
+  Thought for 14s (ctrl+o to expand)
+
+● Update(docs/feature/03-plan.md)
+  ⎿  Added 7 lines
+      242    - `test_team_can_define_and_apply_workflow` — `mindmap_workflow_update` creates
+      243      v2; the next item carries v2; an old item keeps v1 and still allows v1 moves
+      244      after the edit. Proves R4 (frozen) + R1/R2.
+      245 +  - `test_mark_work_item_stamps_live_workflow_and_validates_entry` —
+      246 +    `mindmap_work_mark` (→ `mark_work_item`) on a team whose live workflow is a
+      247 +    custom v2 stamps the new item's `workflow_id` to v2, and rejects an explicit
+      248 +    `status='done'` initial value (not a valid `__entry__` target under the
+      249 +    default workflow's entry sentinel) with `code="invalid_workflow_status"`.
+      250 +    Proves plan:147 stamping + `__entry__` initial-status validation, covering
+      251 +    the `mark`/`assign`/`set_kind` stamping path that otherwise had no test.
+      252    - `test_move_requiring_signoff_blocks_until_approval` — `set_status` on a
+      253      guarded transition returns `code="signoff_required"` + `signoff_state{request_id,
+      254      have, needed, approvers}` and the item's `status` is unchanged (no rollback
+
+● Update(docs/feature/03-plan.md)
+  ⎿  Added 5 lines, removed 3 lines
+      195    - `test_no_two_pending_requests_same_item` — a second `start_signoff` on an
+      196      item with a pending request raises `SignoffAlreadyPendingError`. Proves §2.4
+      197      partial-unique semantics.
+      198 -  - `test_completion_revalidates_status` — approve to quorum, then move the item
+      199 -    before the commit; the second approval path closes the request as
+      200 -    `superseded` and does NOT move the item. Proves §2.4 race logic.
+      198 +  - `test_completion_revalidates_status` — deterministic two-connection setup:
+      199 +    conn A reads the pending request and approves to quorum (quorum flips true);
+      200 +    a separate conn B then moves the item (a real status change) before conn A
+      201 +    commits; conn A's approval path revalidates `from_status` and closes the
+      202 +    request as `superseded` without performing the move. Proves §2.4 race logic.
+      203    - `test_rebase_requires_current_status_mapping` — `rebase_work_item` with a
+      204      `status_map` missing the item's current status raises
+      205      `RebaseConflictError`; with it, `workflow_id`/`status` update atomically and
+
+  Thought for 7s (ctrl+o to expand)
+
+● Let me verify the fixes landed cleanly: no memmap_workflow_get typo, no self-defeating tenant_id = safe_current_tenant_id() AND can_access_team_resource predicate, no contradictory personal-team seed wording, and the
+  new tests are present.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● All five revisions are in and verified: the self-defeating tenant_id = … AND can_access_team_resource(...) predicate only appears inside can_access_team_resource(...)'s own explanatory text (quoting the defect), not as
+  a policy; the memmap typo and GRANT PUBLIC claim are gone; the personal-team hook now consistently says system_tx/RLS-bypassed while MCP/web say tenant_tx/RLS-active; and the new tests (..._cross_tenant,
+  test_mark_work_item_stamps_…, ..._RLS_active vs ..._bypassed) are present.
+
+  1. RLS-basis fixed to the OR-shape can_access_team_resource(safe_current_tenant_id(), tenant_id, team_id) (grant to mem_app, granted to mem_app), and the cross-tenant test now runs tenant B against tenant A's item with
+     a non-member negative case.
+  2. Seeding tests disambiguated by actual path: MCP/web assert the INSERT policy under RLS-active tenant_tx; personal-team asserts outcome only under bypassed system_tx.
+  3. Added the missing mark/__entry__ test, the two-connection race revalidate test, fixed the memmap typo, and aligned the header with "web dispatches to MCP tool classes" (no domain-vs-tool-class contradiction).
+
+✻ Baked for 3m 34s · done 10:27 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+

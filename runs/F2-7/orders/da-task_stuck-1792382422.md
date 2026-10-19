@@ -1,0 +1,3 @@
+```json
+{"action":"retry","guidance":"mypy still reports import-untyped on the TYPE_CHECKING `import asyncpg`. Moving the import there doesn't help, and a new `# type: ignore` is rejected by the harness.\nDon't import asyncpg in workflow_reads.py. Look at how workflow_crud.py (WP1-T2) and workflow_moves.py pass mypy now, and use the same approach.\nIf neither has a clean one, annotate `conn` with the connection type or alias that an already-typed module exports (grep src/mem_mcp for the tenant_tx signature).\nAs a last resort, define a small local `Protocol` with just the `fetch`/`fetchrow` methods you call.\nDon't touch the mypy config in pyproject. Re-run ruff, mypy and pytest on the T4 files.","new_tasks":[]}
+```

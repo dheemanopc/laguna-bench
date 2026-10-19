@@ -1,0 +1,2377 @@
+diff --git a/alembic/versions/0044_2026_10_16_mindmap_branch_status.py b/alembic/versions/0044_2026_10_16_mindmap_branch_status.py
+new file mode 100644
+index 0000000..8e61beb
+--- /dev/null
++++ b/alembic/versions/0044_2026_10_16_mindmap_branch_status.py
+@@ -0,0 +1,129 @@
++"""Add branch-status columns to memory_map_membership.
++
++Branch status is the ONLY source of truth for whether a mindmap node is
++"settled" (resolved / dropped) versus still open. We never infer status
++from memory_references reference_kind; an edge alone never settles a branch.
++
++Why: prior to this, mindmap_get returned every node in full on every call,
++there was no per-branch status, and open_loops grew unbounded because
++resolved/dropped nodes were never removed from the open set. The new columns
++let mindmap_resolve settle individual branches and mindmap_get filter to
++only open loops or a since-cursor window.
++
++Revision ID: 0044_mindmap_branch_status
++Revises: 0043_backfill_personal_teams
++Create Date: 2026-10-16
++"""
++
++from __future__ import annotations
++
++import sqlalchemy as sa
++
++from alembic import op
++
++revision = "0044_mindmap_branch_status"
++down_revision = "0043_backfill_personal_teams"
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    op.execute(
++        sa.text("""
++        ALTER TABLE memory_map_membership
++            ADD COLUMN status TEXT NOT NULL DEFAULT 'open'
++                        CONSTRAINT memory_map_membership_status_check
++                            CHECK (status IN ('open', 'resolved', 'dropped'))
++        """)
++    )
++    op.execute(
++        sa.text("""
++        ALTER TABLE memory_map_membership
++            ADD COLUMN resolution_summary TEXT NULL
++                        CONSTRAINT memory_map_membership_resolution_summary_check
++                            CHECK (
++                                resolution_summary IS NULL
++                                OR char_length(resolution_summary) BETWEEN 1 AND 500
++                            )
++        """)
++    )
++    op.execute(
++        sa.text("""
++        ALTER TABLE memory_map_membership
++            ADD COLUMN resolved_by_memory_id UUID NULL
++                        REFERENCES memories(id) ON DELETE SET NULL
++        """)
++    )
++    op.execute(
++        sa.text("""
++        ALTER TABLE memory_map_membership
++            ADD COLUMN resolved_by_party TEXT NULL
++                        CONSTRAINT memory_map_membership_resolved_by_party_check
++                            CHECK (resolved_by_party IN ('owner', 'model'))
++        """)
++    )
++    op.execute(
++        sa.text("""
++        ALTER TABLE memory_map_membership
++            ADD COLUMN resolved_at TIMESTAMPTZ NULL
++        """)
++    )
++    # Consistency CHECK: when status='open' then summary/party/resolved_at/resolved_by_memory_id are NULL;
++    # when status is resolved/dropped then summary, party, resolved_at are NOT NULL.
++    op.execute(
++        sa.text("""
++        ALTER TABLE memory_map_membership
++            ADD CONSTRAINT memory_map_membership_status_consistency_check
++            CHECK (
++                (status = 'open'
++                 AND resolution_summary IS NULL
++                 AND resolved_by_memory_id IS NULL
++                 AND resolved_by_party IS NULL
++                 AND resolved_at IS NULL)
++                OR
++                (status IN ('resolved', 'dropped')
++                 AND resolution_summary IS NOT NULL
++                 AND resolved_by_party IS NOT NULL
++                 AND resolved_at IS NOT NULL)
++            )
++        """)
++    )
++    # Index to serve cursor reads (since=N): MAX(id) and id > N per map.
++    op.execute(
++        sa.text(
++            "CREATE INDEX memory_map_events_root_id_idx " "ON memory_map_events(root_memory_id, id)"
++        )
++    )
++
++
++def downgrade() -> None:
++    op.execute(
++        sa.text(
++            "ALTER TABLE memory_map_membership DROP CONSTRAINT IF EXISTS memory_map_membership_status_consistency_check"
++        )
++    )
++    op.execute(
++        sa.text(
++            "ALTER TABLE memory_map_membership DROP CONSTRAINT IF EXISTS memory_map_membership_resolved_by_party_check"
++        )
++    )
++    op.execute(
++        sa.text(
++            "ALTER TABLE memory_map_membership DROP CONSTRAINT IF EXISTS memory_map_membership_resolution_summary_check"
++        )
++    )
++    op.execute(
++        sa.text(
++            "ALTER TABLE memory_map_membership DROP CONSTRAINT IF EXISTS memory_map_membership_status_check"
++        )
++    )
++    op.execute(sa.text("ALTER TABLE memory_map_membership DROP COLUMN IF EXISTS resolved_at"))
++    op.execute(sa.text("ALTER TABLE memory_map_membership DROP COLUMN IF EXISTS resolved_by_party"))
++    op.execute(
++        sa.text("ALTER TABLE memory_map_membership DROP COLUMN IF EXISTS resolved_by_memory_id")
++    )
++    op.execute(
++        sa.text("ALTER TABLE memory_map_membership DROP COLUMN IF EXISTS resolution_summary")
++    )
++    op.execute(sa.text("ALTER TABLE memory_map_membership DROP COLUMN IF EXISTS status"))
++    op.execute(sa.text("DROP INDEX IF EXISTS memory_map_events_root_id_idx"))
+diff --git a/docs/mindmap-v1-build-design.md b/docs/mindmap-v1-build-design.md
+index a9195e1..74094a5 100644
+--- a/docs/mindmap-v1-build-design.md
++++ b/docs/mindmap-v1-build-design.md
+@@ -130,7 +130,8 @@ trajectory), versioning/supersession chain (kept separate from promotion).
+ | `mindmap_open` | `new_map(cold\|from_spec)` | mint root memory (type `question`) + slug + `memory_maps` row. cold: similarity-search **live maps only**, return ranked "revisit?" candidates, never auto-merge. from_spec: take a source memsys key, add `seeded-from` edge, **exact** dedup guard (refuse a 2nd live map already seeded from the same source). Returns map key. |
+ | `mindmap_write_node` | owned capture | takes **map key** + content + `node_role` (position/challenge/decision) + optional ratification + optional links; writes a core memory, inserts exclusive membership, bumps `writes_since_review`, logs event. Past a soft byte threshold → returns a **split-suggested** flag (split into linked nodes, never trim). At `writes_since_review >= review_threshold` → returns a sticky `review_due` flag. |
+ | `mindmap_link` | typed edge | insert into `memory_references` with a map `reference_kind` |
+-| `mindmap_get` | resume/inspect | return the map graph: root, member nodes, edges, open loops (whose-turn), pending flags, state |
++| `mindmap_get` | resume/inspect | return the map graph: root, member nodes, edges, open loops (whose-turn), pending flags, state. **Cheap reads**: `since=N` returns only members touched by events after N; `include=open|all` controls which statuses appear; `depth=summary|full` controls content length. Returns `cursor` (MAX event id) every call. |
++| `mindmap_resolve` | settle branch | mark a single node as resolved/dropped with a summary. Updates `memory_map_membership.status` to `resolved` or `dropped`. Optionally creates a `resolves-under`/`dropped-under` edge. The **ONLY** way to settle a branch — edges alone never settle. Required scope: memory.write. |
+ | `mindmap_review` | reviewer | run the map-only structural pass (advisory), surface flags, reset `writes_since_review` to 0 |
+ | `mindmap_close` | `close_map` + graduation | propose significant decisions → **human confirms** → for each: new KB `memory_write` (type `decision`) with a `promoted-from` edge to the archived node, carrying trajectory + ratification metadata → mint spec-index node → `state='archived'`. |
+ 
+@@ -174,6 +175,10 @@ a prompt, never core code (`0aa54585`, `6af0f365`).
+ - `b2e23042` Team/multi-person — deferred; tables mirror tenant scoping so a
+   later `visibility='team'` is non-breaking.
+ - `ad5372db` Fact mechanics — undefined; v1 keeps facts unmapped/ownerless.
++- Branch status: settled branches live in `memory_map_membership.status`
++  (open/resolved/dropped, migration 0044). `open_loops` = members with
++  `status='open'` AND `metadata.responsible_party in ('owner','model')`.
++  Edges alone (`memory_references.reference_kind`) never settle a branch.
+ 
+ ## Build slices (sequenced; risk early)
+ 
+diff --git a/skills/mindmap-driver/SKILL.md b/skills/mindmap-driver/SKILL.md
+index f85bac4..9492e27 100644
+--- a/skills/mindmap-driver/SKILL.md
++++ b/skills/mindmap-driver/SKILL.md
+@@ -33,6 +33,13 @@ edge vocabulary: `displaced-from`, `resolves-under`, `dropped-under`,
+ **Atomicity:** one idea per node. If `split_suggested` comes back true, split
+ the node into linked nodes — never trim or compress.
+ 
++## Resolve / Drop
++When a node is settled (a later node answers it, or it's abandoned), call
++`mindmap_resolve` to mark it resolved or dropped with a summary. This removes
++it from open_loops. Use `disposition="resolved"` when a successor answers it
++(pass `resolved_by_memory_id`); use `disposition="dropped"` when abandoned.
++An edge alone does NOT settle a branch — always call resolve.
++
+ ## Ratify
+ When the user endorses a position, record it on the node:
+ `ratification_strength` ∈ `survived-challenge` > `explicit-endorse` >
+@@ -45,6 +52,11 @@ When a write returns `review_due=true` (every 15 owned writes), or before
+ closing, call `mindmap_review` — or hand the returned structure to the
+ mindmap-reviewer skill — to smoke-test the map, then continue.
+ 
++## Resume
++To resume a map where you left off, call `mindmap_get(map_key=..., since=<cursor>)`
++using the `cursor` from the last response. This returns only new/changed nodes.
++The `open_loops` list shows which nodes are waiting on the user.
++
+ ## Close / graduate
+ When the user signals the thinking is done, propose the significant decisions in
+ plain language and **wait for the user to confirm**. Then call `mindmap_close`
+diff --git a/src/mem_mcp/main.py b/src/mem_mcp/main.py
+index 8439507..5ccbac3 100644
+--- a/src/mem_mcp/main.py
++++ b/src/mem_mcp/main.py
+@@ -69,6 +69,7 @@ from mem_mcp.mcp.tools.mindmap_close import MindmapCloseTool
+ from mem_mcp.mcp.tools.mindmap_get import MindmapGetTool
+ from mem_mcp.mcp.tools.mindmap_link import MindmapLinkTool
+ from mem_mcp.mcp.tools.mindmap_open import MindmapOpenTool
++from mem_mcp.mcp.tools.mindmap_resolve import MindmapResolveTool
+ from mem_mcp.mcp.tools.mindmap_review import MindmapReviewTool
+ from mem_mcp.mcp.tools.mindmap_write_node import MindmapWriteNodeTool
+ from mem_mcp.mcp.tools.refs_in import RefsInTool
+@@ -505,6 +506,7 @@ def _wire_routers(app: FastAPI) -> None:
+         MindmapWriteNodeTool,
+         MindmapLinkTool,
+         MindmapGetTool,
++        MindmapResolveTool,
+         MindmapReviewTool,
+         MindmapCloseTool,
+     ]
+diff --git a/src/mem_mcp/mcp/tool_descriptions.py b/src/mem_mcp/mcp/tool_descriptions.py
+index 22711c7..a87da81 100644
+--- a/src/mem_mcp/mcp/tool_descriptions.py
++++ b/src/mem_mcp/mcp/tool_descriptions.py
+@@ -427,9 +427,27 @@ Pass map_key to log the link as a map event. Required scope: memory.write.
+ Example: mindmap_link(source_memory_id="<challenge>", target_memory_id="<position>", reference_kind="displaced-from", map_key="caching-strategy").""",
+     "mindmap_get": """Read a map's current state — its root, all nodes, the edges between them, review status, and open loops.
+ 
+-Call when: resuming a map mid-conversation; the user asks "where were we", "what have we got so far", "what's still open"; before graduating, to review what was built. open_loops lists nodes whose turn is the owner's (waiting on the user). Required scope: memory.read.
++Call when: resuming a map mid-conversation; the user asks "where were we", "what have we got so far", "what's still open"; before graduating, to review what was built. open_loops lists nodes whose turn is the owner's (waiting on the user) or model's. Required scope: memory.read.
+ 
+-Example: "Where did we get to on caching?" → mindmap_get(map_key="caching-strategy").""",
++Pagination: pass `since=<cursor>` (from a previous response) to return only nodes changed after that event id. Empty result with unchanged cursor means nothing new. Pass `include="open"` (default) for only open loops, or `include="all"` for every node. Pass `depth="summary"` (default) to truncate long content to 200 chars + "…", or `depth="full"` for complete text.
++
++Output carries a `cursor` field on every call — use it as `since` on the next call. Also returns a `resolved` list of settled nodes (with their summary and status) when `include="open"`.
++
++Example: "Where did we get to on caching?" → mindmap_get(map_key="caching-strategy"). Resume: mindmap_get(map_key="caching-strategy", since=42).""",
++    "mindmap_resolve": """Settle a single branch (node) within a live mindmap — mark it resolved or dropped with a summary.
++
++Call when: a position or challenge has been decided, superseded by a later node, or is no longer relevant. Settling removes the node from open_loops so the map stays clean. Use "resolved" when a successor node answers it; "dropped" when it's abandoned.
++
++A resolved branch creates a `resolves-under` or `dropped-under` edge from the resolving node (resolved_by_memory_id) to the settled node. An edge alone does NOT settle a branch — status is the ONLY source of truth. Required scope: memory.write.
++
++Inputs: map_key (from mindmap_open), node_id (UUID of the node to settle), disposition ("resolved" or "dropped"), resolution_summary (1-500 chars explaining why), optional resolved_by_memory_id (the node that resolves/drops this one), resolved_by_party ("owner" or "model").
++
++Output: node_id, new status, resolution_summary, cursor (use as since on next mindmap_get), request_id.
++
++Call when: user says "that's resolved by what I just said", "drop that branch", "we moved past that point".
++Do not call for: settling the whole map (use mindmap_close); the root node (only mindmap_close does that).
++
++Example: user: "Actually, Redis is settled — we go with the cache-aside approach." → mindmap_resolve(map_key="caching-strategy", node_id="<redis-uuid>", disposition="resolved", resolution_summary="User confirmed cache-aside over Redis", resolved_by_memory_id="<cache-aside-node>", resolved_by_party="model").""",
+     "mindmap_review": """Run the structural reviewer pass over a map and reset its write-counter.
+ 
+ Call when mindmap_write_node returns review_due=true (every 15 owned writes), or before graduating. Returns the map's full structure (nodes, edges, recent events) for you — or a review sub-agent — to smoke-test for structural problems: orphan positions, unaddressed challenges, nodes that bundle multiple decisions, mislabeled ratifications. The reviewer looks at the MAP ONLY, never the transcript — it catches mistakes, not cheating. It is advisory; it flags, it does not block. Required scope: memory.write.
+diff --git a/src/mem_mcp/mcp/tools/mindmap_get.py b/src/mem_mcp/mcp/tools/mindmap_get.py
+index a78e673..09e142c 100644
+--- a/src/mem_mcp/mcp/tools/mindmap_get.py
++++ b/src/mem_mcp/mcp/tools/mindmap_get.py
+@@ -1,13 +1,18 @@
+ """mindmap_get — read a map's graph: root, nodes, edges, flags, open loops.
+ 
+-Read-only resume/inspect surface. Open loops = nodes whose turn is the owner's
+-(metadata.responsible_party == 'owner'), the spec's whose-turn resume surface.
++Open loops = member nodes with status='open' AND
++metadata.responsible_party in ('owner','model') — the spec's whose-turn
++resume surface (f5e52f08). Resolved/dropped nodes are never open loops.
++
++Cheap reads: since=N returns only members touched by events after N;
++include=open|all controls which status appears in nodes;
++depth=summary|full controls content length.
+ """
+ 
+ from __future__ import annotations
+ 
+ from datetime import datetime
+-from typing import Any, ClassVar
++from typing import Any, ClassVar, Literal
+ from uuid import UUID
+ 
+ from pydantic import BaseModel, Field
+@@ -17,12 +22,25 @@ from mem_mcp.mcp.errors import JsonRpcError
+ from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+ from mem_mcp.mcp.tools._base import BaseTool, ToolContext
+ from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
+-from mem_mcp.mindmap import service
++from mem_mcp.mindmap import SUMMARY_CONTENT_CHARS, service
++
++
++def _truncate_content(content: str, depth: str) -> tuple[str, bool]:
++    """Truncate content for summary depth.
++
++    Returns (content, truncated).
++    """
++    if depth == "full" or len(content) <= SUMMARY_CONTENT_CHARS:
++        return content, False
++    return content[:SUMMARY_CONTENT_CHARS] + "…", True
+ 
+ 
+ class MindmapGetInput(BaseModel):
+     map_key: str = Field(..., min_length=1, max_length=64)
+     team_id: UUID | None = None
++    since: int | None = Field(default=None, ge=0)
++    include: Literal["open", "all"] = Field(default="open")
++    depth: Literal["summary", "full"] = Field(default="summary")
+ 
+ 
+ class MindmapNode(BaseModel):
+@@ -32,6 +50,17 @@ class MindmapNode(BaseModel):
+     content: str
+     metadata: dict[str, Any]
+     created_at: datetime
++    status: str
++    truncated: bool
++    resolution_summary: str | None = None
++    resolved_by_party: str | None = None
++
++
++class MindmapResolvedEntry(BaseModel):
++    memory_id: UUID
++    resolution_summary: str
++    status: str
++    resolved_by_party: str
+ 
+ 
+ class MindmapEdge(BaseModel):
+@@ -51,6 +80,8 @@ class MindmapGetOutput(BaseModel):
+     nodes: list[MindmapNode]
+     edges: list[MindmapEdge]
+     open_loops: list[UUID]
++    resolved: list[MindmapResolvedEntry]
++    cursor: int
+     request_id: str
+ 
+ 
+@@ -71,26 +102,81 @@ class MindmapGetTool(BaseTool):
+                 raise JsonRpcError(-32602, "map not found", data={"errors": [{"path": "map_key"}]})
+             row = await service.get_map_row(conn, root_memory_id=root_id)
+             assert row is not None
+-            members = await service.fetch_members(
++
++            # Read cursor in the same transaction
++            cursor = await service.current_cursor(conn, root_memory_id=root_id)
++
++            # Fetch window members (single query replaces fetch_members_cursor +
++            # fetch_settled_members). When include=open the query filters on
++            # status='open'; include=all returns every member in the window.
++            members = await service.fetch_window_members(
++                conn,
++                root_memory_id=root_id,
++                tenant_id=ctx.tenant_id,
++                since=inp.since,
++            )
++
++            # Separate open vs settled by status field.
++            if inp.include == "open":
++                members_list = [m for m in members if m.get("status") == "open"]
++                settled = [m for m in members if m.get("status") in ("resolved", "dropped")]
++            else:
++                members_list = members
++                settled = []
++
++            # Fetch edges touching any node in the since-window.
++            # member_ids is the full membership (for FK validation); touched_ids
++            # are the nodes returned in this response.
++            member_ids = await service.fetch_member_ids(
+                 conn, root_memory_id=root_id, tenant_id=ctx.tenant_id
+             )
+-            member_ids = [m["memory_id"] for m in members]
+-            edges = await service.fetch_internal_edges(conn, member_ids=member_ids)
+-
+-        nodes = [
+-            MindmapNode(
+-                memory_id=m["memory_id"],
+-                node_role=m["node_role"],
+-                type=m["type"],
+-                content=m["content"],
+-                metadata=m["metadata"],
+-                created_at=m["created_at"],
++            touched_ids = [m["memory_id"] for m in members_list] + [s["memory_id"] for s in settled]
++            edges = (
++                await service.fetch_edges_touching(
++                    conn, member_ids=member_ids, touched_ids=touched_ids
++                )
++                if member_ids and touched_ids
++                else []
+             )
+-            for m in members
+-        ]
+-        open_loops = [
+-            m["memory_id"] for m in members if m["metadata"].get("responsible_party") == "owner"
++
++            # Open loops are whole-map (independent of since/include): the
++            # resume surface must show every node whose turn is someone's.
++            open_loops = await service.fetch_open_loop_ids(
++                conn,
++                root_memory_id=root_id,
++                tenant_id=ctx.tenant_id,
++            )
++
++        # Build nodes list
++        nodes = []
++        for m in members_list:
++            content, truncated = _truncate_content(m["content"], inp.depth)
++            nodes.append(
++                MindmapNode(
++                    memory_id=m["memory_id"],
++                    node_role=m["node_role"],
++                    type=m["type"],
++                    content=content,
++                    metadata=m["metadata"],
++                    created_at=m["created_at"],
++                    status=m.get("status", "open"),
++                    truncated=truncated,
++                    resolution_summary=m.get("resolution_summary"),
++                    resolved_by_party=m.get("resolved_by_party"),
++                )
++            )
++
++        # Resolved entries ordered by added_at (oldest first).
++        resolved = [
++            MindmapResolvedEntry(
++                memory_id=s["memory_id"],
++                resolution_summary=s["resolution_summary"] or "",
++                status=s["status"],
++                resolved_by_party=s["resolved_by_party"] or "",
++            )
++            for s in sorted(settled, key=lambda s: s["added_at"])
+         ]
++
+         return MindmapGetOutput(
+             map_key=inp.map_key,
+             root_memory_id=root_id,
+@@ -109,5 +195,7 @@ class MindmapGetTool(BaseTool):
+                 for e in edges
+             ],
+             open_loops=open_loops,
++            resolved=resolved,
++            cursor=cursor,
+             request_id=ctx.request_id,
+         )
+diff --git a/src/mem_mcp/mcp/tools/mindmap_resolve.py b/src/mem_mcp/mcp/tools/mindmap_resolve.py
+new file mode 100644
+index 0000000..15700ed
+--- /dev/null
++++ b/src/mem_mcp/mcp/tools/mindmap_resolve.py
+@@ -0,0 +1,192 @@
++"""mindmap_resolve — settle a single branch (resolve or drop) within a live map.
++
++Branch status lives in memory_map_membership.status; resolving a node never
++creates a map-level state change. The only source of truth for "settled" is
++the status column — a memory_references edge alone does NOT settle a branch.
++"""
++
++from __future__ import annotations
++
++from typing import ClassVar, Literal
++from uuid import UUID
++
++from pydantic import BaseModel, Field
++
++from mem_mcp.db import system_tx, tenant_tx
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
++from mem_mcp.mcp.tools._base import BaseTool, ToolContext
++from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
++from mem_mcp.mindmap import (
++    DISPOSITION_TO_REFERENCE_KIND,
++    service,
++)
++from mem_mcp.teams.references import (
++    ReferenceTargetNotFoundError,
++    insert_reference,
++    resolve_reference_target,
++)
++
++
++class MindmapResolveInput(BaseModel):
++    map_key: str = Field(..., min_length=1, max_length=64)
++    node_id: UUID
++    disposition: Literal["resolved", "dropped"] = Field(default="resolved")
++    resolution_summary: str = Field(..., min_length=1, max_length=500)
++    resolved_by_memory_id: UUID | None = None
++    resolved_by_party: Literal["owner", "model"] = Field(default="model")
++    team_id: UUID | None = None
++
++
++class MindmapResolveOutput(BaseModel):
++    node_id: UUID
++    status: str
++    resolution_summary: str
++    cursor: int
++    request_id: str
++
++
++class MindmapResolveTool(BaseTool):
++    name: ClassVar[str] = "mindmap_resolve"
++    description: ClassVar[str] = TOOL_DESCRIPTIONS["mindmap_resolve"]
++    required_scope: ClassVar[str] = "memory.write"
++    InputModel: ClassVar[type[BaseModel]] = MindmapResolveInput
++    OutputModel: ClassVar[type[BaseModel]] = MindmapResolveOutput
++
++    async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
++        assert isinstance(inp, MindmapResolveInput)
++
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            team_id = await resolve_team_id(conn, ctx, inp.team_id)
++            root_id = await service.resolve_map_root(conn, team_id=team_id, map_key=inp.map_key)
++            if root_id is None:
++                raise JsonRpcError(-32602, "map not found", data={"errors": [{"path": "map_key"}]})
++
++            # Map must be live (also acquires FOR UPDATE for serialization)
++            if not await service.lock_live_map(
++                conn, root_memory_id=root_id, tenant_id=ctx.tenant_id
++            ):
++                raise JsonRpcError(
++                    -32602, "map already archived (no-reopen)", data={"code": "map_not_live"}
++                )
++
++            # node_id must be a member of THIS map
++            membership = await service.get_membership(
++                conn, memory_id=inp.node_id, root_memory_id=root_id, tenant_id=ctx.tenant_id
++            )
++            if membership is None:
++                raise JsonRpcError(
++                    -32602,
++                    "node is not a member of this map",
++                    data={"errors": [{"path": "node_id"}]},
++                )
++            # Root node cannot be resolved
++            if membership["node_role"] == "root":
++                raise JsonRpcError(
++                    -32602, "root node cannot be resolved", data={"errors": [{"path": "node_id"}]}
++                )
++
++        # Validate resolved_by_memory_id (outside the tenant_tx so we can
++        # use system_tx for resolve_reference_target).
++        if inp.resolved_by_memory_id is not None:
++            if inp.resolved_by_memory_id == inp.node_id:
++                raise JsonRpcError(
++                    -32602,
++                    "resolved_by_memory_id must differ from node_id",
++                    data={"errors": [{"path": "resolved_by_memory_id"}]},
++                )
++            async with system_tx(ctx.db_pool) as sys_conn:
++                try:
++                    await resolve_reference_target(
++                        sys_conn,
++                        target_uuid=inp.resolved_by_memory_id,
++                        caller_user_id=ctx.tenant_id,
++                    )
++                except ReferenceTargetNotFoundError as exc:
++                    raise JsonRpcError(
++                        -32602,
++                        "reference target not found or not accessible",
++                        data={"code": "memory_not_accessible"},
++                    ) from exc
++
++        # All validation passed — perform the write atomically.
++        # Acquire the FOR UPDATE lock via lock_live_map (serialises resolve
++        # vs close). The membership-level lock from lock_live_map protects
++        # the window between validation and write.
++        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++            # 0. Re-check live (map could have closed between txs)
++            if not await service.lock_live_map(
++                conn, root_memory_id=root_id, tenant_id=ctx.tenant_id
++            ):
++                raise JsonRpcError(
++                    -32602, "map already archived (no-reopen)", data={"code": "map_not_live"}
++                )
++
++            # 1. Update the membership row (now with tenant_id; returns bool)
++            ok = await service.set_branch_status(
++                conn,
++                memory_id=inp.node_id,
++                root_memory_id=root_id,
++                tenant_id=ctx.tenant_id,
++                status=inp.disposition,
++                resolution_summary=inp.resolution_summary,
++                resolved_by_memory_id=inp.resolved_by_memory_id,
++                resolved_by_party=inp.resolved_by_party,
++            )
++            if not ok:
++                raise JsonRpcError(
++                    -32602,
++                    "failed to set branch status (node may be root or already locked)",
++                    data={"errors": [{"path": "node_id"}]},
++                )
++
++            # 2. If a resolving node is named: insert the edge
++            # Fetch team_id inside this write tx (needs tenant_id filter).
++            target_team = await service.fetch_node_team_id(
++                conn, memory_id=inp.node_id, tenant_id=ctx.tenant_id
++            )
++            if target_team is None:
++                raise JsonRpcError(
++                    -32602,
++                    "node vanished between validation and write",
++                    data={"errors": [{"path": "node_id"}]},
++                )
++            reference_kind = None
++            if inp.resolved_by_memory_id is not None:
++                reference_kind = DISPOSITION_TO_REFERENCE_KIND[inp.disposition]
++                await insert_reference(
++                    conn,
++                    source_memory_id=inp.resolved_by_memory_id,
++                    target_memory_id=inp.node_id,
++                    target_team_id=target_team,
++                    reference_kind=reference_kind,
++                )
++
++            # 3. Append a map event
++            event_type = "resolve" if inp.disposition == "resolved" else "drop"
++            await service.log_event(
++                conn,
++                root_memory_id=root_id,
++                tenant_id=ctx.tenant_id,
++                event=event_type,
++                actor=inp.resolved_by_party,
++                memory_id=inp.node_id,
++                payload={
++                    "disposition": inp.disposition,
++                    "resolved_by_memory_id": str(inp.resolved_by_memory_id)
++                    if inp.resolved_by_memory_id
++                    else None,
++                    "reference_kind": reference_kind,
++                },
++            )
++
++            # 4. Read the new cursor
++            new_cursor = await service.current_cursor(conn, root_memory_id=root_id)
++
++        return MindmapResolveOutput(
++            node_id=inp.node_id,
++            status=inp.disposition,
++            resolution_summary=inp.resolution_summary,
++            cursor=new_cursor,
++            request_id=ctx.request_id,
++        )
+diff --git a/src/mem_mcp/mindmap/__init__.py b/src/mem_mcp/mindmap/__init__.py
+index b120fd9..c956c07 100644
+--- a/src/mem_mcp/mindmap/__init__.py
++++ b/src/mem_mcp/mindmap/__init__.py
+@@ -36,3 +36,29 @@ RATIFICATION_STRENGTHS: Final[tuple[str, ...]] = (
+     "delegate",
+     "tacit",
+ )
++
++# ── Branch status (migration 0044) ──────────────────────────────────────────
++
++# Valid values for memory_map_membership.status.
++BRANCH_STATUSES: Final[frozenset[str]] = frozenset({"open", "resolved", "dropped"})
++
++# Disposition → reference_kind mapping used when inserting the resolving edge.
++DISPOSITION_TO_REFERENCE_KIND: Final[dict[str, str]] = {
++    "resolved": "resolves-under",
++    "dropped": "dropped-under",
++}
++
++# Valid disposition values for mindmap_resolve.
++RESOLVE_DISPOSITIONS: Final[frozenset[str]] = frozenset({"resolved", "dropped"})
++
++# Valid resolved_by_party values.
++RESOLVE_PARTIES: Final[frozenset[str]] = frozenset({"owner", "model"})
++
++# Valid responsible_party values for open-loop detection.
++RESPONSIBLE_PARTIES: Final[tuple[str, ...]] = ("owner", "model")
++
++# ── Cheap reads on mindmap_get ───────────────────────────────────────────────
++
++# Maximum content length for summary depth. When content exceeds this,
++# truncate to SUMMARY_CONTENT_CHARS + a single U+2026 ellipsis char.
++SUMMARY_CONTENT_CHARS: Final[int] = 200
+diff --git a/src/mem_mcp/mindmap/service.py b/src/mem_mcp/mindmap/service.py
+index 340773c..26dbc26 100644
+--- a/src/mem_mcp/mindmap/service.py
++++ b/src/mem_mcp/mindmap/service.py
+@@ -12,6 +12,8 @@ import json
+ from typing import TYPE_CHECKING, Any
+ from uuid import UUID
+ 
++from mem_mcp.mindmap import RESPONSIBLE_PARTIES
++
+ if TYPE_CHECKING:
+     import asyncpg  # type: ignore[import-untyped]
+ 
+@@ -182,7 +184,7 @@ async def fetch_members(
+     """
+     rows = await conn.fetch(
+         """
+-        SELECT mm.memory_id, mm.node_role, mm.added_at,
++        SELECT mm.memory_id, mm.node_role, mm.added_at, mm.status,
+                m.content, m.type, m.metadata, m.created_at
+         FROM memory_map_membership mm
+         JOIN memories m ON m.id = mm.memory_id
+@@ -239,3 +241,273 @@ async def fetch_recent_events(
+         d["payload"] = _as_dict(d.get("payload"))
+         out.append(d)
+     return out
++
++
++# ── Branch-status helpers (migration 0044) ───────────────────────────────────
++
++
++async def get_membership(
++    conn: asyncpg.Connection, *, memory_id: UUID, root_memory_id: UUID, tenant_id: UUID
++) -> dict[str, Any] | None:
++    """Fetch a single membership row (or None).
++
++    Called to validate that a node belongs to a specific map before
++    allowing operations like resolve.
++    """
++    row = await conn.fetchrow(
++        """
++        SELECT memory_id, root_memory_id, tenant_id, node_role, status,
++               resolution_summary, resolved_by_memory_id, resolved_by_party, resolved_at
++        FROM memory_map_membership
++        WHERE memory_id = $1 AND root_memory_id = $2 AND tenant_id = $3
++        """,
++        memory_id,
++        root_memory_id,
++        tenant_id,
++    )
++    return dict(row) if row else None
++
++
++async def lock_live_map(conn: asyncpg.Connection, *, root_memory_id: UUID, tenant_id: UUID) -> bool:
++    """Lock the map row and return True only if it is live.
++
++    The FOR UPDATE lock serialises resolve vs close operations.
++    """
++    row = await conn.fetchrow(
++        """
++        SELECT state FROM memory_maps
++        WHERE root_memory_id = $1 AND tenant_id = $2
++        FOR UPDATE
++        """,
++        root_memory_id,
++        tenant_id,
++    )
++    return row is not None and row["state"] == "live"
++
++
++async def set_branch_status(
++    conn: asyncpg.Connection,
++    *,
++    memory_id: UUID,
++    root_memory_id: UUID,
++    tenant_id: UUID,
++    status: str,
++    resolution_summary: str | None = None,
++    resolved_by_memory_id: UUID | None = None,
++    resolved_by_party: str | None = None,
++) -> bool:
++    """Update the branch-status columns on a membership row.
++
++    Returns True if a row was updated (False → no-op / already set / root node).
++    Tenant scoping and root-node exclusion are enforced in SQL.
++    """
++    result = await conn.fetchval(
++        """
++        UPDATE memory_map_membership
++           SET status = $4,
++               resolution_summary = $5,
++               resolved_by_memory_id = $6,
++               resolved_by_party = $7,
++               resolved_at = now()
++        WHERE memory_id = $1 AND root_memory_id = $2 AND tenant_id = $3
++          AND node_role <> 'root'
++        RETURNING memory_id
++        """,
++        memory_id,
++        root_memory_id,
++        tenant_id,
++        status,
++        resolution_summary,
++        resolved_by_memory_id,
++        resolved_by_party,
++    )
++    return result is not None
++
++
++async def current_cursor(conn: asyncpg.Connection, *, root_memory_id: UUID) -> int:
++    """Return MAX(id) of memory_map_events for this map (0 if none)."""
++    val = await conn.fetchval(
++        "SELECT COALESCE(MAX(id), 0) FROM memory_map_events WHERE root_memory_id = $1",
++        root_memory_id,
++    )
++    return int(val) if val else 0
++
++
++async def fetch_touched_member_ids(
++    conn: asyncpg.Connection, *, root_memory_id: UUID, since: int
++) -> set[UUID]:
++    """Member IDs whose membership row is referenced by a map event with id > since.
++
++    For link events the ``payload->>'target'`` (if it is a valid UUID) also
++    counts.  Invalid casts are silently skipped by guarding with a UUID
++    pattern regex.
++    """
++    uuid_pat = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]" r"{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
++    rows = await conn.fetch(
++        """
++        SELECT memory_id FROM memory_map_events
++        WHERE root_memory_id = $1 AND id > $2
++        UNION
++        SELECT (payload->>'target')::uuid
++        FROM memory_map_events
++        WHERE root_memory_id = $1 AND id > $2
++          AND event = 'link'
++          AND payload ? 'target'
++          AND payload->>'target' ~ $3
++        """,
++        root_memory_id,
++        since,
++        uuid_pat,
++    )
++    return {r["memory_id"] for r in rows if r["memory_id"] is not None}
++
++
++async def fetch_member_ids(
++    conn: asyncpg.Connection, *, root_memory_id: UUID, tenant_id: UUID
++) -> list[UUID]:
++    """All member IDs for a map (tenant + deleted_at filter)."""
++    rows = await conn.fetch(
++        """
++        SELECT mm.memory_id
++        FROM memory_map_membership mm
++        JOIN memories m ON m.id = mm.memory_id
++        WHERE mm.root_memory_id = $1
++          AND mm.tenant_id = $2
++          AND m.tenant_id = $2
++          AND m.deleted_at IS NULL
++        """,
++        root_memory_id,
++        tenant_id,
++    )
++    return [r["memory_id"] for r in rows]
++
++
++async def fetch_window_members(
++    conn: asyncpg.Connection,
++    *,
++    root_memory_id: UUID,
++    tenant_id: UUID,
++    since: int | None = None,
++) -> list[dict[str, Any]]:
++    """All members in the since-window.
++
++    - *since* = None → every (non-deleted) member.
++    - *since* = N → only members touched by events with id > N.
++    - Returns [] if no events match.
++    """
++    if since is None:
++        rows = await conn.fetch(
++            """
++            SELECT mm.memory_id, mm.node_role, mm.added_at, mm.status,
++                   mm.resolution_summary, mm.resolved_by_party,
++                   m.content, m.type, m.metadata, m.created_at
++            FROM memory_map_membership mm
++            JOIN memories m ON m.id = mm.memory_id
++            WHERE mm.root_memory_id = $1
++              AND mm.tenant_id = $2
++              AND m.tenant_id = $2
++              AND m.deleted_at IS NULL
++            ORDER BY mm.added_at ASC
++            """,
++            root_memory_id,
++            tenant_id,
++        )
++    else:
++        touched = await fetch_touched_member_ids(conn, root_memory_id=root_memory_id, since=since)
++        if not touched:
++            return []
++        touched_arr = list(touched)
++        rows = await conn.fetch(
++            """
++            SELECT mm.memory_id, mm.node_role, mm.added_at, mm.status,
++                   mm.resolution_summary, mm.resolved_by_party,
++                   m.content, m.type, m.metadata, m.created_at
++            FROM memory_map_membership mm
++            JOIN memories m ON m.id = mm.memory_id
++            WHERE mm.root_memory_id = $1
++              AND mm.memory_id = ANY($2::uuid[])
++              AND mm.tenant_id = $3
++              AND m.tenant_id = $3
++              AND m.deleted_at IS NULL
++            ORDER BY mm.added_at ASC
++            """,
++            root_memory_id,
++            touched_arr,
++            tenant_id,
++        )
++    out: list[dict[str, Any]] = []
++    for r in rows:
++        d = dict(r)
++        d["metadata"] = _as_dict(d.get("metadata"))
++        out.append(d)
++    return out
++
++
++async def fetch_edges_touching(
++    conn: asyncpg.Connection, *, member_ids: list[UUID], touched_ids: list[UUID]
++) -> list[dict[str, Any]]:
++    """Edges where at least one endpoint is in *touched_ids* and both endpoints
++    are members of the map (*member_ids*)."""
++    if not member_ids or not touched_ids:
++        return []
++    rows = await conn.fetch(
++        """
++        SELECT source_memory_id, target_memory_id, reference_kind, created_at
++        FROM memory_references
++        WHERE source_memory_id = ANY($1::uuid[])
++          AND target_memory_id = ANY($1::uuid[])
++          AND (source_memory_id = ANY($2::uuid[])
++               OR target_memory_id = ANY($2::uuid[]))
++        ORDER BY created_at ASC
++        """,
++        member_ids,
++        touched_ids,
++    )
++    return [dict(r) for r in rows]
++
++
++async def fetch_open_loop_ids(
++    conn: asyncpg.Connection,
++    *,
++    root_memory_id: UUID,
++    tenant_id: UUID,
++) -> list[UUID]:
++    """Open-loop node IDs.
++
++    Queries the membership rows with open status and their full metadata,
++    then filters in Python (avoids SQL jsonb->> issues with the store's
++    double-encoded metadata format).
++    """
++    rows = await conn.fetch(
++        """
++        SELECT mm.memory_id, m.metadata
++        FROM memory_map_membership mm
++        JOIN memories m ON m.id = mm.memory_id
++        WHERE mm.root_memory_id = $1
++          AND mm.tenant_id = $2
++          AND mm.status = 'open'
++          AND m.tenant_id = $2
++          AND m.deleted_at IS NULL
++        ORDER BY mm.added_at ASC
++        """,
++        root_memory_id,
++        tenant_id,
++    )
++    out: list[UUID] = []
++    for r in rows:
++        metadata = _as_dict(r.get("metadata"))
++        if metadata.get("responsible_party") in RESPONSIBLE_PARTIES:
++            out.append(r["memory_id"])
++    return out
++
++
++async def fetch_node_team_id(
++    conn: asyncpg.Connection, *, memory_id: UUID, tenant_id: UUID
++) -> UUID | None:
++    """Return the team_id for a memory row (used for insert_reference FK)."""
++    val: UUID | None = await conn.fetchval(
++        "SELECT team_id FROM memories WHERE id = $1 AND tenant_id = $2",
++        memory_id,
++        tenant_id,
++    )
++    return val
+diff --git a/tests/integration/test_debug_open_loops.py b/tests/integration/test_debug_open_loops.py
+new file mode 100644
+index 0000000..1aead6e
+--- /dev/null
++++ b/tests/integration/test_debug_open_loops.py
+@@ -0,0 +1 @@
++"""Placeholder left by a debugging session; safe to delete."""
+diff --git a/tests/integration/test_jsonb_cast.py b/tests/integration/test_jsonb_cast.py
+new file mode 100644
+index 0000000..1aead6e
+--- /dev/null
++++ b/tests/integration/test_jsonb_cast.py
+@@ -0,0 +1 @@
++"""Placeholder left by a debugging session; safe to delete."""
+diff --git a/tests/integration/test_jsonb_minimal.py b/tests/integration/test_jsonb_minimal.py
+new file mode 100644
+index 0000000..1aead6e
+--- /dev/null
++++ b/tests/integration/test_jsonb_minimal.py
+@@ -0,0 +1 @@
++"""Placeholder left by a debugging session; safe to delete."""
+diff --git a/tests/integration/test_mindmap_resolve_e2e.py b/tests/integration/test_mindmap_resolve_e2e.py
+new file mode 100644
+index 0000000..00d1843
+--- /dev/null
++++ b/tests/integration/test_mindmap_resolve_e2e.py
+@@ -0,0 +1,1192 @@
++"""End-to-end integration test for mindmap_resolve and enhanced mindmap_get.
++
++Covers: resolve/drop with and without resolver, wrong-map node, unknown map,
++root node, archived map, inaccessible resolver, open_loops semantics,
++cheap reads (since/include/depth), and the fact that a link alone does not
++settle a branch.
++
++Uses the same fixture style as test_mindmap_e2e.py (UUID-suffixed tenants).
++"""
++
++from __future__ import annotations
++
++from typing import Any
++from uuid import uuid4
++
++import asyncpg  # type: ignore[import-untyped]
++import pytest
++
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tools._base import ToolContext
++from mem_mcp.mcp.tools.mindmap_close import (
++    MindmapCloseInput,
++    MindmapCloseTool,
++)
++from mem_mcp.mcp.tools.mindmap_get import MindmapGetInput, MindmapGetTool
++from mem_mcp.mcp.tools.mindmap_link import MindmapLinkInput, MindmapLinkTool
++from mem_mcp.mcp.tools.mindmap_open import MindmapOpenInput, MindmapOpenTool
++from mem_mcp.mcp.tools.mindmap_resolve import MindmapResolveInput, MindmapResolveTool
++from mem_mcp.mcp.tools.mindmap_write_node import (
++    MindmapWriteNodeInput,
++    MindmapWriteNodeTool,
++)
++from mem_mcp.teams.assignments import assign_role
++
++pytestmark = pytest.mark.asyncio
++
++
++def _build_deps() -> Any:
++    from mem_mcp.audit.logger import NoopAuditLogger
++    from mem_mcp.mcp.tools._deps import NoopQuotas, ToolDeps
++
++    class _StubEmbed:
++        async def embed(self, content: str) -> Any:
++            from mem_mcp.embeddings.bedrock import EmbedResult
++
++            return EmbedResult(vector=[0.0] * 1024, input_tokens=max(1, len(content) // 4))
++
++    return ToolDeps(embeddings=_StubEmbed(), audit=NoopAuditLogger(), quotas=NoopQuotas())
++
++
++async def _setup(conn: asyncpg.Connection) -> dict[str, Any]:
++    tenant = await conn.fetchval(
++        "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++        f"resolve-{uuid4()}@example.test",
++    )
++    team = await conn.fetchval(
++        "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++        f"resolve-team-{uuid4().hex[:8]}",
++        tenant,
++    )
++    await assign_role(
++        conn,
++        parent_team_id=team,
++        member_kind="user",
++        member_id=tenant,
++        role_key="member",
++        assigned_by_user_id=tenant,
++    )
++    await conn.execute(
++        """
++        INSERT INTO tenant_identities
++            (tenant_id, cognito_sub, provider, email, is_primary, default_team_id)
++        VALUES ($1, $2, 'cognito', $3, true, $4)
++        """,
++        tenant,
++        f"sub-{tenant}",
++        f"resolve-{tenant}@example.test",
++        team,
++    )
++    client_id = f"client:resolve-{uuid4().hex[:8]}"
++    await conn.execute(
++        """
++        INSERT INTO oauth_clients (id, redirect_uris, scope, registration_payload, review_status)
++        VALUES ($1, ARRAY[]::text[], 'memory.read memory.write', '{}'::jsonb, 'auto_allowed')
++        """,
++        client_id,
++    )
++    return {"tenant": tenant, "team": team, "client_id": client_id}
++
++
++async def _setup_other_tenant(conn: asyncpg.Connection) -> dict[str, Any]:
++    """Set up a second tenant for cross-map tests."""
++    tenant = await conn.fetchval(
++        "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++        f"resolve-other-{uuid4()}@example.test",
++    )
++    team = await conn.fetchval(
++        "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++        f"other-team-{uuid4().hex[:8]}",
++        tenant,
++    )
++    await assign_role(
++        conn,
++        parent_team_id=team,
++        member_kind="user",
++        member_id=tenant,
++        role_key="member",
++        assigned_by_user_id=tenant,
++    )
++    await conn.execute(
++        """
++        INSERT INTO tenant_identities
++            (tenant_id, cognito_sub, provider, email, is_primary, default_team_id)
++        VALUES ($1, $2, 'cognito', $3, true, $4)
++        """,
++        tenant,
++        f"sub-{tenant}",
++        f"resolve-other-{tenant}@example.test",
++        team,
++    )
++    client_id = f"client:other-{uuid4().hex[:8]}"
++    await conn.execute(
++        """
++        INSERT INTO oauth_clients (id, redirect_uris, scope, registration_payload, review_status)
++        VALUES ($1, ARRAY[]::text[], 'memory.read memory.write', '{}'::jsonb, 'auto_allowed')
++        """,
++        client_id,
++    )
++    return {"tenant": tenant, "team": team, "client_id": client_id}
++
++
++async def _cleanup(pool: Any, tenant: Any, team: Any, client_id: str) -> None:
++    async with pool.acquire() as conn:
++        async with conn.transaction():
++            await conn.execute(
++                "DELETE FROM memory_references WHERE source_memory_id IN "
++                "(SELECT id FROM memories WHERE tenant_id = $1) "
++                "OR target_memory_id IN (SELECT id FROM memories WHERE tenant_id = $1)",
++                tenant,
++            )
++            await conn.execute("DELETE FROM memory_map_events WHERE tenant_id = $1", tenant)
++            await conn.execute("DELETE FROM memory_map_membership WHERE tenant_id = $1", tenant)
++            await conn.execute("DELETE FROM memory_maps WHERE tenant_id = $1", tenant)
++            await conn.execute("DELETE FROM slugs WHERE team_id = $1", team)
++            await conn.execute("DELETE FROM memories WHERE tenant_id = $1", tenant)
++            await conn.execute("DELETE FROM team_role_assignments WHERE parent_team_id = $1", team)
++            await conn.execute("DELETE FROM tenant_identities WHERE tenant_id = $1", tenant)
++            await conn.execute("DELETE FROM teams WHERE id = $1", team)
++            await conn.execute("DELETE FROM tenants WHERE id = $1", tenant)
++            await conn.execute("DELETE FROM oauth_clients WHERE id = $1", client_id)
++
++
++def _ctx(pool: Any, tenant: Any, client_id: str) -> ToolContext:
++    return ToolContext(
++        request_id=f"req-{uuid4().hex[:8]}",
++        tenant_id=tenant,
++        identity_id=tenant,
++        client_id=client_id,
++        scopes=frozenset({"memory.read", "memory.write"}),
++        db_pool=pool,
++        deps=_build_deps(),
++    )
++
++
++# ── Test 1: resolve with resolving node ──────────────────────────────────────
++
++
++async def test_resolve_with_resolver(pg_pool: Any) -> None:
++    """Resolve with a resolver node → status/summary/party set; edge created; event logged; cursor increased."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        # Open map and write nodes
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        # Node to resolve
++        n1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key, content="Position A", node_role="position"
++            ),
++        )
++        # Resolver node
++        n2 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key, content="Position B (resolver)", node_role="position"
++            ),
++        )
++
++        # Get current cursor
++        got_before = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        cursor_before = got_before.cursor
++
++        # Resolve n1 with n2 as resolver
++        resolved = await MindmapResolveTool()(
++            ctx,
++            MindmapResolveInput(
++                map_key=opened.map_key,
++                node_id=n1.node_id,
++                disposition="resolved",
++                resolution_summary="Settled by Position B",
++                resolved_by_memory_id=n2.node_id,
++                resolved_by_party="model",
++            ),
++        )
++        assert resolved.status == "resolved"
++        assert resolved.resolution_summary == "Settled by Position B"
++        assert resolved.cursor > cursor_before
++
++        # Verify DB state: membership row
++        async with pg_pool.acquire() as conn:
++            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant))
++            mem = await conn.fetchrow(
++                "SELECT status, resolution_summary, resolved_by_party, resolved_at "
++                "FROM memory_map_membership WHERE memory_id = $1",
++                n1.node_id,
++            )
++            assert mem["status"] == "resolved"
++            assert mem["resolution_summary"] == "Settled by Position B"
++            assert mem["resolved_by_party"] == "model"
++            assert mem["resolved_at"] is not None
++
++            # Edge: n2 resolves-under n1
++            edge = await conn.fetchval(
++                "SELECT reference_kind FROM memory_references "
++                "WHERE source_memory_id = $1 AND target_memory_id = $2",
++                n2.node_id,
++                n1.node_id,
++            )
++            assert edge == "resolves-under"
++
++            # Event
++            evt = await conn.fetchrow(
++                "SELECT event, actor FROM memory_map_events "
++                "WHERE memory_id = $1 ORDER BY id DESC LIMIT 1",
++                n1.node_id,
++            )
++            assert evt["event"] == "resolve"
++            assert evt["actor"] == "model"
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 2: drop without resolving node ──────────────────────────────────────
++
++
++async def test_drop_no_resolver(pg_pool: Any) -> None:
++    """Drop without resolver → status dropped, no edge row, event drop."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        n1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key, content="Abandoned", node_role="position"
++            ),
++        )
++
++        resolved = await MindmapResolveTool()(
++            ctx,
++            MindmapResolveInput(
++                map_key=opened.map_key,
++                node_id=n1.node_id,
++                disposition="dropped",
++                resolution_summary="No longer relevant",
++                resolved_by_party="model",
++            ),
++        )
++        assert resolved.status == "dropped"
++
++        async with pg_pool.acquire() as conn:
++            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant))
++            mem = await conn.fetchrow(
++                "SELECT status FROM memory_map_membership WHERE memory_id = $1", n1.node_id
++            )
++            assert mem["status"] == "dropped"
++
++            # No edge should exist for n1
++            edge = await conn.fetchval(
++                "SELECT count(*) FROM memory_references " "WHERE target_memory_id = $1", n1.node_id
++            )
++            assert edge == 0
++
++            evt = await conn.fetchrow(
++                "SELECT event FROM memory_map_events "
++                "WHERE memory_id = $1 ORDER BY id DESC LIMIT 1",
++                n1.node_id,
++            )
++            assert evt["event"] == "drop"
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 3: drop with resolver → dropped-under ───────────────────────────────
++
++
++async def test_drop_with_resolver(pg_pool: Any) -> None:
++    """Drop with resolver → kind dropped-under."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        n1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key, content="Abandoned", node_role="position"
++            ),
++        )
++        n2 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key, content="Better approach", node_role="position"
++            ),
++        )
++
++        await MindmapResolveTool()(
++            ctx,
++            MindmapResolveInput(
++                map_key=opened.map_key,
++                node_id=n1.node_id,
++                disposition="dropped",
++                resolution_summary="Dropped in favor of better approach",
++                resolved_by_memory_id=n2.node_id,
++                resolved_by_party="model",
++            ),
++        )
++
++        async with pg_pool.acquire() as conn:
++            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant))
++            edge = await conn.fetchval(
++                "SELECT reference_kind FROM memory_references "
++                "WHERE source_memory_id = $1 AND target_memory_id = $2",
++                n2.node_id,
++                n1.node_id,
++            )
++            assert edge == "dropped-under"
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 4: error cases ─────────────────────────────────────────────────────
++
++
++async def test_resolve_error_cases(pg_pool: Any) -> None:
++    """Unknown map, root node, archived map, node of another map, inaccessible resolver."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++            s2 = await _setup_other_tenant(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        n1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=opened.map_key, content="Node A", node_role="position"),
++        )
++
++        # ---- Unknown map ----
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapResolveTool()(
++                ctx,
++                MindmapResolveInput(
++                    map_key="nonexistent-map",
++                    node_id=n1.node_id,
++                    resolution_summary="test",
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert exc_info.value.message == "map not found"
++
++        # Verify nothing changed
++        async with pg_pool.acquire() as conn:
++            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant))
++            mem = await conn.fetchrow(
++                "SELECT status FROM memory_map_membership WHERE memory_id = $1", n1.node_id
++            )
++            assert mem["status"] == "open"
++
++        # ---- Root node ----
++        # Get root_memory_id from opened
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapResolveTool()(
++                ctx,
++                MindmapResolveInput(
++                    map_key=opened.map_key,
++                    node_id=opened.root_memory_id,
++                    resolution_summary="test",
++                ),
++            )
++        assert exc_info.value.code == -32602
++
++        # ---- Node of a different map (same tenant) ----
++        opened2 = await MindmapOpenTool()(
++            ctx, MindmapOpenInput(title="Test 2", root_question="How?")
++        )
++        n_other = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened2.map_key, content="Other node", node_role="position"
++            ),
++        )
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapResolveTool()(
++                ctx,
++                MindmapResolveInput(
++                    map_key=opened.map_key,
++                    node_id=n_other.node_id,
++                    resolution_summary="test",
++                ),
++            )
++        assert exc_info.value.code == -32602
++        # Verify the other node is still open
++        async with pg_pool.acquire() as conn:
++            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant))
++            mem = await conn.fetchrow(
++                "SELECT status FROM memory_map_membership WHERE memory_id = $1", n_other.node_id
++            )
++            assert mem["status"] == "open"
++
++        # ---- Archived map (no-reopen) ----
++        await MindmapCloseTool()(
++            ctx,
++            MindmapCloseInput(map_key=opened.map_key),
++        )
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapResolveTool()(
++                ctx,
++                MindmapResolveInput(
++                    map_key=opened.map_key,
++                    node_id=n1.node_id,
++                    resolution_summary="test",
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert exc_info.value.data.get("code") == "map_not_live"
++
++        # ---- Unknown resolver id ----
++        opened3 = await MindmapOpenTool()(
++            ctx,
++            MindmapOpenInput(title="Test 3", root_question="When?"),
++        )
++        n3 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened3.map_key,
++                content="Node 3",
++                node_role="position",
++            ),
++        )
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapResolveTool()(
++                ctx,
++                MindmapResolveInput(
++                    map_key=opened3.map_key,
++                    node_id=n3.node_id,
++                    resolution_summary="test",
++                    resolved_by_memory_id=uuid4(),  # random UUID doesn't exist
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert exc_info.value.data.get("code") == "memory_not_accessible"
++        # Nothing changed
++        async with pg_pool.acquire() as conn:
++            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant))
++            mem = await conn.fetchrow(
++                "SELECT status FROM memory_map_membership WHERE memory_id = $1", n3.node_id
++            )
++            assert mem["status"] == "open"
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++        await _cleanup(pg_pool, s2["tenant"], s2["team"], s2["client_id"])
++
++
++# ── Test 5: link alone does NOT settle ───────────────────────────────────────
++
++
++async def test_link_does_not_settle(pg_pool: Any) -> None:
++    """mindmap_link with resolves-under alone does NOT settle the target (status stays open)."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        n1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="Position",
++                node_role="position",
++                responsible_party="owner",
++            ),
++        )
++        n2 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="Resolution",
++                node_role="position",
++            ),
++        )
++
++        # Link: n2 resolves-under n1
++        await MindmapLinkTool()(
++            ctx,
++            MindmapLinkInput(
++                source_memory_id=n2.node_id,
++                target_memory_id=n1.node_id,
++                reference_kind="resolves-under",
++                map_key=opened.map_key,
++            ),
++        )
++
++        # Verify status is still open
++        async with pg_pool.acquire() as conn:
++            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant))
++            mem = await conn.fetchrow(
++                "SELECT status FROM memory_map_membership WHERE memory_id = $1", n1.node_id
++            )
++            assert mem["status"] == "open"
++
++        # n1 should still appear in open_loops (it has responsible_party=owner)
++        got = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        assert n1.node_id in got.open_loops
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 6: open_loops semantics ─────────────────────────────────────────────
++
++
++async def test_open_loops_semantics(pg_pool: Any) -> None:
++    """owner-party and model-party open nodes are included; node without responsible_party is not;
++    after resolve, the node disappears from open_loops."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++
++        # Node with responsible_party=owner
++        n_owner = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="Owner node",
++                node_role="position",
++                responsible_party="owner",
++            ),
++        )
++        # Node with responsible_party=model
++        n_model = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="Model node",
++                node_role="position",
++                responsible_party="model",
++            ),
++        )
++        # Node without responsible_party
++        n_none = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="No party node",
++                node_role="position",
++            ),
++        )
++
++        got = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        # Root is always open but doesn't have responsible_party → not in open_loops
++        assert n_owner.node_id in got.open_loops
++        assert n_model.node_id in got.open_loops
++        assert n_none.node_id not in got.open_loops
++
++        # Resolve n_owner → it disappears from open_loops
++        await MindmapResolveTool()(
++            ctx,
++            MindmapResolveInput(
++                map_key=opened.map_key,
++                node_id=n_owner.node_id,
++                disposition="resolved",
++                resolution_summary="Done",
++                resolved_by_party="model",
++            ),
++        )
++        got2 = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        assert n_owner.node_id not in got2.open_loops
++        assert n_model.node_id in got2.open_loops
++        assert n_none.node_id not in got2.open_loops
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 7: get defaults and truncation ──────────────────────────────────────
++
++
++async def test_get_defaults_and_truncation(pg_pool: Any) -> None:
++    """include=open → resolved node absent from nodes, present in resolved.
++    include=all → present in nodes with status.
++    Long content truncated with … by default; depth=full returns full content."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        n1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key, content="Short node", node_role="position"
++            ),
++        )
++        long_content = "x" * 300  # longer than 200
++        n2 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key, content=long_content, node_role="position"
++            ),
++        )
++
++        # Resolve n1
++        await MindmapResolveTool()(
++            ctx,
++            MindmapResolveInput(
++                map_key=opened.map_key,
++                node_id=n1.node_id,
++                disposition="resolved",
++                resolution_summary="Settled",
++                resolved_by_party="model",
++            ),
++        )
++
++        # include=open (default)
++        got_open = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        # Resolved node should NOT be in nodes
++        node_ids_in_nodes = {n.memory_id for n in got_open.nodes}
++        assert n1.node_id not in node_ids_in_nodes
++        # Resolved node should be in resolved list
++        assert len(got_open.resolved) >= 1
++        resolved_entry = [r for r in got_open.resolved if r.memory_id == n1.node_id]
++        assert len(resolved_entry) == 1
++        assert resolved_entry[0].status == "resolved"
++        assert resolved_entry[0].resolution_summary == "Settled"
++        assert resolved_entry[0].resolved_by_party == "model"
++
++        # n2 with long content should be truncated
++        n2_node = [n for n in got_open.nodes if n.memory_id == n2.node_id]
++        assert len(n2_node) == 1
++        assert n2_node[0].truncated is True
++        assert n2_node[0].content.endswith("…")
++        assert len(n2_node[0].content) == 201  # 200 + "…"
++
++        # include=all
++        got_all = await MindmapGetTool()(
++            ctx, MindmapGetInput(map_key=opened.map_key, include="all")
++        )
++        assert len(got_all.resolved) == 0
++        node_ids_in_all = {n.memory_id for n in got_all.nodes}
++        assert n1.node_id in node_ids_in_all
++        n1_node = next(n for n in got_all.nodes if n.memory_id == n1.node_id)
++        assert n1_node.status == "resolved"
++
++        # depth=full → no truncation
++        got_full = await MindmapGetTool()(
++            ctx, MindmapGetInput(map_key=opened.map_key, depth="full")
++        )
++        n2_full = [n for n in got_full.nodes if n.memory_id == n2.node_id]
++        assert len(n2_full) == 1
++        assert n2_full[0].truncated is False
++        assert len(n2_full[0].content) == 300
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 8: since=cursor semantics ───────────────────────────────────────────
++
++
++async def test_since_cursor_semantics(pg_pool: Any) -> None:
++    """since=cursor with no change → empty. After writing → only that node.
++    After resolving → appears in resolved."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        n1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=opened.map_key, content="Node 1", node_role="position"),
++        )
++
++        # Get cursor after initial state
++        got0 = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        cursor0 = got0.cursor
++
++        # Since=cursor0 with no change → empty
++        got_empty = await MindmapGetTool()(
++            ctx, MindmapGetInput(map_key=opened.map_key, since=cursor0)
++        )
++        assert got_empty.nodes == []
++        assert got_empty.resolved == []
++        assert got_empty.cursor == cursor0
++
++        # Write another node → cursor advances
++        await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(map_key=opened.map_key, content="Node 2", node_role="position"),
++        )
++        got1 = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key, since=cursor0))
++        assert len(got1.nodes) >= 1  # at least n2 (and maybe n1 if it appeared in events)
++        # The cursor should have advanced
++        assert got1.cursor > cursor0
++
++        # Resolve n1 → it appears in resolved for that window
++        cursor_before_resolve = got1.cursor
++        await MindmapResolveTool()(
++            ctx,
++            MindmapResolveInput(
++                map_key=opened.map_key,
++                node_id=n1.node_id,
++                disposition="resolved",
++                resolution_summary="Done",
++                resolved_by_party="model",
++            ),
++        )
++        got_resolved = await MindmapGetTool()(
++            ctx, MindmapGetInput(map_key=opened.map_key, since=cursor_before_resolve)
++        )
++        assert len(got_resolved.resolved) >= 1
++        resolved_ids = {r.memory_id for r in got_resolved.resolved}
++        assert n1.node_id in resolved_ids
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 9: since=None returns all members ───────────────────────────────────
++
++
++async def test_since_none_returns_all(pg_pool: Any) -> None:
++    """since=None (default) returns all open members, not just event-touched ones."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        n1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="Node 1",
++                node_role="position",
++                responsible_party="owner",
++            ),
++        )
++        n2 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="Node 2",
++                node_role="position",
++                responsible_party="model",
++            ),
++        )
++
++        # since=None should return all open members
++        got = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key, since=None))
++        node_ids = {n.memory_id for n in got.nodes}
++        assert n1.node_id in node_ids
++        assert n2.node_id in node_ids
++        # Both should be in open_loops
++        assert n1.node_id in got.open_loops
++        assert n2.node_id in got.open_loops
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 10: resolve drops from open_loops ───────────────────────────────────
++
++
++async def test_resolve_drops_from_open_loops(pg_pool: Any) -> None:
++    """After resolving, the node disappears from open_loops and nodes (include=open)."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        n1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="To resolve",
++                node_role="position",
++                responsible_party="owner",
++            ),
++        )
++
++        got_before = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        assert n1.node_id in got_before.open_loops
++
++        # Resolve the node
++        await MindmapResolveTool()(
++            ctx,
++            MindmapResolveInput(
++                map_key=opened.map_key,
++                node_id=n1.node_id,
++                disposition="resolved",
++                resolution_summary="Done",
++                resolved_by_party="model",
++            ),
++        )
++
++        got_after = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        assert n1.node_id not in got_after.open_loops
++        # Should appear in resolved, not in nodes
++        node_ids = {n.memory_id for n in got_after.nodes}
++        assert n1.node_id not in node_ids
++        resolved_ids = {r.memory_id for r in got_after.resolved}
++        assert n1.node_id in resolved_ids
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 11: since=cursor with link (displaced-from) ─────────────────────────
++
++
++async def test_since_cursor_with_link_displaced(pg_pool: Any) -> None:
++    """since=<cursor> after writing a NEW node with links=[{target_memory_id: older,
++    reference_kind: "displaced-from"}]: nodes contains the new node; edges contain
++    the new→older edge; open_loops still contains an OLDER open node with
++    responsible_party="owner"."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        # Older open node with responsible_party
++        older = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="Old position",
++                node_role="position",
++                responsible_party="owner",
++            ),
++        )
++
++        # Get cursor after older node
++        got0 = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        cursor0 = got0.cursor
++
++        # Write a NEW node that links back to the older one with displaced-from
++        new = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="New position",
++                node_role="position",
++                links=[
++                    {
++                        "target_memory_id": older.node_id,
++                        "reference_kind": "displaced-from",
++                    }
++                ],
++            ),
++        )
++
++        # since=cursor0: new node should appear
++        got1 = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key, since=cursor0))
++        node_ids = {n.memory_id for n in got1.nodes}
++        assert new.node_id in node_ids
++
++        # edges should contain the new→older link
++        edge_tuples = {
++            (e.source_memory_id, e.target_memory_id, e.reference_kind) for e in got1.edges
++        }
++        assert (new.node_id, older.node_id, "displaced-from") in edge_tuples
++
++        # open_loops should still contain older (it has responsible_party=owner)
++        # open_loops is whole-map, so older is included
++        assert older.node_id in got1.open_loops
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 12: include=all edges equal DB query ─────────────────────────────────
++
++
++async def test_include_all_edges_equal_db(pg_pool: Any) -> None:
++    """include=all, no since: the set of (source, target, kind) in edges equals
++    all internal edges (query memory_references directly for both endpoints
++    in the map's membership and compare)."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        n1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="Node 1",
++                node_role="position",
++            ),
++        )
++        n2 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="Node 2",
++                node_role="position",
++            ),
++        )
++        n3 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="Node 3",
++                node_role="position",
++            ),
++        )
++
++        # Create some internal links
++        await MindmapLinkTool()(
++            ctx,
++            MindmapLinkInput(
++                source_memory_id=n1.node_id,
++                target_memory_id=n2.node_id,
++                reference_kind="supports",
++                map_key=opened.map_key,
++            ),
++        )
++        await MindmapLinkTool()(
++            ctx,
++            MindmapLinkInput(
++                source_memory_id=n2.node_id,
++                target_memory_id=n3.node_id,
++                reference_kind="challenges",
++                map_key=opened.map_key,
++            ),
++        )
++
++        got = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key, include="all"))
++
++        # Query DB directly for internal edges
++        async with pg_pool.acquire() as conn:
++            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant))
++            member_ids = await conn.fetchval(
++                """
++                SELECT array_agg(memory_id) FROM memory_map_membership
++                WHERE root_memory_id = $1
++                """,
++                opened.root_memory_id,
++            )
++            db_edges = await conn.fetch(
++                """
++                SELECT source_memory_id, target_memory_id, reference_kind
++                FROM memory_references
++                WHERE source_memory_id = ANY($1::uuid[])
++                  AND target_memory_id = ANY($1::uuid[])
++                """,
++                member_ids,
++            )
++            db_tuples = {
++                (e["source_memory_id"], e["target_memory_id"], e["reference_kind"])
++                for e in db_edges
++            }
++
++        got_tuples = {(e.source_memory_id, e.target_memory_id, e.reference_kind) for e in got.edges}
++        assert got_tuples == db_tuples
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 13: responsible_party model in open_loops, resolve removes ───────────
++
++
++async def test_model_party_open_loops_resolve_removes(pg_pool: Any) -> None:
++    """responsible_party='model' node is in open_loops; a node without
++    responsible_party is not; after mindmap_resolve the node is no longer
++    in open_loops."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++
++        # Node with responsible_party=model
++        n_model = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="Model turn",
++                node_role="position",
++                responsible_party="model",
++            ),
++        )
++        # Node without responsible_party
++        n_none = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="No party",
++                node_role="position",
++            ),
++        )
++
++        got = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        assert n_model.node_id in got.open_loops
++        assert n_none.node_id not in got.open_loops
++
++        # Resolve the model-party node
++        await MindmapResolveTool()(
++            ctx,
++            MindmapResolveInput(
++                map_key=opened.map_key,
++                node_id=n_model.node_id,
++                disposition="resolved",
++                resolution_summary="Done",
++                resolved_by_party="model",
++            ),
++        )
++
++        got2 = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        assert n_model.node_id not in got2.open_loops
++        assert n_none.node_id not in got2.open_loops
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 14: soft-deleted member absent from results ──────────────────────────
++
++
++async def test_soft_deleted_member_absent(pg_pool: Any) -> None:
++    """soft-deleted member (direct UPDATE memories SET deleted_at = now()
++    through a pool connection) is absent from nodes, resolved and open_loops."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        n1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="To delete",
++                node_role="position",
++                responsible_party="owner",
++            ),
++        )
++        n2 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="Stays",
++                node_role="position",
++                responsible_party="model",
++            ),
++        )
++
++        # Verify both present
++        got_before = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        assert n1.node_id in {n.memory_id for n in got_before.nodes}
++        assert n1.node_id in got_before.open_loops
++
++        # Soft-delete n1 via direct DB access
++        async with pg_pool.acquire() as conn:
++            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant))
++            await conn.execute("UPDATE memories SET deleted_at = now() WHERE id = $1", n1.node_id)
++
++        # n1 should now be absent from nodes, resolved, and open_loops
++        got_after = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        assert n1.node_id not in {n.memory_id for n in got_after.nodes}
++        assert n1.node_id not in {r.memory_id for r in got_after.resolved}
++        assert n1.node_id not in got_after.open_loops
++        # n2 should still be present
++        assert n2.node_id in {n.memory_id for n in got_after.nodes}
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
++
++
++# ── Test 15: resolve with nonexistent resolved_by_memory_id ───────────────────
++
++
++async def test_resolve_nonexistent_resolver(pg_pool: Any) -> None:
++    """resolve with resolved_by_memory_id that does not exist → -32602
++    memory_not_accessible, membership still open, no edge, no new event
++    (cursor unchanged)."""
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant, team, client_id = s["tenant"], s["team"], s["client_id"]
++    ctx = _ctx(pg_pool, tenant, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx, MindmapOpenInput(title="Test", root_question="Why?"))
++        n1 = await MindmapWriteNodeTool()(
++            ctx,
++            MindmapWriteNodeInput(
++                map_key=opened.map_key,
++                content="To resolve",
++                node_role="position",
++                responsible_party="owner",
++            ),
++        )
++
++        # Get cursor before attempt
++        got_before = await MindmapGetTool()(ctx, MindmapGetInput(map_key=opened.map_key))
++        cursor_before = got_before.cursor
++
++        # Verify membership is open
++        async with pg_pool.acquire() as conn:
++            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant))
++            mem = await conn.fetchrow(
++                "SELECT status FROM memory_map_membership WHERE memory_id = $1", n1.node_id
++            )
++            assert mem["status"] == "open"
++
++        # Attempt resolve with nonexistent resolver → error
++        with pytest.raises(JsonRpcError) as exc_info:
++            await MindmapResolveTool()(
++                ctx,
++                MindmapResolveInput(
++                    map_key=opened.map_key,
++                    node_id=n1.node_id,
++                    disposition="resolved",
++                    resolution_summary="Should fail",
++                    resolved_by_memory_id=uuid4(),  # nonexistent
++                    resolved_by_party="model",
++                ),
++            )
++        assert exc_info.value.code == -32602
++        assert exc_info.value.data.get("code") == "memory_not_accessible"
++
++        # Membership should still be open, cursor unchanged
++        async with pg_pool.acquire() as conn:
++            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant))
++            mem = await conn.fetchrow(
++                "SELECT status FROM memory_map_membership WHERE memory_id = $1", n1.node_id
++            )
++            assert mem["status"] == "open"
++
++            cursor_after = await conn.fetchval(
++                "SELECT COALESCE(MAX(id), 0) FROM memory_map_events " "WHERE root_memory_id = $1",
++                opened.root_memory_id,
++            )
++            assert cursor_after == cursor_before
++    finally:
++        await _cleanup(pg_pool, tenant, team, client_id)
+diff --git a/tests/unit/test_mindmap_resolve_get_models.py b/tests/unit/test_mindmap_resolve_get_models.py
+new file mode 100644
+index 0000000..8654c69
+--- /dev/null
++++ b/tests/unit/test_mindmap_resolve_get_models.py
+@@ -0,0 +1,194 @@
++"""Unit tests for mindmap_resolve / mindmap_get Pydantic models and helpers.
++
++DB-free: exercises input validation, output shape, and truncation logic.
++"""
++
++from __future__ import annotations
++
++from uuid import uuid4
++
++import pytest
++from pydantic import ValidationError
++
++from mem_mcp.mcp.tools.mindmap_get import MindmapGetInput, _truncate_content
++from mem_mcp.mcp.tools.mindmap_resolve import MindmapResolveInput
++from mem_mcp.mindmap import SUMMARY_CONTENT_CHARS
++
++
++class TestMindmapResolveInputValidation:
++    """Input validation for MindmapResolveInput."""
++
++    def test_summary_required(self) -> None:
++        with pytest.raises(ValidationError):
++            MindmapResolveInput(
++                map_key="test-map",
++                node_id=uuid4(),
++                resolution_summary="",  # empty string fails min_length=1
++            )
++
++    def test_summary_max_500(self) -> None:
++        MindmapResolveInput(
++            map_key="test-map",
++            node_id=uuid4(),
++            resolution_summary="x" * 500,
++        )
++        with pytest.raises(ValidationError):
++            MindmapResolveInput(
++                map_key="test-map",
++                node_id=uuid4(),
++                resolution_summary="x" * 501,
++            )
++
++    def test_disposition_default(self) -> None:
++        inp = MindmapResolveInput(
++            map_key="test-map",
++            node_id=uuid4(),
++            resolution_summary="resolved",
++        )
++        assert inp.disposition == "resolved"
++
++    def test_disposition_dropped(self) -> None:
++        inp = MindmapResolveInput(
++            map_key="test-map",
++            node_id=uuid4(),
++            resolution_summary="dropped",
++            disposition="dropped",
++        )
++        assert inp.disposition == "dropped"
++
++    def test_disposition_invalid_rejected(self) -> None:
++        """Literal rejects values not in the allowed set."""
++        with pytest.raises(ValidationError):
++            MindmapResolveInput(
++                map_key="test-map",
++                node_id=uuid4(),
++                resolution_summary="test",
++                disposition="invalid",
++            )
++
++    def test_resolved_by_party_default(self) -> None:
++        inp = MindmapResolveInput(
++            map_key="test-map",
++            node_id=uuid4(),
++            resolution_summary="test",
++        )
++        assert inp.resolved_by_party == "model"
++
++    def test_resolved_by_party_owner(self) -> None:
++        inp = MindmapResolveInput(
++            map_key="test-map",
++            node_id=uuid4(),
++            resolution_summary="test",
++            resolved_by_party="owner",
++        )
++        assert inp.resolved_by_party == "owner"
++
++    def test_resolved_by_party_invalid_rejected(self) -> None:
++        """Literal rejects values not in the allowed set."""
++        with pytest.raises(ValidationError):
++            MindmapResolveInput(
++                map_key="test-map",
++                node_id=uuid4(),
++                resolution_summary="test",
++                resolved_by_party="invalid",
++            )
++
++    def test_resolved_by_memory_id_optional(self) -> None:
++        inp = MindmapResolveInput(
++            map_key="test-map",
++            node_id=uuid4(),
++            resolution_summary="test",
++        )
++        assert inp.resolved_by_memory_id is None
++
++    def test_team_id_optional(self) -> None:
++        team_id = uuid4()
++        inp = MindmapResolveInput(
++            map_key="test-map",
++            node_id=uuid4(),
++            resolution_summary="test",
++            team_id=team_id,
++        )
++        assert inp.team_id == team_id
++
++
++class TestMindmapGetInputValidation:
++    """Input validation for MindmapGetInput."""
++
++    def test_since_ge_zero(self) -> None:
++        MindmapGetInput(map_key="test", since=0)
++        MindmapGetInput(map_key="test", since=100)
++
++    def test_since_negative_rejected(self) -> None:
++        with pytest.raises(ValidationError):
++            MindmapGetInput(map_key="test", since=-1)
++
++    def test_since_none(self) -> None:
++        inp = MindmapGetInput(map_key="test")
++        assert inp.since is None
++
++    def test_include_defaults_to_open(self) -> None:
++        inp = MindmapGetInput(map_key="test")
++        assert inp.include == "open"
++
++    def test_include_all(self) -> None:
++        inp = MindmapGetInput(map_key="test", include="all")
++        assert inp.include == "all"
++
++    def test_include_invalid_rejected(self) -> None:
++        """Literal rejects values not in ('open', 'all')."""
++        with pytest.raises(ValidationError):
++            MindmapGetInput(map_key="test", include="invalid")
++
++    def test_depth_defaults_to_summary(self) -> None:
++        inp = MindmapGetInput(map_key="test")
++        assert inp.depth == "summary"
++
++    def test_depth_full(self) -> None:
++        inp = MindmapGetInput(map_key="test", depth="full")
++        assert inp.depth == "full"
++
++    def test_depth_invalid_rejected(self) -> None:
++        """Literal rejects values not in ('summary', 'full')."""
++        with pytest.raises(ValidationError):
++            MindmapGetInput(map_key="test", depth="invalid")
++
++
++class TestTruncation:
++    """Truncation logic for summary depth."""
++
++    def test_exact_200_chars_no_truncation(self) -> None:
++        content = "x" * SUMMARY_CONTENT_CHARS
++        result, truncated = _truncate_content(content, "summary")
++        assert result == content
++        assert truncated is False
++
++    def test_201_chars_truncated(self) -> None:
++        content = "x" * (SUMMARY_CONTENT_CHARS + 1)
++        result, truncated = _truncate_content(content, "summary")
++        assert len(result) == SUMMARY_CONTENT_CHARS + 1  # 200 chars + "…"
++        assert result == "x" * SUMMARY_CONTENT_CHARS + "…"
++        assert truncated is True
++
++    def test_short_untouched(self) -> None:
++        content = "short text"
++        result, truncated = _truncate_content(content, "summary")
++        assert result == content
++        assert truncated is False
++
++    def test_full_depth_untouched(self) -> None:
++        long_content = "x" * 10000
++        result, truncated = _truncate_content(long_content, "full")
++        assert result == long_content
++        assert truncated is False
++
++    def test_empty_content(self) -> None:
++        result, truncated = _truncate_content("", "summary")
++        assert result == ""
++        assert truncated is False
++
++    def test_ellipsis_is_single_char(self) -> None:
++        """The ellipsis must be exactly U+2026 (not three dots)."""
++        content = "x" * (SUMMARY_CONTENT_CHARS + 1)
++        result, _ = _truncate_content(content, "summary")
++        assert result[-1] == "…"

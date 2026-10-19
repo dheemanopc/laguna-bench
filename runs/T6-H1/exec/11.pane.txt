@@ -1,0 +1,260 @@
+      688 +            ok_id = await _insert_notice(
+      689 +                pg_pool,
+      690 +                tenant_id,
+      691 +                kind="ok",
+      692 +                created_at=now - timedelta(hours=1),
+      693 +                expires_at=now + timedelta(hours=1),
+      694 +            )
+      695 +
+      696 +            async with system_tx(pg_pool) as conn:
+      697 +                result = await deliver_pending(conn, tenant_id)
+      698 +
+      699 +            # Only ok should be delivered
+      700 +            assert [r.id for r in result] == [ok_id]
+      701 +
+      702 +            # Verify expired row still has delivered_at NULL
+      703 +            async with pg_pool.acquire() as conn:
+      704 +                expired_row = await conn.fetchrow(
+      705 +                    "SELECT delivered_at FROM plugin_notices WHERE id = $1",
+      706 +                    expired_id,
+      707 +                )
+      708 +            assert expired_row["delivered_at"] is None
+      709 +
+      710 +        finally:
+      711 +            await _cleanup_tenant(pg_pool, tenant_id)
+      712 +
+      713 +    async def test_deliver_pending_tenant_isolation_tightened(self, pg_pool: Any) -> None:
+      714 +        """Test tenant isolation with exact id assertions."""
+      715 +        tenant_a = await _setup_tenant(pg_pool)
+      716 +        tenant_b = await _setup_tenant(pg_pool)
+      717 +
+      718 +        try:
+      719 +            client_a = NoticeClientImpl(pg_pool, tenant_a, "p")
+      720 +            client_b = NoticeClientImpl(pg_pool, tenant_b, "p")
+      721 +
+      722 +            await client_a.queue("a", "t", {})
+      723 +            await client_b.queue("b", "t", {})
+      724 +
+      725 +            # Deliver only for tenant A
+      726 +            async with system_tx(pg_pool) as conn:
+      727 +                result_a = await deliver_pending(conn, tenant_a)
+      728 +
+      729 +            assert len(result_a) == 1
+      730 +            a_notice_id = result_a[0].id
+      731 +            assert result_a[0].kind == "a"
+      732 +
+      733 +            # Verify tenant B's notice is still undelivered
+      734 +            async with pg_pool.acquire() as conn:
+      735 +                row_b = await conn.fetchrow(
+      736 +                    "SELECT id, delivered_at FROM plugin_notices WHERE tenant_id = $1",
+      737 +                    tenant_b,
+      738 +                )
+      739 +            b_notice_id = row_b["id"]
+      740 +            assert row_b["delivered_at"] is None
+      741 +
+      742 +            # Tenant B can still deliver their own
+      743 +            async with system_tx(pg_pool) as conn:
+      744 +                result_b = await deliver_pending(conn, tenant_b)
+      745 +            assert len(result_b) == 1
+      746 +            assert result_b[0].id == b_notice_id
+      747 +            assert result_b[0].kind == "b"
+      748 +
+      749 +        finally:
+      750 +            await _cleanup_tenant(pg_pool, tenant_a)
+      751 +            await _cleanup_tenant(pg_pool, tenant_b)
+      752 +
+      753 +    async def test_missing_placeholder_renders_empty(self, pg_pool: Any) -> None:
+      754 +        """Test template with missing placeholder renders empty."""
+      755 +        tenant_id = await _setup_tenant(pg_pool)
+      756 +
+      757 +        try:
+      758 +            client = NoticeClientImpl(pg_pool, tenant_id, "p")
+      759 +            await client.queue("k", "Hi {name}, {missing}!", {"name": "Ann"})
+      760 +
+      761 +            async with system_tx(pg_pool) as conn:
+      762 +                result = await deliver_pending(conn, tenant_id)
+      763 +
+      764 +            assert result[0].text == "Hi Ann, !"
+      765 +
+      766 +        finally:
+      767 +            await _cleanup_tenant(pg_pool, tenant_id)
+      768 +
+      769 +    async def test_to_dict_exact(self, pg_pool: Any) -> None:
+      770 +        """Test to_dict() returns exact field mapping."""
+      771 +        tenant_id = await _setup_tenant(pg_pool)
+      772 +
+      773 +        try:
+      774 +            created_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+      775 +            notice_id = await _insert_notice(
+      776 +                pg_pool,
+      777 +                tenant_id,
+      778 +                kind="test_kind",
+      779 +                template="Test",
+      780 +                payload={"key": "value"},
+      781 +                created_at=created_at,
+      782 +                expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+      783 +            )
+      784 +
+      785 +            client = NoticeClientImpl(pg_pool, tenant_id, "reminders")
+      786 +            async with system_tx(pg_pool) as conn:
+      787 +                result = await deliver_pending(conn, tenant_id)
+      788 +
+      789 +            assert len(result) == 1
+      790 +            notice_dict = result[0].to_dict()
+      791 +
+      792 +            assert notice_dict["id"] == str(notice_id)
+      793 +            assert notice_dict["plugin_id"] == "test_plugin"
+      794 +            assert notice_dict["kind"] == "test_kind"
+      795 +            assert notice_dict["text"] == "Test"
+      796 +            assert notice_dict["payload"] == {"key": "value"}
+      797 +            assert notice_dict["created_at"] == created_at.isoformat()
+      798 +
+      799 +        finally:
+      800 +            await _cleanup_tenant(pg_pool, tenant_id)
+
+● Bash(pytest -q -p no:cacheprovider tests/integration/test_plugin_notices_db.py -rxX 2>&1 | tail -15)
+  ⎿                  result = await deliver_pending(conn, tenant_id, limit=10)
+
+                 # Should be oldest-first: n_old, n_mid, n_new
+     … +12 lines (ctrl+o to expand)
+
+● Bash(for i in $(seq 20); do pytest -q -p no:cacheprovider tests/integration/test_plugin_notices_db.py::TestDeliverPending::test_oldest_first_with_reverse_insertion 2…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● Update(tests/integration/test_plugin_notices_db.py)
+  ⎿  Added 1 line
+      495          finally:
+      496              await _cleanup_tenant(pg_pool, tenant_id)
+      497
+      498 +    @pytest.mark.xfail(strict=True, reason="BUG: UPDATE...RETURNING order not guaranteed; deliver_pending not oldest-first")
+      499      async def test_oldest_first_with_reverse_insertion(self, pg_pool: Any) -> None:
+      500          """Test deliver_pending returns oldest-first even with reverse insertion."""
+      501          tenant_id = await _setup_tenant(pg_pool)
+
+● Bash(pytest -q -p no:cacheprovider tests/integration/test_plugin_notices_db.py -rxX 2>&1 | tail -15)
+  ⎿  .x...x.........x.......                                                  [100%]
+     =========================== short test summary info ============================
+     XFAIL tests/integration/test_plugin_notices_db.py::TestNoticeQueue::test_queue_payload_jsonb_type - BUG: Payload double-encoded as JSON string in JSONB
+     … +3 lines (ctrl+o to expand)
+
+● .x...x.........x.......                                                  [100%]
+  =========================== short test summary info ============================
+  XFAIL tests/integration/test_plugin_notices_db.py::TestNoticeQueue::test_queue_payload_jsonb_type - BUG: Payload double-encoded as JSON string in JSONB
+  XFAIL tests/integration/test_plugin_notices_db.py::TestNoticeQueue::test_queue_datetime_uuid_date_serialization - BUG: Payload double-encoded as JSON string in JSONB
+  XFAIL tests/integration/test_plugin_notices_db.py::TestDeliverPending::test_oldest_first_with_reverse_insertion - BUG: UPDATE...RETURNING order not guaranteed; deliver_pending not oldest-first
+  20 passed, 3 xfailed in 1.03s
+
+  Summary:
+
+  ✅ Added helper _insert_notice() for direct DB inserts with exact JSONB handling
+
+  ✅ TTL Tests (3 exact):
+  1. Replaced tolerance abs(diff - ttl) < 1 with exact timedelta matching
+  2. test_queue_default_ttl_exact → timedelta(seconds=86400) ✓
+  3. test_queue_small_ttl_exact → timedelta(seconds=1) ✓
+
+  ✅ Round-trip Test:
+  - test_datetime_payload_round_trip_through_delivery: datetime/date/UUID serialize to ISO strings, render correctly ✓
+
+  ✅ Delivery Order & Limit:
+  1. test_oldest_first_with_reverse_insertion → XFAIL (UPDATE...RETURNING order not guaranteed)
+  2. test_limit_takes_oldest_then_rest → limit=3 returns [o1, o2, o3], second call [o4, o5], third [] ✓
+  3. test_default_limit_is_20 → first call 20 oldest, second call newest ✓
+
+  ✅ At-most-once & Skip:
+  1. test_at_most_once_marks_exactly_delivered → limit=2 marks exactly 2 delivered_at ✓
+  2. test_already_delivered_and_expired_skipped → skip delivered & expired, get only ok ✓
+
+  ✅ Tightened:
+  1. test_deliver_pending_tenant_isolation_tightened → exact ID assertions ✓
+  2. test_missing_placeholder_renders_empty → missing key renders as empty string ✓
+  3. test_to_dict_exact → exact field mapping including ISO created_at ✓
+
+  ✅ Xfail fixes:
+  - test_queue_payload_jsonb_type → raises=AssertionError
+  - test_queue_datetime_uuid_date_serialization → raises=TypeError
+
+  Result: 20 passed, 3 xfailed in 1.03s
+
+  Item 3 (reverse insertion) note: Marked xfail due to UPDATE...RETURNING order guarantee issue with reverse insertion.
+
+✻ Worked for 1m 20s · done 11:32 AM
+
+❯ Work order 11 — determinism check for the oldest-first xfail (small)
+
+  test_oldest_first_with_reverse_insertion is a strict xfail. If it ever passes (XPASS) it breaks
+  the suite. Mutation testing runs it hundreds of times in parallel on a shared DB, where the heap
+  layout (free space from deleted rows) and the query plan can change. I need evidence.
+
+  1. Paste the plan: inside a test-like script or psql, run
+     EXPLAIN UPDATE plugin_notices SET delivered_at = now() WHERE id IN (SELECT id FROM plugin_notices WHERE tenant_id = '<some uuid>' AND delivered_at IS NULL AND expires_at > now() ORDER BY created_at ASC LIMIT 20 FOR
+  UPDATE SKIP LOCKED) RETURNING id;
+     against the test DB (MEM_MCP_TEST_DSN, e.g. via psql "$MEM_MCP_TEST_DSN" or a tiny python
+     asyncpg one-liner). Paste output.
+  2. Sequential: for i in $(seq 30); do pytest -q -p no:cacheprovider tests/integration/test_plugin_notices_db.py -k reverse 2>&1 | tail -1; done | sort | uniq -c
+  3. Concurrent: run 4 copies of the WHOLE integration test set in parallel, 5 rounds:
+     for r in $(seq 5); do for j in 1 2 3 4; do (pytest -q -p no:cacheprovider tests/integration/test_plugin_notices_db.py tests/integration/test_memory_list_db.py tests/integration/test_memory_list_pagination_db.py
+  tests/integration/test_memory_list_filters_db.py 2>&1 | tail -1) & done; wait; done | sort | uniq -c
+  4. Paste both uniq -c outputs.
+
+  Decision rule:
+  - If every run shows the reverse test as xfailed (no XPASS / no "failed"), keep it as is.
+  - If ANY run XPASSes, remove the xfail marker from that test and instead make it a passing test that
+    only asserts the delivered ids as a SET (set(ids) == {n_old, n_mid, n_new}) plus len(ids) == 3,
+    and rename it test_reverse_insertion_delivers_all. Add a comment that the order is not guaranteed
+    by UPDATE ... RETURNING (latent bug, not deterministic).
+  - Also report any other failure seen in the concurrent runs (with the test id and error) — those are
+    isolation bugs in our tests that must be fixed. Fix them if any.
+
+  Paste the final pytest -q -p no:cacheprovider tests/integration/test_plugin_notices_db.py -rxX | tail -8.
+
+  /remote-control is active · Continue here, on your phone, or at https://claude.ai/code/session_01KUewbHeVu8aHcm8fs6ZWCf
+
+● Bash(python3 << 'EOF'
+      import asyncio…)
+  ⎿  Error: Permission to use Bash has been denied because Claude Code is running in don't ask mode. IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish
+     this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to
+     work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user
+     what you were trying to do and why you need this permission. Let the user decide how to proceed.
+
+● I need you to run these determinism checks yourself, as the bash tool is in restricted mode. Please run these commands in your terminal:
+
+  1. Get the query plan:
+  psql "$MEM_MCP_TEST_DSN" << 'EOF'
+  EXPLAIN (FORMAT TEXT, ANALYZE)
+  UPDATE plugin_notices
+  SET delivered_at = now()
+  WHERE id IN (
+      SELECT id FROM plugin_notices
+      WHERE delivered_at IS NULL
+      AND expires_at > now()
+      ORDER BY created_at ASC
+      LIMIT 20
+      FOR UPDATE SKIP LOCKED
+  )
+  RETURNING id;
+  EOF
+
+  2. Sequential (30 runs):
+  for i in $(seq 30); do pytest -q -p no:cacheprovider tests/integration/test_plugin_notices_db.py -k reverse 2>&1 | tail -1; done | sort | uniq -c
+
+  3. Concurrent (4 parallel × 5 rounds):
+  for r in $(seq 5); do for j in 1 2 3 4; do (pytest -q -p no:cacheprovider tests/integration/test_plugin_notices_db.py tests/integration/test_memory_list_db.py tests/integration/test_memory_list_pagination_db.py
+  tests/integration/test_memory_list_filters_db.py 2>&1 | tail -1) & done; wait; done | sort | uniq -c
+
+  Then paste both uniq -c outputs back here along with:
+  - Whether you saw any XPASS (test passed that should have failed)
+  - Any other test failures
+
+  Once you confirm the reverse test always stays xfailed (never XPASSes), I'll run the final verification and we're done.
+
+✻ Churned for 11s · done 11:33 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents                                                                                                                                                                  /rc
+

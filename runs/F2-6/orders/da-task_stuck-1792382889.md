@@ -1,0 +1,3 @@
+```json
+{"action":"retry","guidance":"Remove the module-level `pytestmark = pytest.mark.skipif(not os.getenv(\"MEM_MCP_TEST_DSN\"))` (line 59) and the unused `import os`. The harness rejects any added skip, even if an older test file has the same pattern. MEM_MCP_TEST_DSN is always set in this environment, so the tests run unconditionally. Don't use xfail or importorskip either.\nKeep everything else as is. Item #3 (SignoffRequiredError is never raised by any tool path) can stay documented in the mapping test's docstring. Don't fake an end-to-end test for it, but mention the gap in your report.\nRun `pytest tests/integration/test_mindmap_workflows_e2e.py -q`, confirm 6 passed and 0 skipped, then run ruff and mypy.","new_tasks":[]}
+```

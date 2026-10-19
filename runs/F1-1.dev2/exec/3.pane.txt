@@ -1,0 +1,260 @@
+      1343 +            MindmapWorkAssignInput(
+      1344 +                map_key=map_key,
+      1345 +                node_id=node_id,
+      1346 +                assignee_id=None,
+      1347 +                reason="unassigned",
+      1348 +            ),
+      1349 +        )
+      1350 +        assert result.assignee_id is None
+      1351 +
+      1352 +        # Verify history count - 3 changes (assign, reassign, unassign)
+      1353 +        async with pg_pool.acquire() as conn:
+      1354 +            count = await conn.fetchval(
+      1355 +                "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1",
+      1356 +                node_id,
+      1357 +            )
+      1358 +            assert count == initial_count + 3
+      1359 +            rows = await conn.fetch(
+      1360                  "SELECT change_type, assignee_after FROM work_item_history WHERE memory_id = $1 ORDER BY id DESC",
+      1361                  node_id,
+      1362              )
+
+  Thought for 2s (ctrl+o to expand)
+
+● Now let me run all the tests:
+
+● Bash(pytest tests/integration/test_mindmap_work_items_e2e.py -q 2>&1)
+  ⎿  ......................                                                   [100%]
+     22 passed in 2.00s
+
+  Thought for 2s (ctrl+o to expand)
+
+● All 22 tests pass! Let me run them twice as requested:
+
+● Bash(pytest tests/integration/test_mindmap_work_items_e2e.py -q 2>&1 && echo "--- Running second time ---" && pytest tests/integration/test_mindmap_work_items_e2e.py…)
+  ⎿  ......................                                                   [100%]
+     22 passed in 2.11s
+     --- Running second time ---
+     … +2 lines (ctrl+o to expand)
+
+  Thought for 4s (ctrl+o to expand)
+
+● All 22 tests pass twice. Let me also run the linter and type checker:
+
+● Bash(ruff check src tests 2>&1 | head -50)
+  ⎿  src/mem_mcp/mindmap/work_items.py:12:1: I001 [*] Import block is un-sorted or un-formatted
+        |
+     10 |   """
+     … +47 lines (ctrl+o to expand)
+
+  Thought for 2s (ctrl+o to expand)
+
+● I see there's a corruption in the test_work_item_kind_change test. Let me check and fix it:
+
+  Thought for 2s, read 1 file (ctrl+o to expand)
+
+● The edit accidentally corrupted the test_work_item_kind_change function. Let me read more and fix it:
+
+  Thought for 3s, read 1 file (ctrl+o to expand)
+
+● I need to fix the corrupted test. Let me read further and then restore the correct content:
+
+  Thought for 5s, read 1 file (ctrl+o to expand)
+
+● I see the issue - there's a corrupted duplicate function. I need to remove the corrupted version (lines 1273-1370) and keep the correct one (lines 1372+). Let me fix this:
+
+● Update(tests/integration/test_mindmap_work_items_e2e.py)
+  ⎿  Removed 99 lines
+      1277          async with conn.transaction():
+      1278              s = await _setup(conn)
+      1279      tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
+      1280 -
+      1281 -    try:
+      1282 -        opened = await MindmapOpenTool()(
+      1283 -            ctx,
+      1284 -            MindmapOpenInput(title="Test", root_question="Question?"),
+      1285 -        )
+      1286 -        map_key = opened.map_key
+      1287 -
+      1288 -        from mem_mcp.mcp.tools.mindmap_write_node import (
+      1289 -            MindmapWriteNodeInput,
+      1290 -            MindmapWriteNodeTool,
+      1291 -        )
+      1292 -
+      1293 -        node = await MindmapWriteNodeTool()(
+      1294 -            ctx,
+      1295 -            MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"),
+      1296 -        )
+      1297 -        node_id = node.node_id
+      1298 -
+      1299 -        from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkTool
+      1300 -
+      1301 -        await MindmapWorkMarkTool()(
+      1302 -            ctx,
+      1303 -            MindmapWorkMarkInput(map_key=map_key, node_id=node_id, kind="story"),
+      1304 -        )
+      1305 -
+      1306 -        # Check history count after mark (1 entry for "created")
+      1307 -        async with pg_pool.acquire() as conn:
+      1308 -            initial_count = await conn.fetchval(
+      1309 -                "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1",
+      1310 -                node_id,
+      1311 -            )
+      1312 -        assert initial_count == 1  # "created" entry from marking
+      1313 -
+      1314 -        # Assign to tenant_b
+      1315 -        from mem_mcp.mcp.tools.mindmap_work_assign import MindmapWorkAssignTool
+      1316 -
+      1317 -        result = await MindmapWorkAssignTool()(
+      1318 -            ctx,
+      1319 -            MindmapWorkAssignInput(
+      1320 -                map_key=map_key,
+      1321 -                node_id=node_id,
+      1322 -                assignee_id=tenant_b,
+      1323 -                reason="assigned to team lead",
+      1324 -            ),
+      1325 -        )
+      1326 -        assert result.assignee_id == tenant_b
+      1327 -
+      1328 -        # Reassign to tenant_c
+      1329 -        result = await MindmapWorkAssignTool()(
+      1330 -            ctx,
+      1331 -            MindmapWorkAssignInput(
+      1332 -                map_key=map_key,
+      1333 -                node_id=node_id,
+      1334 -                assignee_id=tenant_c,
+      1335 -                reason="moved to another team member",
+      1336 -            ),
+      1337 -        )
+      1338 -        assert result.assignee_id == tenant_c
+      1339 -
+      1340 -        # Unassign (assignee_id=None)
+      1341 -        result = await MindmapWorkAssignTool()(
+      1342 -            ctx,
+      1343 -            MindmapWorkAssignInput(
+      1344 -                map_key=map_key,
+      1345 -                node_id=node_id,
+      1346 -                assignee_id=None,
+      1347 -                reason="unassigned",
+      1348 -            ),
+      1349 -        )
+      1350 -        assert result.assignee_id is None
+      1351 -
+      1352 -        # Verify history count - 3 changes (assign, reassign, unassign)
+      1353 -        async with pg_pool.acquire() as conn:
+      1354 -            count = await conn.fetchval(
+      1355 -                "SELECT COUNT(*) FROM work_item_history WHERE memory_id = $1",
+      1356 -                node_id,
+      1357 -            )
+      1358 -            assert count == initial_count + 3
+      1359 -            rows = await conn.fetch(
+      1360 -                "SELECT change_type, assignee_after FROM work_item_history WHERE memory_id = $1 ORDER BY id DESC",
+      1361 -                node_id,
+      1362 -            )
+      1363 -            # First row should be "created", rest should be "owner" changes
+      1364 -            assert rows[0]["change_type"] == "created"
+      1365 -            for row in rows[1:]:
+      1366 -                assert row["change_type"] == "owner"
+      1367 -
+      1368 -    finally:
+      1369 -        await _cleanup(pg_pool, tenant_a, tenant_c, team, client_id) if "s" in dir() else None
+      1370 -
+      1371 -
+      1372 <email>
+      1373 -async def test_work_item_kind_change(pg_pool: Any) -> None:
+      1374 -    """Test changing work item kind."""
+      1375 -    async with pg_pool.acquire() as conn:
+      1376 -        async with conn.transaction():
+      1377 -            s = await _setup(conn)
+      1378 -    tenant, team, client_id = s["tenant_a"], s["team"], s["client_id"]
+      1280      ctx = _ctx(pg_pool, tenant, client_id)
+      1281
+      1282      try:
+
+  Thought for 2s (ctrl+o to expand)
+
+● Now let me run all the tests to verify they pass:
+
+● Bash(pytest tests/integration/test_mindmap_work_items_e2e.py -v 2>&1 | tail -40)
+  ⎿  ============================= test session starts ==============================
+     platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- ~/laguna-bench/wt/lead/.venv/bin/python
+     cachedir: .pytest_cache
+     … +31 lines (ctrl+o to expand)
+
+  Thought for 7s (ctrl+o to expand)
+
+● All 22 tests pass. Let me run the linter again:
+
+● Bash(ruff check src tests 2>&1)
+  ⎿  Error: Exit code 1
+     src/mem_mcp/mindmap/work_items.py:12:1: I001 [*] Import block is un-sorted or un-formatted
+        |
+     10 |   """
+     11 |
+     12 | / from __future__ import annotations
+     13 | |
+     14 | | import asyncpg  # type: ignore[import-untyped]
+     15 | | from dataclasses import dataclass
+     16 | | from datetime import datetime
+     … +17 lines (ctrl+o to expand)
+
+  Thought for 6s (ctrl+o to expand)
+
+● The only lint error is in a pre-existing file I was instructed not to modify. Let me run mypy:
+
+● Bash(mypy src tests 2>&1 | head -50)
+  ⎿  Success: no issues found in 337 source files
+
+  Thought for 5s (ctrl+o to expand)
+
+● Let me run the tests twice more to confirm stability:
+
+● Bash(pytest tests/integration/test_mindmap_work_items_e2e.py -q 2>&1 && echo "--- Second run ---" && pytest tests/integration/test_mindmap_work_items_e2e.py -q 2>&1)
+  ⎿  ......................                                                   [100%]
+     22 passed in 2.13s
+     --- Second run ---
+     … +2 lines (ctrl+o to expand)
+
+● All tests pass twice. Let me provide a summary of what was done:
+
+  Summary Report
+
+  Files Changed
+
+  1. tests/integration/test_mindmap_work_items_e2e.py - Fixed 5 failing tests per dev2-3 requirements:
+     - Added ORDER BY id LIMIT 1 to role selection queries in _setup() function (lines 81, 89)
+     - Fixed test_work_item_status_transitions: Added transitions from in_progress → done to todo path (removed invalid done → todo transition)
+     - Fixed test_work_item_blocked_without_reason_rejected: Added intermediate in_progress status before trying blocked, and added assertions for e.data["code"] and errors[0]["path"]
+     - Fixed test_work_item_viewer_permission_denied:
+       - Used UPDATE instead of INSERT for role change
+       - Fixed e.data["missing_permission"] assertion to expect team.write_memory
+       - Used new connection for role update after original connection was released
+     - Fixed test_work_item_assign_reassign_unassign:
+       - Created tenant_c properly in tenants table before adding to team
+       - Fixed assigned_by_user_id to use tenant_a (a tenant UUID) instead of team
+       - Fixed initial_count to query actual count after marking (was hardcoded to 0)
+       - Fixed history assertions to check for "created" entry plus "owner" entries
+       - Fixed cleanup function call with correct number of arguments
+     - Fixed _cleanup() function: Added optional tenant_c parameter
+     - Fixed test_work_item_archived_map_mark_rejected_status_change_works:
+       - Wrote node2 BEFORE closing the map (can't write to closed map)
+       - Added in_progress status transition before done (invalid todo → done transition)
+
+  Verification
+
+  - Tests: pytest tests/integration/test_mindmap_work_items_e2e.py -q → 22 passed (ran twice)
+  - Linter: ruff check src tests → Only pre-existing issue in src/mem_mcp/mindmap/work_items.py (file not to be modified per instructions)
+  - Type checker: mypy src tests → Success: no issues found in 337 source files
+
+  Notes
+
+  - Pre-existing issues in src/mem_mcp/mindmap/work_items.py (import order) were not modified as per instructions to not edit dev1's files
+  - The ORDER BY id LIMIT 1 additions were necessary because the database has multiple roles in roles_catalog and subqueries without LIMIT fail when more than one row matches
+
+✻ Cooked for 9m 25s · done 1:13 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ don't ask on (shift+tab to cycle) · ← for agents
+
