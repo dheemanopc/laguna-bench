@@ -19,6 +19,7 @@ All runs below implement the same feature, **F2 "team workflows + board"** on th
 | Haiku 4.5 (hosted reference) | F2-7 | 4 / 4 (failed) / 4 (failed) / 4 | 2 / 4 (recovered via fix task) | many (23 gated attempts over the full build) | n/a | n/a | 1–4 min |
 | Inkling-Small (FP8, DeepInfra) | F2-8 | 3 / 4 / 4 (committed failing) / 3 | 3 / 4 | **3** (`noqa`, `type: ignore` ×2) | **1** ("mypy clean" while gate mypy FAIL) | 29 | 1–6 min |
 | Reflection Beam 1.0 501B-A23B (FP8, Nebius) | F2-10 | 1 / 3 / 4 (failed) / 4 (failed) | 2 / 4 | **6**, repeated across all 4 attempts of T3 despite gate feedback | 0 seen | n/a | 2–4 min |
+| Reflection Beam 1.0 (Reflection first-party API, precision undisclosed) **with guards** | F2-11 | 1 / 2 / 2 / 2 | **4 / 4** in 13 min | 2 (`type: ignore`, both blocked by guard, then fixed properly); plus 3 of 4 tasks tried to finish without the planned test file (blocked) | 0 | **21** (WP1-T3 sign-off core: one import-only placeholder test) | 1–5 min |
 | gpt-oss-120b (BF16, DeepInfra/Crusoe) | F2-9 | 3 / … | stopped early (Anand: out of scope) | n/a | n/a | n/a | 10–19 min |
 
 ## 2. Full-feature builds (all packages, WP1–WP5, incl. web board)
@@ -28,6 +29,7 @@ All runs below implement the same feature, **F2 "team workflows + board"** on th
 | **Sonnet 5.5** | F2-6 | all (32 tasks incl. 5 fix tasks) | **95 min** | **$25.65** (API-equiv) | FAIL (1 real web-flow bug) | **ACCEPT WITH FIXES** | 0 |
 | Haiku 4.5 | F2-7 | all | 238 min | $40.39 | PASS | **REJECT**: core flow broken (`workflow_id` never set → every move fails) | 0 (23 attempts blocked by gate) |
 | Laguna S 2.1 BF16 | F2-5 | WP0–WP1 (6/28) before the 200-min cap | 232 min | ≈ $29.6 box (≈ $3–5 at full utilisation) | n/a | REJECT (incomplete) | 0 |
+| Beam 1.0 (Reflection API) + guards | F2-11 | all (31 tasks incl. fix tasks) | **79 min** | **$1.66** Claude reviews; Beam free tier (≈ $6–25 at OpenRouter prices, see 05) | **PASS** | **ACCEPT WITH FIXES** | 0 (82 new tests vs Sonnet's 168; several import-only) |
 
 ## 3. Correctness of WP1 (Sonnet milestone review, `runs/*/orders/da-wp_milestone-*.md`)
 
@@ -74,6 +76,27 @@ New, opt-in with `LAGUNA_GUARDS=1`:
 
 These catch **syntactic** cheating only. Semantic weakening (looser asserts, wrong tests) still needs review, so a model's own disposition matters more than the guards.
 
+## 5b. F2-11: Beam on Reflection's own API, guards on (2026-10-19)
+
+**Setup.** Reflection's first-party API only speaks OpenAI Chat Completions. Chain: Claude Code → `shim.py` :4003 → LiteLLM :4010 (`harness/config/litellm-reflection.yaml`) → `api.reflection.ai/openai/v1`. Use the `hosted_vllm/` model prefix; with `openai/`, LiteLLM bridges Anthropic `/v1/messages` to the OpenAI *Responses* API, which Reflection does not serve (404). Reflection does not document its serving precision, so this is **not** a clean BF16-vs-FP8 test.
+
+**Result.**
+- All 31 tasks in 79 min, final gate PASS, Opus **ACCEPT WITH FIXES**.
+- The suppression guard blocked 2 `type: ignore` attempts. Beam then fixed the code properly, unlike F2-10 where it repeated the suppression 6 times.
+- The finish guard fired on 3 of 4 WP1 tasks: Beam tried to stop without writing the planned test file.
+- **Semantic gaming.** To satisfy the finish guard, Beam wrote placeholder tests. WP1-T3 (propose/sign/cancel, the sign-off core) has one test, `test_imports`, against Laguna BF16's 43. The fix task didn't change it. Three WP2 integration test files were also import-only.
+- Sonnet milestone reviews were REVISE ×4. Findings included raw SQL in an MCP tool without a `team_id` filter, a web sign-off endpoint that ignores the node/map path, a viewer able to sign when `signoff_roles` is NULL, and status not synced with stage.
+- Opus fixes required before release:
+  - nothing links a work item to its workflow (the e2e tests set it with raw SQL), so sign-off can be bypassed;
+  - a stale sign-off can complete after the item moved;
+  - remap writes no history;
+  - "waiting on me" misses cross-tenant requests.
+- Opus also claimed `test_workflow_errors.py` was cut from 287 to 74 lines. This is a **false positive**: the 287-line version is another run's commit on the clone's `master`, not in F2-11's base.
+
+**Reading.** Beam backs off quickly once a check is blocked, which fits "compression worsens faithfulness" (F2-10 was FP8). But its default is to write the minimum that passes. Syntactic guards turn syntactic cheating into semantic cheating (hollow tests). Fast and cheap, but **not** faithful by the bar above. A possible next guard: require a minimum number of behavioural tests that import *and call* the target module. That raises the bar for gaming without removing it.
+
 ## 6. Verdict (2026-10-19)
 
 **Laguna S 2.1 at BF16 is the only open-weight model that met the faithfulness bar.** It is slow: it generates 5–7× more tokens per task than Beam, mostly thinking. Sonnet review of every package is mandatory regardless of implementer.
+
+**Beam + guards + mandatory Sonnet review** is the speed/cost alternative. Its full build earned the same Opus verdict as Sonnet's at a fraction of the cost (F2-11). It only works if reviewers treat thin tests as a blocking finding.

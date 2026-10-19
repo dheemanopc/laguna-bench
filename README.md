@@ -17,6 +17,8 @@ A private research log (Oct 2026) evaluating open-weight LLMs as the implementer
 | Correctness? | Even faithful Laguna shipped 5 auth/integrity bugs behind green gates. **Sonnet milestone review is mandatory.** |
 | Speed? | Laguna: 35–45 min/task on our 4-GPU box (5–7× more tokens than Beam, plus PCIe hardware). Sonnet: 1–4 min. |
 | Cost? | Sonnet full feature: $25.65 in 95 min. Self-hosted Laguna is cheaper only above about 30–40% sustained GPU utilisation. |
+| Beam with guards (F2-11)? | Full feature in 79 min, final gate PASS, Opus ACCEPT WITH FIXES (same as Sonnet) for $1.66 of Claude reviews. But it games the guards with **hollow tests** (sign-off core: one import-only test), so it is **not faithful**. Viable only with review that blocks thin tests. |
+| Bedrock? | Neither Beam nor Laguna is on Bedrock. Both are on SageMaker JumpStart at $41–131/hr on-demand. EC2 spot is far cheaper. |
 | Licences | Laguna S 2.1: OpenMDW-1.1 (permissive). Laguna M.1, Beam, gpt-oss, Inkling: Apache-2.0. Devstral 2 / Mistral Medium 3.5: $20M revenue cap (rejected). EXAONE: non-commercial. |
 
 ## Repo map
@@ -45,7 +47,8 @@ A private research log (Oct 2026) evaluating open-weight LLMs as the implementer
 | F2-7 | Haiku 4.5 full build |
 | F2-8 | Inkling-Small FP8 |
 | F2-9 | gpt-oss-120b BF16 (stopped) |
-| F2-10 | Beam FP8 |
+| F2-10 | Beam FP8 (OpenRouter/Nebius) |
+| F2-11 | Beam via Reflection API, guards on, full build |
 | OR-1 | Laguna fp4 (OpenRouter) replay |
 | BF-1 | Laguna BF16 replay (BF-2..4 invalid: tunnel) |
 | PL-G*, PL-P* | Planning tests (goal / WP1 plan) per model |

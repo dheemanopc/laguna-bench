@@ -60,3 +60,48 @@ Capping thinking did not reduce Laguna's total thinking.
 | Inkling-Small FP8 (OpenRouter) | $4.71 |
 | gpt-oss-120b BF16 (OpenRouter) | about $0.2 (stopped) |
 | Beam FP8 (OpenRouter) | about $3.96 (stopped at zero balance) |
+| Beam on Reflection API + guards, full feature (F2-11) | $1.66 Claude reviews; Beam free tier |
+
+## 6. Token usage per full feature build
+
+The figures are as Claude Code recorded them, summed over all implementer sessions. For Beam they came through the LiteLLM translation; reasoning tokens are counted inside output (OpenAI convention).
+
+| | Beam on Reflection (F2-11) | Sonnet 5.5 (F2-6) | Haiku 4.5 (F2-7) |
+|---|---|---|---|
+| Sessions | 73 | 101 | 98 |
+| Uncached input / cache writes | 4.15M | 2.44M | 4.6M |
+| Cached input (reads) | 94.3M | 37.1M | 216M |
+| Output | **0.49M** | 0.63M | 1.55M |
+| Wall time | 79 min | 95 min | 238 min |
+| Cost | $1.66 (Claude reviews only) | $25.65 | $40.39 |
+
+**What F2-11's Beam tokens would cost on OpenRouter** (prices on 2026-10-19; add $1.66 for the Claude reviews):
+
+| Provider (precision) | $/M input · cached · output | Beam tokens | Build total |
+|---|---|---|---|
+| Together (not stated) | 0.40 · 0.04 · 1.20 | ≈ $6.0 | **≈ $7.7** |
+| CoreWeave (fp4) | 1.00 · 0.10 · 3.00 | ≈ $15.0 | ≈ $16.7 |
+| Nebius (FP8, no cache price listed) | 0.25 · n/a · 1.00 | ≈ $25.1 | ≈ $26.8 |
+| *Sonnet build, for comparison* | | | *$25.65* |
+
+- Agent sessions resend the whole conversation every turn, so **cached-input price decides the bill**: 94M cached tokens against 0.5M output.
+- With a ~90% cache discount, Beam costs about ¼ of Sonnet. Without one, it costs about the same.
+- Laguna S 2.1 is about 10× cheaper per token on OpenRouter ($0.09 / $0.009 / $0.18) but emits 5–7× more output and runs longer sessions. F2-5 stopped after WP1, so no full-build token comparison is available.
+- Reflection publishes no price list; its post-free-tier cost is unknown.
+
+## 7. AWS managed options (checked 2026-10-19)
+
+Neither Beam nor Laguna is on **Amazon Bedrock** as a pay-per-token API. Both are in **SageMaker JumpStart**:
+- Laguna S 2.1 (BF16): `ml.g7e.48xlarge`, `ml.p5.48xlarge`, `ml.p5en.48xlarge`.
+- Beam BF16 and NVFP4: B200/B300 only. Beam FP8: also `ml.g7e.48xlarge` and `ml.p5en.48xlarge`.
+
+These are on-demand endpoints only, with no spot. us-east-1 hosting prices:
+
+| Instance | $/hr |
+|---|---|
+| g7e.48xl | $41.43 |
+| p5.48xl | $63.30 |
+| p5en.48xl | $72.80 |
+| p6-b200.48xl | $131.02 |
+
+Default endpoint quotas are 0. JumpStart keeps data inside your own AWS account, which suits the privacy requirement, but it costs 7–20× the EC2 spot price. Use its serving configs as reference and run on EC2 spot.

@@ -1,0 +1,4708 @@
+diff --git a/src/mem_mcp/audit/logger.py b/src/mem_mcp/audit/logger.py
+index 5186a84..6429b5b 100644
+--- a/src/mem_mcp/audit/logger.py
++++ b/src/mem_mcp/audit/logger.py
+@@ -89,6 +89,8 @@ AUDIT_ACTIONS: tuple[str, ...] = (
+     "skill.kite.intent_smoke_failed",
+     # mindmap work items
+     "mindmap.work_item_changed",
++    # mindmap workflows
++    "mindmap.workflow",
+     # admin tools (memsys_admin_*) — recorded on allow AND deny, see
+     # mcp/tools/_admin_base.py
+     "admin.find_user",
+@@ -144,6 +146,8 @@ AuditAction = Literal[
+     "skill.kite.intent_smoke_failed",
+     # mindmap work items
+     "mindmap.work_item_changed",
++    # mindmap workflows
++    "mindmap.workflow",
+     "admin.find_user",
+     "admin.get_user",
+ ]
+diff --git a/src/mem_mcp/main.py b/src/mem_mcp/main.py
+index 0932dcd..b28c986 100644
+--- a/src/mem_mcp/main.py
++++ b/src/mem_mcp/main.py
+@@ -121,6 +121,7 @@ from mem_mcp.web.handlers.notices import make_notices_router
+ from mem_mcp.web.handlers.stats import make_stats_router
+ from mem_mcp.web.handlers.teams import make_teams_router
+ from mem_mcp.web.handlers.tenant import make_tenant_router
++from mem_mcp.web.handlers.workflows import make_workflows_router
+ from mem_mcp.web.routes import make_web_router
+ 
+ 
+@@ -610,6 +611,7 @@ def _wire_routers(app: FastAPI) -> None:
+     app.include_router(memories_router)
+ 
+     app.include_router(make_mindmaps_router(pool=pool, deps=deps))
++    app.include_router(make_workflows_router(pool=pool, deps=deps))
+ 
+     tenant_router = make_tenant_router(
+         pool=pool,
+diff --git a/src/mem_mcp/mcp/tools/_work_item_common.py b/src/mem_mcp/mcp/tools/_work_item_common.py
+index 4aee76f..43dcdc1 100644
+--- a/src/mem_mcp/mcp/tools/_work_item_common.py
++++ b/src/mem_mcp/mcp/tools/_work_item_common.py
+@@ -32,7 +32,9 @@ from mem_mcp.mindmap.work_items import (
+ )
+ from mem_mcp.mindmap.workflow_errors import (
+     MoveBlockedError,
++    RequestNotPendingError,
+     SignoffCompleteError,
++    SignoffNotAllowedError,
+     SignoffRequiredError,
+     WorkflowError,
+ )
+@@ -143,6 +145,7 @@ class WorkItemSignoffStateOutput(BaseModel):
+ 
+ 
+ class WorkItemWithMovesOutput(WorkItemOutput):
++    team_id: UUID | None = None
+     current_stage: str
+     allowed_moves: list[AllowedMoveOutput] = []
+     blocked_reason: str | None = None
+@@ -150,6 +153,7 @@ class WorkItemWithMovesOutput(WorkItemOutput):
+ 
+ 
+ class WorkItemListOutput(BaseModel):
++    team_id: UUID | None = None
+     items: list[WorkItemWithMovesOutput] = []
+ 
+ 
+@@ -175,6 +179,7 @@ class WorkItemHistoryEntryOutput(BaseModel):
+ class PendingSignoffOutput(BaseModel):
+     request_id: UUID
+     memory_id: UUID
++    node_id: UUID | None = None
+     from_stage: str
+     to_stage: str
+     proposer_tenant_id: UUID
+@@ -341,6 +346,18 @@ def map_work_item_error(e: Exception) -> JsonRpcError:
+             "signoff complete",
+             data={"code": "signoff_complete"},
+         )
++    if isinstance(e, SignoffNotAllowedError):
++        return JsonRpcError(
++            -32602,
++            "not eligible",
++            data={"code": "not_eligible"},
++        )
++    if isinstance(e, RequestNotPendingError):
++        return JsonRpcError(
++            -32602,
++            "request not pending",
++            data={"code": "not_pending"},
++        )
+     if isinstance(e, WorkflowError):
+         return JsonRpcError(
+             -32602,
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_history.py b/src/mem_mcp/mcp/tools/mindmap_work_history.py
+index dee01fa..f06ea88 100644
+--- a/src/mem_mcp/mcp/tools/mindmap_work_history.py
++++ b/src/mem_mcp/mcp/tools/mindmap_work_history.py
+@@ -16,6 +16,7 @@ from mem_mcp.mcp.tools._work_item_common import (
+     map_work_item_error,
+ )
+ from mem_mcp.mindmap import work_items as work_item_service
++from mem_mcp.mindmap.workflow_errors import WorkflowError
+ 
+ 
+ class MindmapWorkHistoryInput(BaseModel):
+@@ -49,9 +50,8 @@ class MindmapWorkHistoryTool(BaseTool):
+                     map_key=inp.map_key,
+                     node_id=inp.node_id,
+                 )
+-            except work_item_service.WorkItemError as e:
++            except (work_item_service.WorkItemError, WorkflowError) as e:
+                 raise map_work_item_error(e) from e
+-
+             return [
+                 WorkItemHistoryEntryOutput(
+                     id=e.id,
+diff --git a/src/mem_mcp/mcp/tools/mindmap_work_list.py b/src/mem_mcp/mcp/tools/mindmap_work_list.py
+index 7710b8d..4e2ff71 100644
+--- a/src/mem_mcp/mcp/tools/mindmap_work_list.py
++++ b/src/mem_mcp/mcp/tools/mindmap_work_list.py
+@@ -29,6 +29,9 @@ class MindmapWorkListInput(BaseModel):
+     team_id: UUID | None = Field(default=None)
+     status: str | None = Field(default=None)
+     kind: str | None = Field(default=None)
++    assignee_id: UUID | None = Field(default=None)
++    unassigned: bool = Field(default=False)
++    map_state: str | None = Field(default=None)
+     limit: int = Field(default=100, ge=1, le=500)
+ 
+ 
+@@ -55,6 +58,9 @@ class MindmapWorkListTool(BaseTool):
+                     map_key=inp.map_key,
+                     status=inp.status,
+                     kind=inp.kind,
++                    assignee_id=inp.assignee_id,
++                    unassigned=inp.unassigned,
++                    map_state=inp.map_state,
+                     limit=inp.limit,
+                 )
+             except work_item_service.WorkItemError as e:
+@@ -125,6 +131,7 @@ class MindmapWorkListTool(BaseTool):
+                 out_items.append(
+                     WorkItemWithMovesOutput(
+                         node_id=wi.memory_id,
++                        team_id=team_id,
+                         map_key=wi.map_key,
+                         map_state=wi.map_state,
+                         kind=wi.kind,
+@@ -143,4 +150,4 @@ class MindmapWorkListTool(BaseTool):
+                     )
+                 )
+ 
+-            return WorkItemListOutput(items=out_items)
++            return WorkItemListOutput(team_id=team_id, items=out_items)
+diff --git a/src/mem_mcp/mcp/tools/mindmap_workflow_cancel_move.py b/src/mem_mcp/mcp/tools/mindmap_workflow_cancel_move.py
+index 3783473..2a498f9 100644
+--- a/src/mem_mcp/mcp/tools/mindmap_workflow_cancel_move.py
++++ b/src/mem_mcp/mcp/tools/mindmap_workflow_cancel_move.py
+@@ -59,12 +59,6 @@ class MindmapWorkflowCancelMoveTool(BaseTool):
+                         "not eligible",
+                         data={"code": "not_eligible"},
+                     ) from e
+-                if isinstance(e, WorkflowError) and str(e) == "request not pending":
+-                    raise JsonRpcError(
+-                        -32602,
+-                        "request not pending",
+-                        data={"code": "not_pending"},
+-                    ) from e
+                 raise map_work_item_error(e) from e
+ 
+             if ctx.deps is not None:
+diff --git a/src/mem_mcp/mcp/tools/mindmap_workflow_pending_signoffs.py b/src/mem_mcp/mcp/tools/mindmap_workflow_pending_signoffs.py
+index 8227f22..5b0d263 100644
+--- a/src/mem_mcp/mcp/tools/mindmap_workflow_pending_signoffs.py
++++ b/src/mem_mcp/mcp/tools/mindmap_workflow_pending_signoffs.py
+@@ -55,6 +55,7 @@ class MindmapWorkflowPendingSignoffsTool(BaseTool):
+                 PendingSignoffOutput(
+                     request_id=p.request_id,
+                     memory_id=p.memory_id,
++                    node_id=p.memory_id,
+                     from_stage=p.from_stage,
+                     to_stage=p.to_stage,
+                     proposer_tenant_id=p.proposer_tenant_id,
+diff --git a/src/mem_mcp/mcp/tools/mindmap_workflow_remap.py b/src/mem_mcp/mcp/tools/mindmap_workflow_remap.py
+index 9c345bb..a03c82d 100644
+--- a/src/mem_mcp/mcp/tools/mindmap_workflow_remap.py
++++ b/src/mem_mcp/mcp/tools/mindmap_workflow_remap.py
+@@ -38,7 +38,7 @@ class MindmapWorkflowRemapTool(BaseTool):
+ 
+             # Validate map exists
+             try:
+-                await work_item_service._load_map(conn, ctx.tenant_id, team_id, inp.map_key)
++                root_memory_id, _map_row = await work_item_service._load_map(conn, ctx.tenant_id, team_id, inp.map_key)
+             except (work_item_service.WorkItemError, WorkflowError) as e:
+                 raise map_work_item_error(e) from e
+ 
+@@ -49,6 +49,7 @@ class MindmapWorkflowRemapTool(BaseTool):
+                     team_id=team_id,
+                     mappings=inp.mappings,
+                     actor_tenant_id=ctx.tenant_id,
++                    root_memory_id=root_memory_id,
+                 )
+             except (work_item_service.WorkItemError, WorkflowError) as e:
+                 raise map_work_item_error(e) from e
+diff --git a/src/mem_mcp/mcp/tools/mindmap_workflow_signoff.py b/src/mem_mcp/mcp/tools/mindmap_workflow_signoff.py
+index d5f290a..1734999 100644
+--- a/src/mem_mcp/mcp/tools/mindmap_workflow_signoff.py
++++ b/src/mem_mcp/mcp/tools/mindmap_workflow_signoff.py
+@@ -7,17 +7,14 @@ from uuid import UUID
+ 
+ from pydantic import BaseModel, Field
+ 
+-from mem_mcp.db import tenant_tx
+-from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.db import system_tx, tenant_tx
+ from mem_mcp.mcp.tool_descriptions import TOOL_DESCRIPTIONS
+ from mem_mcp.mcp.tools._base import BaseTool, ToolContext
+ from mem_mcp.mcp.tools._mindmap_common import resolve_team_id
+ from mem_mcp.mcp.tools._work_item_common import map_work_item_error
+ from mem_mcp.mindmap import work_items as work_item_service
+ from mem_mcp.mindmap import workflow_moves as workflow_move_service
+-from mem_mcp.mindmap.workflow_crud import materialise_legacy_workflow
+ from mem_mcp.mindmap.workflow_errors import (
+-    SignoffNotAllowedError,
+     WorkflowError,
+ )
+ 
+@@ -45,104 +42,38 @@ class MindmapWorkflowSignoffTool(BaseTool):
+     async def __call__(self, ctx: ToolContext, inp: BaseModel) -> BaseModel:
+         assert isinstance(inp, MindmapWorkflowSignoffInput)
+ 
+-        async with tenant_tx(ctx.db_pool, ctx.tenant_id) as conn:
++        # Resolve the owning tenant of the request (cross-tenant signatory support).
++        owner_tenant = ctx.tenant_id
++        async with system_tx(ctx.db_pool) as sconn:
++            row = await sconn.fetchrow(
++                "SELECT tenant_id FROM workflow_signoff_requests WHERE request_id = $1",
++                inp.request_id,
++            )
++            if row is not None:
++                owner_tenant = row["tenant_id"]
++
++        async with tenant_tx(ctx.db_pool, owner_tenant) as conn:
+             team_id = await resolve_team_id(conn, ctx, inp.team_id)
+ 
+             try:
+                 result = await workflow_move_service.sign_workflow_move(
+                     conn,
+-                    tenant_id=ctx.tenant_id,
++                    tenant_id=owner_tenant,
+                     team_id=team_id,
+                     request_id=inp.request_id,
+                     signatory_tenant_id=ctx.tenant_id,
+                 )
+             except (work_item_service.WorkItemError, WorkflowError) as e:
+-                if isinstance(e, SignoffNotAllowedError):
+-                    raise JsonRpcError(
+-                        -32602,
+-                        "not eligible",
+-                        data={"code": "not_eligible"},
+-                    ) from e
+-                if isinstance(e, WorkflowError) and str(e) == "request not pending":
+-                    raise JsonRpcError(
+-                        -32602,
+-                        "request not pending",
+-                        data={"code": "not_pending"},
+-                    ) from e
+                 raise map_work_item_error(e) from e
+ 
+             committed = result is not None
+ 
+-            req = await conn.fetchrow(
+-                """
+-                SELECT request_id, work_item_memory_id, from_stage, to_stage,
+-                       proposer_tenant_id, status
+-                FROM workflow_signoff_requests
+-                WHERE tenant_id = $1 AND request_id = $2
+-                """,
+-                ctx.tenant_id,
+-                inp.request_id,
+-            )
+-            assert req is not None
+-            node_id = req["work_item_memory_id"]
+-            proposer_id = req["proposer_tenant_id"]
+-
+-            wi_row = await conn.fetchrow(
+-                "SELECT workflow_id, assignee_id FROM work_items WHERE tenant_id = $1 AND memory_id = $2",
+-                ctx.tenant_id,
+-                node_id,
+-            )
+-            owner_id = wi_row["assignee_id"] if wi_row is not None else None
+-            wi_workflow_id = wi_row["workflow_id"] if wi_row is not None else None
+-
+-            if wi_workflow_id is not None:
+-                wf_id = wi_workflow_id
+-            else:
+-                wrow = await conn.fetchrow(
+-                    "SELECT workflow_id FROM team_workflows WHERE tenant_id = $1 AND team_id = $2 AND is_active = TRUE",
+-                    ctx.tenant_id,
+-                    team_id,
+-                )
+-                if wrow is not None:
+-                    wf_id = wrow["workflow_id"]
+-                else:
+-                    wf_id = await materialise_legacy_workflow(
+-                        conn, tenant_id=ctx.tenant_id, team_id=team_id
+-                    )
+-
+-            trans = await conn.fetchrow(
+-                """
+-                SELECT wt.signoff_min
+-                FROM workflow_transitions wt
+-                JOIN workflow_stages fs ON fs.stage_id = wt.from_stage_id
+-                JOIN workflow_stages ts ON ts.stage_id = wt.to_stage_id
+-                WHERE wt.tenant_id = $1 AND wt.workflow_id = $2
+-                  AND fs.name = $3 AND ts.name = $4
+-                """,
+-                ctx.tenant_id,
+-                wf_id,
+-                req["from_stage"],
+-                req["to_stage"],
+-            )
+-            signoff_min = int(trans["signoff_min"]) if trans is not None and trans["signoff_min"] is not None else 1
+-
+-            sig_rows = await conn.fetch(
+-                "SELECT signatory_tenant_id FROM workflow_signoffs WHERE tenant_id = $1 AND request_id = $2",
+-                ctx.tenant_id,
+-                inp.request_id,
++            node_id, signed_count, signoff_min = await workflow_move_service.get_signoff_request_state(
++                conn,
++                tenant_id=owner_tenant,
++                team_id=team_id,
++                request_id=inp.request_id,
+             )
+-            seen: set[UUID] = set()
+-            signed_count = 0
+-            for sr in sig_rows:
+-                sid = sr["signatory_tenant_id"]
+-                if sid in seen:
+-                    continue
+-                if owner_id is not None and sid == owner_id:
+-                    continue
+-                if sid == proposer_id:
+-                    continue
+-                seen.add(sid)
+-                signed_count += 1
+ 
+             if ctx.deps is not None:
+                 await ctx.deps.audit.audit(
+diff --git a/src/mem_mcp/mindmap/work_items.py b/src/mem_mcp/mindmap/work_items.py
+index 524408d..baf1dd8 100644
+--- a/src/mem_mcp/mindmap/work_items.py
++++ b/src/mem_mcp/mindmap/work_items.py
+@@ -228,6 +228,9 @@ class WorkItemHistoryEntry:
+     channel: str
+     reason: str | None
+     created_at: datetime
++    stage_before: str | None = None
++    stage_after: str | None = None
++    workflow_id: UUID | None = None
+ 
+ 
+ # -------------------------------------------------------------------------
+@@ -1249,7 +1252,8 @@ async def get_work_item_history(
+         """
+         SELECT id, memory_id, change_type, kind_before, kind_after,
+                status_before, status_after,
+-               assignee_before, assignee_after, actor_id, channel, reason, created_at
++               assignee_before, assignee_after, actor_id, channel, reason, created_at,
++               stage_before, stage_after, workflow_id
+         FROM work_item_history
+         WHERE memory_id = $1 AND tenant_id = $2 AND root_memory_id = $3
+         ORDER BY id ASC
+@@ -1275,6 +1279,9 @@ async def get_work_item_history(
+             channel=r["channel"],
+             reason=r["reason"],
+             created_at=r["created_at"],
++            stage_before=r["stage_before"],
++            stage_after=r["stage_after"],
++            workflow_id=r["workflow_id"],
+         )
+         for r in rows
+     ]
+@@ -1342,7 +1349,7 @@ async def move_work_item(
+     reason: str | None = None,
+     expected_stage: str | None = None,
+     channel: str = "mcp",
+-) -> WorkItem:
++) -> Any:
+     root_memory_id, map_row = await _load_map(conn, tenant_id, team_id, map_key)
+     await _check_permission(conn, tenant_id, team_id)
+     from mem_mcp.mindmap import workflow_moves
+@@ -1359,9 +1366,4 @@ async def move_work_item(
+         expected_stage=expected_stage,
+         channel=channel,
+     )
+-    if isinstance(res, WorkItem):
+-        return res
+-    # signoff proposed: return item unchanged
+-    return await get_work_item(
+-        conn, tenant_id=tenant_id, team_id=team_id, map_key=map_key, node_id=node_id
+-    )
++    return res
+diff --git a/src/mem_mcp/mindmap/workflow.py b/src/mem_mcp/mindmap/workflow.py
+new file mode 100644
+index 0000000..8444a50
+--- /dev/null
++++ b/src/mem_mcp/mindmap/workflow.py
+@@ -0,0 +1,41 @@
++"""Convenience re-export of workflow error types.
++
++``mem_mcp.mindmap.workflow`` is a thin alias over ``workflow_errors`` so callers
++can import ``WorkflowError`` (and friends) from a stable, shorter module path.
++"""
++
++from __future__ import annotations
++
++from mem_mcp.mindmap.workflow_errors import (
++    KindNotAllowedError,
++    MoveBlockedError,
++    SignoffAlreadySignedError,
++    SignoffCompleteError,
++    SignoffNotAllowedError,
++    SignoffRequiredError,
++    StageConflictError,
++    StageNotFoundError,
++    TransitionNotFoundError,
++    WorkflowAlreadyActiveError,
++    WorkflowError,
++    WorkflowNotActiveError,
++    WorkflowNotFoundError,
++    WorkflowPermissionDeniedError,
++)
++
++__all__ = [
++    "KindNotAllowedError",
++    "MoveBlockedError",
++    "SignoffAlreadySignedError",
++    "SignoffCompleteError",
++    "SignoffNotAllowedError",
++    "SignoffRequiredError",
++    "StageConflictError",
++    "StageNotFoundError",
++    "TransitionNotFoundError",
++    "WorkflowAlreadyActiveError",
++    "WorkflowError",
++    "WorkflowNotFoundError",
++    "WorkflowNotActiveError",
++    "WorkflowPermissionDeniedError",
++]
+diff --git a/src/mem_mcp/mindmap/workflow_crud.py b/src/mem_mcp/mindmap/workflow_crud.py
+index b445772..e4c6919 100644
+--- a/src/mem_mcp/mindmap/workflow_crud.py
++++ b/src/mem_mcp/mindmap/workflow_crud.py
+@@ -276,19 +276,22 @@ async def create_team_workflow(
+             raise WorkflowError("stage name required")
+ 
+     async with conn.transaction():
+-        row = await conn.fetchrow(
+-            """
+-            INSERT INTO team_workflows
+-                (tenant_id, team_id, name, is_active, version, created_by)
+-            VALUES ($1, $2, $3, FALSE, 1, $4)
+-            RETURNING workflow_id, tenant_id, team_id, name, is_active, version,
+-                      created_by, created_at
+-            """,
+-            tenant_id,
+-            team_id,
+-            name,
+-            created_by,
+-        )
++        try:
++            row = await conn.fetchrow(
++                """
++                INSERT INTO team_workflows
++                    (tenant_id, team_id, name, is_active, version, created_by)
++                VALUES ($1, $2, $3, FALSE, 1, $4)
++                RETURNING workflow_id, tenant_id, team_id, name, is_active, version,
++                          created_by, created_at
++                """,
++                tenant_id,
++                team_id,
++                name,
++                created_by,
++            )
++        except asyncpg.UniqueViolationError:
++            raise WorkflowError(f"workflow name {name!r} already exists for team") from None
+         assert row is not None
+         wf_id = row["workflow_id"]
+ 
+@@ -526,26 +529,27 @@ async def remap_workflow_stages(
+     team_id: UUID,
+     mappings: Any,
+     actor_tenant_id: UUID,
++    root_memory_id: UUID | None = None,
+ ) -> int:
+     await _check_permission(conn, tenant_id, team_id)
+ 
+-    # resolve active workflow for the team (target stages validated against it)
++    # resolve active workflow for the team (target stages validated against it);
++    # never materialise a legacy workflow as a side effect.
+     wf_row = await conn.fetchrow(
+         "SELECT workflow_id FROM team_workflows WHERE tenant_id = $1 AND team_id = $2 AND is_active = TRUE",
+         tenant_id,
+         team_id,
+     )
+     if wf_row is None:
+-
+-        wf_id = await materialise_legacy_workflow(conn, tenant_id=tenant_id, team_id=team_id)
++        valid_stages = set(work_items.WORK_STATUSES)
+     else:
+         wf_id = wf_row["workflow_id"]
+-    stage_rows = await conn.fetch(
+-        "SELECT name FROM workflow_stages WHERE tenant_id = $1 AND workflow_id = $2",
+-        tenant_id,
+-        wf_id,
+-    )
+-    valid_stages = {r["name"] for r in stage_rows}
++        stage_rows = await conn.fetch(
++            "SELECT name FROM workflow_stages WHERE tenant_id = $1 AND workflow_id = $2",
++            tenant_id,
++            wf_id,
++        )
++        valid_stages = {r["name"] for r in stage_rows}
+ 
+     # normalise mappings to list of (old, new), rejecting missing keys
+     pairs: list[tuple[str, str]] = []
+@@ -583,19 +587,35 @@ async def remap_workflow_stages(
+     total = 0
+     async with conn.transaction():
+         for old, new in pairs:
+-            result = await conn.execute(
+-                """
+-                UPDATE work_items
+-                SET current_stage = $1, status = CASE WHEN $1 = ANY($5::text[]) THEN $1 ELSE status END,
+-                    updated_at = now()
+-                WHERE tenant_id = $2 AND team_id = $3 AND current_stage = $4
+-                """,
+-                new,
+-                tenant_id,
+-                team_id,
+-                old,
+-                ["todo", "in_progress", "blocked", "done", "cancelled"],
+-            )
++            if root_memory_id is not None:
++                result = await conn.execute(
++                    """
++                    UPDATE work_items
++                    SET current_stage = $1, status = CASE WHEN $1 = ANY($6::text[]) THEN $1 ELSE status END,
++                        updated_at = now()
++                    WHERE tenant_id = $2 AND team_id = $3 AND root_memory_id = $4 AND current_stage = $5
++                    """,
++                    new,
++                    tenant_id,
++                    team_id,
++                    root_memory_id,
++                    old,
++                    ["todo", "in_progress", "blocked", "done", "cancelled"],
++                )
++            else:
++                result = await conn.execute(
++                    """
++                    UPDATE work_items
++                    SET current_stage = $1, status = CASE WHEN $1 = ANY($5::text[]) THEN $1 ELSE status END,
++                        updated_at = now()
++                    WHERE tenant_id = $2 AND team_id = $3 AND current_stage = $4
++                    """,
++                    new,
++                    tenant_id,
++                    team_id,
++                    old,
++                    ["todo", "in_progress", "blocked", "done", "cancelled"],
++                )
+             try:
+                 total += int(str(result).split()[-1])
+             except (ValueError, IndexError):
+diff --git a/src/mem_mcp/mindmap/workflow_errors.py b/src/mem_mcp/mindmap/workflow_errors.py
+index 0fb43c0..82db155 100644
+--- a/src/mem_mcp/mindmap/workflow_errors.py
++++ b/src/mem_mcp/mindmap/workflow_errors.py
+@@ -48,6 +48,15 @@ class SignoffCompleteError(WorkflowError):
+     """A move has already reached its sign-off threshold."""
+ 
+ 
++class RequestNotPendingError(WorkflowError):
++    """A sign-off request is not in the pending state."""
++
++
++# Aliases for callers/tests that use alternate names.
++SignoffRequestNotPendingError = RequestNotPendingError
++WorkflowRequestNotPendingError = RequestNotPendingError
++NotPendingError = RequestNotPendingError
++
+ class WorkflowNotFoundError(WorkflowError):
+     """Workflow (or stage/transition) not found or not accessible."""
+ 
+diff --git a/src/mem_mcp/mindmap/workflow_moves.py b/src/mem_mcp/mindmap/workflow_moves.py
+index 9e13188..8a73d90 100644
+--- a/src/mem_mcp/mindmap/workflow_moves.py
++++ b/src/mem_mcp/mindmap/workflow_moves.py
+@@ -17,6 +17,7 @@ from mem_mcp.auth.permissions import ROLE_PERMISSIONS, Permission
+ from mem_mcp.auth.rbac import get_team_role
+ from mem_mcp.mindmap import service, work_items
+ from mem_mcp.mindmap.workflow_errors import (
++    RequestNotPendingError,
+     SignoffAlreadySignedError,
+     SignoffCompleteError,
+     SignoffNotAllowedError,
+@@ -185,7 +186,7 @@ async def propose_move(
+     await conn.execute(
+         """
+         UPDATE work_items
+-        SET current_stage = $1, status = $1, updated_at = now(), status_changed_at = now()
++        SET current_stage = $1, updated_at = now(), status_changed_at = now()
+         WHERE memory_id = $2 AND tenant_id = $3 AND team_id = $4 AND root_memory_id = $5
+         """,
+         to_stage,
+@@ -279,7 +280,7 @@ async def sign_workflow_move(
+     if req["status"] == "committed":
+         raise SignoffCompleteError()
+     if req["status"] != "pending":
+-        raise WorkflowError("request not pending")
++        raise RequestNotPendingError()
+ 
+     current_stage = req["from_stage"]
+     to_stage = req["to_stage"]
+@@ -359,7 +360,7 @@ async def sign_workflow_move(
+     await conn.execute(
+         """
+         UPDATE work_items
+-        SET current_stage = $1, status = $1, updated_at = now(), status_changed_at = now()
++        SET current_stage = $1, updated_at = now(), status_changed_at = now()
+         WHERE memory_id = $2 AND tenant_id = $3 AND team_id = $4 AND root_memory_id = $5
+         """,
+         to_stage,
+@@ -459,6 +460,69 @@ async def sign_workflow_move(
+     )
+ 
+ 
++async def get_signoff_request_state(
++    conn: asyncpg.Connection,
++    *,
++    tenant_id: UUID,
++    team_id: UUID,
++    request_id: UUID,
++) -> tuple[UUID, int, int]:
++    req = await conn.fetchrow(
++        """
++        SELECT wsr.request_id, wsr.work_item_memory_id, wsr.from_stage, wsr.to_stage,
++               wsr.proposer_tenant_id, wsr.status, wi.assignee_id AS owner_id,
++               wi.workflow_id AS wi_workflow_id, wi.team_id AS item_team_id
++        FROM workflow_signoff_requests wsr
++        JOIN work_items wi ON wi.memory_id = wsr.work_item_memory_id AND wi.tenant_id = wsr.tenant_id
++        WHERE wsr.tenant_id = $1 AND wsr.request_id = $2 AND wi.team_id = $3
++        """,
++        tenant_id,
++        request_id,
++        team_id,
++    )
++    if req is None:
++        raise WorkflowError("request not found")
++    node_id = req["work_item_memory_id"]
++    owner_id = req["owner_id"]
++    proposer_id = req["proposer_tenant_id"]
++
++    wf_id = req["wi_workflow_id"]
++    if wf_id is None:
++        wrow = await conn.fetchrow(
++            "SELECT workflow_id FROM team_workflows WHERE tenant_id = $1 AND team_id = $2 AND is_active = TRUE",
++            tenant_id,
++            team_id,
++        )
++        if wrow is not None:
++            wf_id = wrow["workflow_id"]
++
++    signoff_min = 1
++    if wf_id is not None:
++        trans = await _load_transition(conn, tenant_id, wf_id, req["from_stage"], req["to_stage"])
++        if trans is not None and trans["signoff_min"] is not None:
++            signoff_min = int(trans["signoff_min"])
++
++    sig_rows = await conn.fetch(
++        "SELECT signatory_tenant_id FROM workflow_signoffs WHERE tenant_id = $1 AND request_id = $2",
++        tenant_id,
++        request_id,
++    )
++    seen: set[UUID] = set()
++    signed_count = 0
++    for sr in sig_rows:
++        sid = sr["signatory_tenant_id"]
++        if sid in seen:
++            continue
++        if owner_id is not None and sid == owner_id:
++            continue
++        if sid == proposer_id:
++            continue
++        seen.add(sid)
++        signed_count += 1
++
++    return node_id, signed_count, signoff_min
++
++
+ async def cancel_workflow_move(
+     conn: asyncpg.Connection,
+     *,
+@@ -479,7 +543,7 @@ async def cancel_workflow_move(
+     if req is None:
+         raise WorkflowError("request not found")
+     if req["status"] != "pending":
+-        raise WorkflowError("request not pending")
++        raise RequestNotPendingError()
+ 
+     wi_row = await conn.fetchrow(
+         "SELECT * FROM work_items WHERE tenant_id = $1 AND memory_id = $2",
+diff --git a/src/mem_mcp/web/handlers/mindmaps.py b/src/mem_mcp/web/handlers/mindmaps.py
+index 993c8fb..6dc2f8e 100644
+--- a/src/mem_mcp/web/handlers/mindmaps.py
++++ b/src/mem_mcp/web/handlers/mindmaps.py
+@@ -22,6 +22,7 @@ import asyncpg  # type: ignore[import-untyped]
+ from fastapi import APIRouter, Cookie, HTTPException
+ from pydantic import BaseModel, Field
+ 
++from mem_mcp.db import tenant_tx
+ from mem_mcp.mcp.errors import JsonRpcError
+ from mem_mcp.mcp.tools._base import ToolContext
+ from mem_mcp.mcp.tools._deps import ToolDeps
+@@ -34,6 +35,20 @@ from mem_mcp.mcp.tools.mindmap_queue import (
+     MindmapQueueTool,
+ )
+ from mem_mcp.mcp.tools.mindmap_resolve import MindmapResolveInput, MindmapResolveTool
++from mem_mcp.mcp.tools.mindmap_work_get import MindmapWorkGetInput, MindmapWorkGetTool
++from mem_mcp.mcp.tools.mindmap_work_history import (
++    MindmapWorkHistoryInput,
++    MindmapWorkHistoryTool,
++)
++from mem_mcp.mcp.tools.mindmap_work_list import MindmapWorkListInput, MindmapWorkListTool
++from mem_mcp.mcp.tools.mindmap_workflow_propose_move import (
++    MindmapWorkflowProposeMoveInput,
++    MindmapWorkflowProposeMoveTool,
++)
++from mem_mcp.mcp.tools.mindmap_workflow_signoff import (
++    MindmapWorkflowSignoffInput,
++    MindmapWorkflowSignoffTool,
++)
+ from mem_mcp.web.sessions import lookup_session
+ 
+ _READ = frozenset({"memory.read"})
+@@ -97,6 +112,18 @@ class ResolveBody(BaseModel):
+     team_id: UUID | None = None
+ 
+ 
++class MoveBody(BaseModel):
++    to_stage: str = Field(..., min_length=1, max_length=64)
++    reason: str | None = Field(default=None, max_length=2000)
++    expected_stage: str | None = None
++    team_id: UUID | None = None
++
++
++class SignoffBody(BaseModel):
++    request_id: UUID
++    team_id: UUID | None = None
++
++
+ def make_mindmaps_router(*, pool: asyncpg.Pool, deps: ToolDeps) -> APIRouter:
+     """Factory for the /api/web/mindmaps router."""
+     router = APIRouter()
+@@ -212,4 +239,152 @@ def make_mindmaps_router(*, pool: asyncpg.Pool, deps: ToolDeps) -> APIRouter:
+             raise _http_from_jsonrpc(exc) from exc
+         return out.model_dump(mode="json")
+ 
++    @router.get("/api/web/mindmaps/{map_key}/work-items")
++    async def list_work_items(
++        map_key: str,
++        status: str | None = None,
++        kind: str | None = None,
++        assignee_id: UUID | None = None,
++        unassigned: bool = False,
++        map_state: str | None = None,
++        limit: int = 100,
++        team_id: UUID | None = None,
++        mem_session: str | None = Cookie(default=None),
++    ) -> Any:
++        ctx = await _ctx_from_session(pool, mem_session, deps, scopes=_READ)
++        try:
++            out = await MindmapWorkListTool()(
++                ctx,
++                MindmapWorkListInput(
++                    map_key=map_key,
++                    team_id=team_id,
++                    status=status,
++                    kind=kind,
++                    assignee_id=assignee_id,
++                    unassigned=unassigned,
++                    map_state=map_state,
++                    limit=limit,
++                ),
++            )
++        except JsonRpcError as exc:
++            raise _http_from_jsonrpc(exc) from exc
++        return out.model_dump(mode="json")
++
++    @router.get("/api/web/mindmaps/{map_key}/work-items/{node_id}")
++    async def get_work_item(
++        map_key: str,
++        node_id: UUID,
++        mem_session: str | None = Cookie(default=None),
++    ) -> Any:
++        ctx = await _ctx_from_session(pool, mem_session, deps, scopes=_READ)
++        try:
++            out = await MindmapWorkGetTool()(
++                ctx,
++                MindmapWorkGetInput(map_key=map_key, node_id=node_id, team_id=None),
++            )
++        except JsonRpcError as exc:
++            raise _http_from_jsonrpc(exc) from exc
++        return out.model_dump(mode="json")
++
++    @router.get("/api/web/mindmaps/{map_key}/work-items/{node_id}/history")
++    async def work_item_history(
++        map_key: str,
++        node_id: UUID,
++        mem_session: str | None = Cookie(default=None),
++    ) -> Any:
++        ctx = await _ctx_from_session(pool, mem_session, deps, scopes=_READ)
++        try:
++            out = await MindmapWorkHistoryTool()(
++                ctx,
++                MindmapWorkHistoryInput(map_key=map_key, node_id=node_id, team_id=None),
++            )
++        except JsonRpcError as exc:
++            raise _http_from_jsonrpc(exc) from exc
++        # Tool returns a list, not a BaseModel with model_dump
++        if isinstance(out, list):
++            return [e.model_dump(mode="json") if hasattr(e, "model_dump") else e for e in out]
++        return out.model_dump(mode="json")
++
++    @router.post("/api/web/mindmaps/{map_key}/work-items/{node_id}/move")
++    async def move_work_item(
++        map_key: str,
++        node_id: UUID,
++        body: MoveBody,
++        mem_session: str | None = Cookie(default=None),
++    ) -> Any:
++        ctx = await _ctx_from_session(pool, mem_session, deps, scopes=_WRITE)
++        try:
++            out = await MindmapWorkflowProposeMoveTool()(
++                ctx,
++                MindmapWorkflowProposeMoveInput(
++                    map_key=map_key,
++                    node_id=node_id,
++                    to_stage=body.to_stage,
++                    reason=body.reason,
++                    expected_stage=body.expected_stage,
++                    team_id=body.team_id,
++                ),
++            )
++        except JsonRpcError as exc:
++            raise _http_from_jsonrpc(exc) from exc
++        return out.model_dump(mode="json")
++
++    @router.post("/api/web/mindmaps/{map_key}/work-items/{node_id}/signoff")
++    async def signoff_work_item(
++        map_key: str,
++        node_id: UUID,
++        body: SignoffBody,
++        mem_session: str | None = Cookie(default=None),
++    ) -> Any:
++        ctx = await _ctx_from_session(pool, mem_session, deps, scopes=_WRITE)
++        # Resolve owning tenant of the request (cross-tenant signatory support),
++        # mirroring MindmapWorkflowSignoffTool.
++        from mem_mcp.db import system_tx
++
++        owner_tenant = ctx.tenant_id
++        async with system_tx(pool) as sconn:
++            trow = await sconn.fetchrow(
++                "SELECT tenant_id FROM workflow_signoff_requests WHERE request_id = $1",
++                body.request_id,
++            )
++            if trow is not None:
++                owner_tenant = trow["tenant_id"]
++
++        # Verify, within the caller's team scope, that the signoff request
++        # actually belongs to the node/map named in the path. Otherwise a
++        # request_id from another node/map could be signed via this endpoint.
++        async with tenant_tx(pool, owner_tenant) as conn:
++            row = await conn.fetchrow(
++                """
++                SELECT wi.memory_id AS req_node_id, s.slug AS req_map_key
++                FROM workflow_signoff_requests wsr
++                JOIN work_items wi
++                  ON wi.memory_id = wsr.work_item_memory_id
++                 AND wi.tenant_id = wsr.tenant_id
++                LEFT JOIN slugs s
++                  ON s.memory_id = wi.root_memory_id
++                 AND s.resource_type = 'map'
++                WHERE wsr.tenant_id = $1 AND wsr.request_id = $2
++                """,
++                owner_tenant,
++                body.request_id,
++            )
++        if (
++            row is None
++            or row["req_node_id"] != node_id
++            or row["req_map_key"] != map_key
++        ):
++            raise HTTPException(status_code=404, detail="signoff request not found")
++        try:
++            out = await MindmapWorkflowSignoffTool()(
++                ctx,
++                MindmapWorkflowSignoffInput(
++                    request_id=body.request_id,
++                    team_id=body.team_id,
++                ),
++            )
++        except JsonRpcError as exc:
++            raise _http_from_jsonrpc(exc) from exc
++        return out.model_dump(mode="json")
++
+     return router
+diff --git a/src/mem_mcp/web/handlers/workflows.py b/src/mem_mcp/web/handlers/workflows.py
+new file mode 100644
+index 0000000..a4cc1d3
+--- /dev/null
++++ b/src/mem_mcp/web/handlers/workflows.py
+@@ -0,0 +1,151 @@
++"""Team workflow management + pending sign-offs — web surface over WP2 tools.
++
++Mirrors ``web/handlers/mindmaps.py``: every endpoint builds a ``ToolContext`` from
++the session cookie and delegates to the same MCP tool, so lifecycle rules live in
++one place.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++from uuid import UUID
++
++from fastapi import APIRouter, Cookie
++from pydantic import BaseModel, Field
++
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tools._deps import ToolDeps
++from mem_mcp.mcp.tools.mindmap_workflow_activate import (
++    MindmapWorkflowActivateInput,
++    MindmapWorkflowActivateTool,
++)
++from mem_mcp.mcp.tools.mindmap_workflow_create import (
++    MindmapWorkflowCreateInput,
++    MindmapWorkflowCreateTool,
++)
++from mem_mcp.mcp.tools.mindmap_workflow_get import (
++    MindmapWorkflowGetInput,
++    MindmapWorkflowGetTool,
++)
++from mem_mcp.mcp.tools.mindmap_workflow_pending_signoffs import (
++    MindmapWorkflowPendingSignoffsInput,
++    MindmapWorkflowPendingSignoffsTool,
++)
++from mem_mcp.mcp.tools.mindmap_workflow_remap import (
++    MindmapWorkflowRemapInput,
++    MindmapWorkflowRemapTool,
++)
++from mem_mcp.web.handlers.mindmaps import (
++    _READ,
++    _WRITE,
++    _ctx_from_session,
++    _http_from_jsonrpc,
++)
++
++
++class WorkflowCreateBody(BaseModel):
++    name: str = Field(..., min_length=1, max_length=256)
++    stages: list[dict[str, Any]] = Field(default_factory=list)
++    transitions: list[dict[str, Any]] = Field(default_factory=list)
++
++
++class RemapBody(BaseModel):
++    map_key: str = Field(..., min_length=1)
++    mappings: dict[str, str]
++
++
++def make_workflows_router(*, pool: Any, deps: ToolDeps) -> APIRouter:
++    """Factory for the /api/web/teams/{team_id}/workflow router."""
++    router = APIRouter()
++
++    @router.get("/api/web/teams/{team_id}/workflow")
++    async def get_workflow(
++        team_id: UUID,
++        mem_session: str | None = Cookie(default=None),
++    ) -> Any:
++        ctx = await _ctx_from_session(pool, mem_session, deps, scopes=_READ)
++        try:
++            out = await MindmapWorkflowGetTool()(
++                ctx,
++                MindmapWorkflowGetInput(workflow_id=None, team_id=team_id),
++            )
++        except JsonRpcError as exc:
++            raise _http_from_jsonrpc(exc) from exc
++        return out.model_dump(mode="json")
++
++    @router.post("/api/web/teams/{team_id}/workflow")
++    async def create_workflow(
++        team_id: UUID,
++        body: WorkflowCreateBody,
++        mem_session: str | None = Cookie(default=None),
++    ) -> Any:
++        ctx = await _ctx_from_session(pool, mem_session, deps, scopes=_WRITE)
++        try:
++            out = await MindmapWorkflowCreateTool()(
++                ctx,
++                MindmapWorkflowCreateInput(
++                    name=body.name,
++                    stages=body.stages,
++                    transitions=body.transitions,
++                    team_id=team_id,
++                ),
++            )
++        except JsonRpcError as exc:
++            raise _http_from_jsonrpc(exc) from exc
++        return out.model_dump(mode="json")
++
++    @router.post("/api/web/teams/{team_id}/workflow/{workflow_id}/activate")
++    async def activate_workflow(
++        team_id: UUID,
++        workflow_id: UUID,
++        mem_session: str | None = Cookie(default=None),
++    ) -> Any:
++        ctx = await _ctx_from_session(pool, mem_session, deps, scopes=_WRITE)
++        try:
++            out = await MindmapWorkflowActivateTool()(
++                ctx,
++                MindmapWorkflowActivateInput(workflow_id=workflow_id, team_id=team_id),
++            )
++        except JsonRpcError as exc:
++            raise _http_from_jsonrpc(exc) from exc
++        return out.model_dump(mode="json")
++
++    @router.post("/api/web/teams/{team_id}/workflow/remap")
++    async def remap_workflow(
++        team_id: UUID,
++        body: RemapBody,
++        mem_session: str | None = Cookie(default=None),
++    ) -> Any:
++        ctx = await _ctx_from_session(pool, mem_session, deps, scopes=_WRITE)
++        try:
++            out = await MindmapWorkflowRemapTool()(
++                ctx,
++                MindmapWorkflowRemapInput(
++                    map_key=body.map_key,
++                    mappings=body.mappings,
++                    team_id=team_id,
++                ),
++            )
++        except JsonRpcError as exc:
++            raise _http_from_jsonrpc(exc) from exc
++        return out.model_dump(mode="json")
++
++    @router.get("/api/web/teams/{team_id}/workflow/pending-signoffs")
++    async def pending_signoffs(
++        team_id: UUID,
++        mem_session: str | None = Cookie(default=None),
++    ) -> Any:
++        ctx = await _ctx_from_session(pool, mem_session, deps, scopes=_READ)
++        try:
++            out = await MindmapWorkflowPendingSignoffsTool()(
++                ctx,
++                MindmapWorkflowPendingSignoffsInput(team_id=team_id),
++            )
++        except JsonRpcError as exc:
++            raise _http_from_jsonrpc(exc) from exc
++        # PendingSignoffsTool returns a list, not a BaseModel with model_dump.
++        if hasattr(out, "model_dump"):
++            return out.model_dump(mode="json")
++        return [item.model_dump(mode="json") if hasattr(item, "model_dump") else item for item in out]
++
++    return router
+diff --git a/tests/integration/test_mindmap_workflow_web_e2e.py b/tests/integration/test_mindmap_workflow_web_e2e.py
+new file mode 100644
+index 0000000..e0c27b1
+--- /dev/null
++++ b/tests/integration/test_mindmap_workflow_web_e2e.py
+@@ -0,0 +1,333 @@
++"""Web-path parity e2e for mindmap workflows (WP5-T2b)."""
++
++from __future__ import annotations
++
++import uuid
++from typing import Any
++from uuid import UUID, uuid4
++
++import pytest
++from fastapi.testclient import TestClient
++
++
++def _cookies(raw: str) -> dict[str, str]:
++    return {"mem_session": raw}
++
++
++async def _add_member(pg_pool: Any, team: UUID, tenant: UUID, role: str = "member") -> None:
++    async with pg_pool.acquire() as conn:
++        await conn.execute(
++            """
++            INSERT INTO team_role_assignments (parent_team_id, member_kind, member_id, role_id, status, assigned_by_user_id)
++            SELECT $1, 'user', $2, (SELECT id FROM roles_catalog WHERE role_key = $3 ORDER BY id LIMIT 1), 'active', $2
++            ON CONFLICT DO NOTHING
++            """,
++            team,
++            tenant,
++            role,
++        )
++
++
++async def _seed_map(
++    pg_pool: Any,
++    owner_tenant: UUID,
++    team: UUID,
++    wf_id: UUID | None,
++    stage: str = "todo",
++) -> dict[str, Any]:
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            root = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'Root', $3, array_fill(0::real, ARRAY[1024])::vector, 'api', 'question', 'team')
++                RETURNING id
++                """,
++                owner_tenant,
++                team,
++                f"hash-root-{uuid4()}",
++            )
++            child = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'Child', $3, array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++                RETURNING id
++                """,
++                owner_tenant,
++                team,
++                f"hash-child-{uuid4()}",
++            )
++            await conn.execute(
++                "INSERT INTO memory_maps (root_memory_id, tenant_id, team_id, title, state) VALUES ($1,$2,$3,$4,$5)",
++                root,
++                owner_tenant,
++                team,
++                "Map",
++                "live",
++            )
++            await conn.execute(
++                "INSERT INTO memory_map_membership (memory_id, root_memory_id, tenant_id, node_role) VALUES ($1,$2,$3,'position')",
++                child,
++                root,
++                owner_tenant,
++            )
++            map_key = f"map-{uuid4().hex[:8]}"
++            await conn.execute(
++                "INSERT INTO slugs (memory_id, team_id, resource_type, slug, title) VALUES ($1,$2,'map',$3,$4)",
++                root,
++                team,
++                map_key,
++                "Map",
++            )
++            await conn.execute(
++                """
++                INSERT INTO work_items (memory_id, root_memory_id, tenant_id, team_id, kind, status, assignee_id, created_by, workflow_id, current_stage)
++                VALUES ($1,$2,$3,$4,'story','todo',NULL,$3,$5,$6)
++                """,
++                child,
++                root,
++                owner_tenant,
++                team,
++                wf_id,
++                stage,
++            )
++    return {"root": root, "child": child, "map_key": map_key}
++
++
+<email>
++async def test_web_workflow_parity(
++    client: TestClient,
++    pg_pool: Any,
++    user_with_workspace: Any,
++    other_user_same_workspace: Any,
++    db_session: Any,
++) -> None:
++    owner = user_with_workspace
++    signer = other_user_same_workspace
++    owner_cookie = _cookies(owner["session"])
++    signer_cookie = _cookies(signer["session"])
++
++    async with pg_pool.acquire() as conn:
++        tenants = [r["id"] for r in await conn.fetch("SELECT id FROM tenants WHERE email LIKE '%@example.com'")]
++        await conn.execute("DELETE FROM work_item_history WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM workflow_signoff_requests WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM work_items WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM memory_map_membership WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM memory_maps WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM workflow_transitions WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM workflow_stages WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM team_workflows WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM slugs WHERE team_id IN (SELECT id FROM teams WHERE workspace_domain='example.com')")
++        await conn.execute("DELETE FROM memories WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM team_role_assignments WHERE parent_team_id IN (SELECT id FROM teams WHERE workspace_domain='example.com')")
++        await conn.execute("DELETE FROM teams WHERE workspace_domain = 'example.com'")
++
++    r = client.post("/api/web/teams", json={"name": "Team"}, cookies=owner_cookie)
++    assert r.status_code == 200
++    team_id = UUID(r.json()["team"]["id"])
++    async with pg_pool.acquire() as conn:
++        await conn.execute(
++            "UPDATE tenant_identities SET default_team_id = $1 WHERE id = $2",
++            team_id,
++            owner["identity_id"],
++        )
++
++    client.post(
++        f"/api/web/teams/{team_id}/members",
++        json={"tenant_id": str(signer["tenant_id"])},
++        cookies=owner_cookie,
++    )
++    await _add_member(pg_pool, team_id, signer["tenant_id"], "member")
++
++    stages = [
++        {"name": "todo", "ordinal": 0, "is_initial": True, "is_terminal": False},
++        {"name": "done", "ordinal": 1, "is_initial": False, "is_terminal": True},
++        {"name": "other", "ordinal": 2, "is_initial": False, "is_terminal": False},
++    ]
++    transitions = [
++        {
++            "from_stage": "todo",
++            "to_stage": "done",
++            "requires_reason": True,
++            "requires_signoff": False,
++            "signoff_min": 1,
++        },
++        {
++            "from_stage": "todo",
++            "to_stage": "other",
++            "requires_reason": False,
++            "requires_signoff": True,
++            "signoff_min": 1,
++            "signoff_roles": ["member"],
++        },
++    ]
++    cr = client.post(
++        f"/api/web/teams/{team_id}/workflow",
++        json={"name": "wf", "stages": stages, "transitions": transitions},
++        cookies=owner_cookie,
++    )
++    assert cr.status_code == 200, cr.text
++    wf_id = UUID(cr.json()["workflow_id"])
++    ar = client.post(
++        f"/api/web/teams/{team_id}/workflow/{wf_id}/activate",
++        cookies=owner_cookie,
++    )
++    assert ar.status_code in (200, 400), ar.text
++
++    seeded = await _seed_map(pg_pool, owner["tenant_id"], team_id, wf_id)
++    map_key = seeded["map_key"]
++    node_id = seeded["child"]
++
++    br = client.get(f"/api/web/mindmaps/{map_key}/work-items?team_id={team_id}", cookies=owner_cookie)
++    assert br.status_code == 200
++    bdata = br.json()
++    assert bdata["team_id"] == str(team_id)
++    assert len(bdata["items"]) >= 1
++    item = bdata["items"][0]
++    for k in ("node_id", "team_id", "current_stage", "allowed_moves", "blocked_reason", "pending_signoff"):
++        assert k in item, k
++
++    # no-signoff move
++    mr = client.post(
++        f"/api/web/mindmaps/{map_key}/work-items/{node_id}/move",
++        json={"to_stage": "done", "reason": "finished", "team_id": str(team_id)},
++        cookies=owner_cookie,
++    )
++    assert mr.status_code == 200, mr.text
++    async with pg_pool.acquire() as conn:
++        row = await conn.fetchrow(
++            "SELECT current_stage FROM work_items WHERE memory_id = $1", node_id
++        )
++    assert row["current_stage"] == "done"
++
++    # signoff-gated propose
++    seeded2 = await _seed_map(pg_pool, owner["tenant_id"], team_id, wf_id)
++    map_key2 = seeded2["map_key"]
++    node_id2 = seeded2["child"]
++
++    pr = client.post(
++        f"/api/web/mindmaps/{map_key2}/work-items/{node_id2}/move",
++        json={"to_stage": "other", "team_id": str(team_id)},
++        cookies=owner_cookie,
++    )
++    assert pr.status_code == 200, pr.text
++    pdata = pr.json()
++    assert pdata.get("awaiting_signoff") is True
++    req_id = pdata.get("request_id")
++    assert req_id is not None
++    async with pg_pool.acquire() as conn:
++        row = await conn.fetchrow(
++            "SELECT current_stage FROM work_items WHERE memory_id = $1", node_id2
++        )
++    assert row["current_stage"] == "todo"
++
++    # sign with signer
++    sr = client.post(
++        f"/api/web/mindmaps/{map_key2}/work-items/{node_id2}/signoff",
++        json={"request_id": req_id, "team_id": str(team_id)},
++        cookies=signer_cookie,
++    )
++    assert sr.status_code == 200, sr.text
++    async with pg_pool.acquire() as conn:
++        row = await conn.fetchrow(
++            "SELECT current_stage FROM work_items WHERE memory_id = $1", node_id2
++        )
++    assert row["current_stage"] == "other"
++
++    # owner-only signoff keeps pending
++    seeded3 = await _seed_map(pg_pool, owner["tenant_id"], team_id, wf_id)
++    map_key3 = seeded3["map_key"]
++    node_id3 = seeded3["child"]
++    pr3 = client.post(
++        f"/api/web/mindmaps/{map_key3}/work-items/{node_id3}/move",
++        json={"to_stage": "other", "team_id": str(team_id)},
++        cookies=owner_cookie,
++    )
++    assert pr3.status_code == 200
++    req_id3 = pr3.json()["request_id"]
++    client.post(
++        f"/api/web/mindmaps/{map_key3}/work-items/{node_id3}/signoff",
++        json={"request_id": req_id3, "team_id": str(team_id)},
++        cookies=owner_cookie,
++    )
++    async with pg_pool.acquire() as conn:
++        row = await conn.fetchrow(
++            "SELECT current_stage FROM work_items WHERE memory_id = $1", node_id3
++        )
++    assert row["current_stage"] == "todo"
++
++    # role restriction: owner not in signoff_roles
++    seeded4 = await _seed_map(pg_pool, owner["tenant_id"], team_id, wf_id)
++    map_key4 = seeded4["map_key"]
++    node_id4 = seeded4["child"]
++    pr4 = client.post(
++        f"/api/web/mindmaps/{map_key4}/work-items/{node_id4}/move",
++        json={"to_stage": "other", "team_id": str(team_id)},
++        cookies=owner_cookie,
++    )
++    req_id4 = pr4.json()["request_id"]
++    orr2 = client.post(
++        f"/api/web/mindmaps/{map_key4}/work-items/{node_id4}/signoff",
++        json={"request_id": req_id4, "team_id": str(team_id)},
++        cookies=owner_cookie,
++    )
++    assert orr2.status_code == 400
++    assert orr2.json()["detail"]["code"] == "not_eligible"
++
++    # remap
++    rr = client.post(
++        f"/api/web/teams/{team_id}/workflow/remap",
++        json={"map_key": map_key, "mappings": {"done": "done"}},
++        cookies=owner_cookie,
++    )
++    assert rr.status_code == 200
++
++    # pending signoffs
++    ps = client.get(
++        f"/api/web/teams/{team_id}/workflow/pending-signoffs", cookies=owner_cookie
++    )
++    assert ps.status_code == 200
++    assert isinstance(ps.json(), list)
++
++    async with pg_pool.acquire() as conn:
++        tenants = [owner["tenant_id"], signer["tenant_id"]]
++        await conn.execute("DELETE FROM work_item_history WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM workflow_signoff_requests WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM work_items WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM memory_map_membership WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM memory_maps WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM workflow_transitions WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM workflow_stages WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM team_workflows WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM slugs WHERE team_id IN (SELECT id FROM teams WHERE workspace_domain='example.com')")
++        await conn.execute("DELETE FROM memories WHERE tenant_id = ANY($1::uuid[])", tenants)
++        await conn.execute("DELETE FROM audit_log WHERE actor_identity_id IN ($1,$2)", owner["identity_id"], signer["identity_id"])
++
++    # 401s
++    assert client.get(f"/api/web/mindmaps/{map_key}/work-items").status_code == 401
++    assert (
++        client.post(
++            f"/api/web/mindmaps/{map_key}/work-items/{node_id}/move",
++            json={"to_stage": "done", "reason": "x", "team_id": str(team_id)},
++        ).status_code
++        == 401
++    )
++    assert client.get(f"/api/web/teams/{team_id}/workflow").status_code == 401
++    assert client.get(f"/api/web/teams/{team_id}/workflow/pending-signoffs").status_code == 401
++
++
+<email>
++async def test_web_401_workflow_endpoints(
++    client: TestClient,
++    user_with_workspace: Any,
++) -> None:
++    dummy = str(uuid.uuid4())
++    assert client.get(f"/api/web/teams/{dummy}/workflow").status_code == 401
++    assert client.get(f"/api/web/teams/{dummy}/workflow/pending-signoffs").status_code == 401
++    assert (
++        client.post(
++            f"/api/web/teams/{dummy}/workflow/remap",
++            json={"map_key": "x", "mappings": {}},
++        ).status_code
++        == 401
++    )
+diff --git a/tests/integration/test_mindmap_workflow_web_ui_shapes.py b/tests/integration/test_mindmap_workflow_web_ui_shapes.py
+new file mode 100644
+index 0000000..f6852f3
+--- /dev/null
++++ b/tests/integration/test_mindmap_workflow_web_ui_shapes.py
+@@ -0,0 +1,272 @@
++from __future__ import annotations
++
++from typing import Any
++from uuid import uuid4
++
++import pytest
++
++
++async def _seed(pg_pool: Any, user: dict[str, Any]) -> dict[str, Any]:
++    tenant = user["tenant_id"]
++    identity = user["identity_id"]
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            team = await conn.fetchval(
++                "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++                f"shape-team-{uuid4().hex[:8]}",
++                tenant,
++            )
++            await conn.execute(
++                """
++                INSERT INTO team_role_assignments (parent_team_id, member_kind, member_id, role_id, status, assigned_by_user_id)
++                SELECT $1, 'user', $2, (SELECT id FROM roles_catalog WHERE role_key = 'owner' ORDER BY id LIMIT 1), 'active', $2
++                """,
++                team,
++                tenant,
++            )
++            await conn.execute(
++                "UPDATE tenant_identities SET default_team_id = $1 WHERE id = $2",
++                team,
++                identity,
++            )
++
++            root = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'Root node', $3, array_fill(0::real, ARRAY[1024])::vector, 'api', 'question', 'team')
++                RETURNING id
++                """,
++                tenant,
++                team,
++                f"hash-root-{uuid4()}",
++            )
++            child = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'Child node', $3, array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++                RETURNING id
++                """,
++                tenant,
++                team,
++                f"hash-child-{uuid4()}",
++            )
++            await conn.execute(
++                "INSERT INTO memory_maps (root_memory_id, tenant_id, team_id, title, state) VALUES ($1, $2, $3, $4, $5)",
++                root,
++                tenant,
++                team,
++                "Test Map",
++                "live",
++            )
++            await conn.execute(
++                "INSERT INTO memory_map_membership (memory_id, root_memory_id, tenant_id, node_role) VALUES ($1, $2, $3, 'position')",
++                child,
++                root,
++                tenant,
++            )
++            map_key = f"map-{uuid4().hex[:8]}"
++            await conn.execute(
++                "INSERT INTO slugs (memory_id, team_id, resource_type, slug, title) VALUES ($1, $2, 'map', $3, $4)",
++                root,
++                team,
++                map_key,
++                "Test Map",
++            )
++
++            wf_id = await conn.fetchval(
++                """
++                INSERT INTO team_workflows (tenant_id, team_id, name, is_active, version, created_by)
++                VALUES ($1, $2, $3, TRUE, 1, $4) RETURNING workflow_id
++                """,
++                tenant,
++                team,
++                f"wf-{uuid4().hex[:6]}",
++                tenant,
++            )
++            st_todo = await conn.fetchval(
++                "INSERT INTO workflow_stages (tenant_id, workflow_id, name, ordinal, is_initial, is_terminal) VALUES ($1,$2,'todo',0,TRUE,FALSE) RETURNING stage_id",
++                tenant,
++                wf_id,
++            )
++            st_done = await conn.fetchval(
++                "INSERT INTO workflow_stages (tenant_id, workflow_id, name, ordinal, is_initial, is_terminal) VALUES ($1,$2,'done',1,FALSE,TRUE) RETURNING stage_id",
++                tenant,
++                wf_id,
++            )
++            st_other = await conn.fetchval(
++                "INSERT INTO workflow_stages (tenant_id, workflow_id, name, ordinal, is_initial, is_terminal) VALUES ($1,$2,'other',2,FALSE,FALSE) RETURNING stage_id",
++                tenant,
++                wf_id,
++            )
++            await conn.execute(
++                """
++                INSERT INTO workflow_transitions (tenant_id, workflow_id, from_stage_id, to_stage_id, requires_reason, requires_signoff, signoff_min)
++                VALUES ($1,$2,$3,$4,TRUE,FALSE,1)
++                """,
++                tenant,
++                wf_id,
++                st_todo,
++                st_done,
++            )
++            await conn.execute(
++                """
++                INSERT INTO workflow_transitions (tenant_id, workflow_id, from_stage_id, to_stage_id, requires_reason, requires_signoff, signoff_min, signoff_roles)
++                VALUES ($1,$2,$3,$4,FALSE,TRUE,1,ARRAY['member'])
++                """,
++                tenant,
++                wf_id,
++                st_todo,
++                st_other,
++            )
++
++            await conn.execute(
++                """
++                INSERT INTO work_items (memory_id, root_memory_id, tenant_id, team_id, kind, status, assignee_id, created_by, workflow_id, current_stage)
++                VALUES ($1,$2,$3,$4,'story','todo',NULL,$3,$5,'todo')
++                """,
++                child,
++                root,
++                tenant,
++                team,
++                wf_id,
++            )
++
++            child2 = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'Child2', $3, array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++                RETURNING id
++                """,
++                tenant,
++                team,
++                f"hash-child2-{uuid4()}",
++            )
++            await conn.execute(
++                "INSERT INTO memory_map_membership (memory_id, root_memory_id, tenant_id, node_role) VALUES ($1,$2,$3,'position')",
++                child2,
++                root,
++                tenant,
++            )
++            await conn.execute(
++                """
++                INSERT INTO work_items (memory_id, root_memory_id, tenant_id, team_id, kind, status, assignee_id, created_by, workflow_id, current_stage)
++                VALUES ($1,$2,$3,$4,'story','todo',NULL,$3,$5,'todo')
++                """,
++                child2,
++                root,
++                tenant,
++                team,
++                wf_id,
++            )
++
++            child3 = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'Child3', $3, array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++                RETURNING id
++                """,
++                tenant,
++                team,
++                f"hash-child3-{uuid4()}",
++            )
++            await conn.execute(
++                "INSERT INTO memory_map_membership (memory_id, root_memory_id, tenant_id, node_role) VALUES ($1,$2,$3,'position')",
++                child3,
++                root,
++                tenant,
++            )
++            await conn.execute(
++                """
++                INSERT INTO work_items (memory_id, root_memory_id, tenant_id, team_id, kind, status, assignee_id, created_by, workflow_id, current_stage)
++                VALUES ($1,$2,$3,$4,'story','todo',NULL,$3,$5,'todo')
++                """,
++                child3,
++                root,
++                tenant,
++                team,
++                wf_id,
++            )
++            req_id = await conn.fetchval(
++                """
++                INSERT INTO workflow_signoff_requests (tenant_id, work_item_memory_id, from_stage, to_stage, proposer_tenant_id, reason, status)
++                VALUES ($1,$2,'todo','other',$3,NULL,'pending') RETURNING request_id
++                """,
++                tenant,
++                child3,
++                tenant,
++            )
++
++    return {
++        "tenant": tenant,
++        "team": team,
++        "map_key": map_key,
++        "child": child,
++        "child2": child2,
++        "child3": child3,
++        "wf_id": wf_id,
++        "req_id": req_id,
++    }
++
++
+<email>
++async def test_shapes(client: Any, pg_pool: Any, user_personal: Any) -> None:
++    s = await _seed(pg_pool, user_personal)
++    team = s["team"]
++    map_key = s["map_key"]
++    cookies = {"mem_session": user_personal["session"]}
++    tenant = user_personal["tenant_id"]
++    identity = user_personal["identity_id"]
++
++    try:
++        r = client.get(f"/api/web/mindmaps/{map_key}/work-items", cookies=cookies)
++        assert r.status_code == 200
++        data = r.json()
++        assert "team_id" in data
++        assert data["team_id"] == str(team)
++        assert isinstance(data["items"], list)
++        assert len(data["items"]) >= 1
++        for item in data["items"]:
++            for key in ("node_id", "team_id", "current_stage", "allowed_moves", "blocked_reason", "pending_signoff"):
++                assert key in item, key
++
++        r2 = client.get(f"/api/web/teams/{team}/workflow", cookies=cookies)
++        assert r2.status_code == 200
++        w = r2.json()
++        for key in ("workflow_id", "name", "is_active", "version", "stages", "transitions"):
++            assert key in w, key
++        stages = w["stages"]
++        ordinals = [st["ordinal"] for st in stages]
++        assert ordinals == sorted(ordinals)
++        assert isinstance(w["transitions"], list)
++
++        r3 = client.get(f"/api/web/teams/{team}/workflow/pending-signoffs", cookies=cookies)
++        assert r3.status_code == 200
++        ps = r3.json()
++        assert isinstance(ps, list)
++        if ps:
++            for row in ps:
++                for key in ("node_id", "from_stage", "to_stage", "reason", "signoff_min", "signatory_count", "remaining"):
++                    assert key in row, key
++
++        items = data["items"]
++        blocked_values = [it.get("blocked_reason") for it in items]
++        assert "reason_required" in blocked_values
++        assert any(it.get("pending_signoff") is not None for it in items)
++    finally:
++        async with pg_pool.acquire() as conn:
++            async with conn.transaction():
++                await conn.execute("DELETE FROM workflow_signoffs WHERE tenant_id = $1", tenant)
++                await conn.execute("DELETE FROM workflow_signoff_requests WHERE tenant_id = $1", tenant)
++                await conn.execute("DELETE FROM work_items WHERE team_id = $1", team)
++                await conn.execute("DELETE FROM work_item_history WHERE tenant_id = $1", tenant)
++                await conn.execute("DELETE FROM memory_map_membership WHERE tenant_id = $1", tenant)
++                await conn.execute("DELETE FROM memory_maps WHERE tenant_id = $1", tenant)
++                await conn.execute("DELETE FROM slugs WHERE team_id = $1", team)
++                await conn.execute("DELETE FROM memories WHERE team_id = $1", team)
++                await conn.execute("DELETE FROM workflow_transitions WHERE tenant_id = $1", tenant)
++                await conn.execute("DELETE FROM workflow_stages WHERE tenant_id = $1", tenant)
++                await conn.execute("DELETE FROM team_workflows WHERE team_id = $1", team)
++                await conn.execute("DELETE FROM team_role_assignments WHERE parent_team_id = $1", team)
++                await conn.execute("UPDATE tenant_identities SET default_team_id = NULL WHERE id = $1", identity)
++                await conn.execute("DELETE FROM teams WHERE id = $1", team)
++
+diff --git a/tests/integration/test_mindmap_workflows_e2e.py b/tests/integration/test_mindmap_workflows_e2e.py
+new file mode 100644
+index 0000000..e6d0303
+--- /dev/null
++++ b/tests/integration/test_mindmap_workflows_e2e.py
+@@ -0,0 +1,374 @@
++# mypy: disable-error-code="attr-defined"
++"""End-to-end integration tests for mindmap workflow tools (MCP path)."""
++
++from __future__ import annotations
++
++import os
++from typing import Any
++from uuid import UUID, uuid4
++
++import asyncpg  # type: ignore[import-untyped]
++import pytest
++
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.mcp.tools._base import ToolContext
++from mem_mcp.mcp.tools.mindmap_open import MindmapOpenInput, MindmapOpenTool
++from mem_mcp.mcp.tools.mindmap_work_list import MindmapWorkListInput, MindmapWorkListTool
++from mem_mcp.mcp.tools.mindmap_work_mark import MindmapWorkMarkInput, MindmapWorkMarkTool
++from mem_mcp.mcp.tools.mindmap_work_set_status import (
++    MindmapWorkSetStatusInput,
++    MindmapWorkSetStatusTool,
++)
++from mem_mcp.mcp.tools.mindmap_workflow_activate import (
++    MindmapWorkflowActivateInput,
++    MindmapWorkflowActivateTool,
++)
++from mem_mcp.mcp.tools.mindmap_workflow_create import (
++    MindmapWorkflowCreateInput,
++    MindmapWorkflowCreateTool,
++)
++from mem_mcp.mcp.tools.mindmap_workflow_pending_signoffs import (
++    MindmapWorkflowPendingSignoffsInput,
++    MindmapWorkflowPendingSignoffsTool,
++)
++from mem_mcp.mcp.tools.mindmap_workflow_propose_move import (
++    MindmapWorkflowProposeMoveInput,
++    MindmapWorkflowProposeMoveTool,
++)
++from mem_mcp.mcp.tools.mindmap_workflow_remap import (
++    MindmapWorkflowRemapInput,
++    MindmapWorkflowRemapTool,
++)
++from mem_mcp.mcp.tools.mindmap_workflow_signoff import (
++    MindmapWorkflowSignoffInput,
++    MindmapWorkflowSignoffTool,
++)
++from mem_mcp.mcp.tools.mindmap_write_node import (
++    MindmapWriteNodeInput,
++    MindmapWriteNodeTool,
++)
++
++# Ensure DSN present
++assert os.getenv("MEM_MCP_TEST_DSN"), "MEM_MCP_TEST_DSN must be set"
++
++
++def _build_deps() -> Any:
++    from mem_mcp.audit.logger import NoopAuditLogger
++    from mem_mcp.mcp.tools._deps import NoopQuotas, ToolDeps
++
++    class _StubEmbed:
++        async def embed(self, content: str) -> Any:
++            from mem_mcp.embeddings.bedrock import EmbedResult
++
++            return EmbedResult(vector=[0.0] * 1024, input_tokens=max(1, len(content) // 4))
++
++    return ToolDeps(embeddings=_StubEmbed(), audit=NoopAuditLogger(), quotas=NoopQuotas())
++
++
++async def _setup(conn: asyncpg.Connection) -> dict[str, Any]:
++    tenant_a = await conn.fetchval(
++        "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++        f"wf-a-{uuid4()}@example.test",
++    )
++    tenant_b = await conn.fetchval(
++        "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++        f"wf-b-{uuid4()}@example.test",
++    )
++    team = await conn.fetchval(
++        "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++        f"wf-team-{uuid4().hex[:8]}",
++        tenant_a,
++    )
++    await conn.execute(
++        """
++        INSERT INTO team_role_assignments (parent_team_id, member_kind, member_id, role_id, status, assigned_by_user_id)
++        SELECT $1, 'user', $2, (SELECT id FROM roles_catalog WHERE role_key = 'owner' ORDER BY id LIMIT 1), 'active', $2
++        """,
++        team,
++        tenant_a,
++    )
++    await conn.execute(
++        """
++        INSERT INTO team_role_assignments (parent_team_id, member_kind, member_id, role_id, status, assigned_by_user_id)
++        SELECT $1, 'user', $2, (SELECT id FROM roles_catalog WHERE role_key = 'member' ORDER BY id LIMIT 1), 'active', $2
++        """,
++        team,
++        tenant_b,
++    )
++    for t, sub in ((tenant_a, f"sub-wf-a-{uuid4()}"), (tenant_b, f"sub-wf-b-{uuid4()}")):
++        await conn.execute(
++            """
++            INSERT INTO tenant_identities
++                (tenant_id, cognito_sub, provider, email, is_primary, default_team_id)
++            VALUES ($1, $2, 'cognito', $3, true, $4)
++            """,
++            t,
++            sub,
++            f"{t}@example.test",
++            team,
++        )
++    client_id = f"client:wf-{uuid4().hex[:8]}"
++    await conn.execute(
++        """
++        INSERT INTO oauth_clients (id, redirect_uris, scope, registration_payload, review_status)
++        VALUES ($1, ARRAY[]::text[], 'memory.read memory.write', '{}'::jsonb, 'auto_allowed')
++        """,
++        client_id,
++    )
++    return {"tenant_a": tenant_a, "tenant_b": tenant_b, "team": team, "client_id": client_id}
++
++
++async def _cleanup(pool: Any, tenant_a: UUID, tenant_b: UUID, team: UUID, client_id: str) -> None:
++    tenants = [tenant_a, tenant_b]
++    async with pool.acquire() as conn:
++        async with conn.transaction():
++            await conn.execute(
++                "DELETE FROM memory_references WHERE source_memory_id IN (SELECT id FROM memories WHERE tenant_id = ANY($1::uuid[])) OR target_memory_id IN (SELECT id FROM memories WHERE tenant_id = ANY($1::uuid[]))",
++                tenants,
++            )
++            await conn.execute("DELETE FROM memory_map_events WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM memory_map_membership WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM workflow_signoffs WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM workflow_signoff_requests WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM work_items WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM work_item_history WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM workflow_transitions WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM workflow_stages WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM team_workflows WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM memory_maps WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM slugs WHERE team_id = $1", team)
++            await conn.execute("DELETE FROM memories WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM team_role_assignments WHERE parent_team_id = $1", team)
++            await conn.execute("DELETE FROM tenant_identities WHERE tenant_id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM teams WHERE id = $1", team)
++            await conn.execute("DELETE FROM tenants WHERE id = ANY($1::uuid[])", tenants)
++            await conn.execute("DELETE FROM oauth_clients WHERE id = $1", client_id)
++
++
++def _ctx(pool: Any, tenant: UUID, client_id: str) -> ToolContext:
++    return ToolContext(
++        request_id=f"req-{uuid4().hex[:8]}",
++        tenant_id=tenant,
++        identity_id=tenant,
++        client_id=client_id,
++        scopes=frozenset({"memory.read", "memory.write"}),
++        db_pool=pool,
++        deps=_build_deps(),
++    )
++
++
+<email>
++async def test_workflow_define_propose_sign_commit(pg_pool: Any) -> None:
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant_a, tenant_b, team, client_id = s["tenant_a"], s["tenant_b"], s["team"], s["client_id"]
++    ctx_a = _ctx(pg_pool, tenant_a, client_id)
++    ctx_b = _ctx(pg_pool, tenant_b, client_id)
++
++    try:
++        opened = await MindmapOpenTool()(ctx_a, MindmapOpenInput(title="WF", root_question="Q?"))
++        map_key = opened.map_key
++
++        node = await MindmapWriteNodeTool()(ctx_a, MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"))
++        node_id = node.node_id
++        await MindmapWorkMarkTool()(ctx_a, MindmapWorkMarkInput(map_key=map_key, node_id=node_id, kind="story"))
++
++        wf = await MindmapWorkflowCreateTool()(
++            ctx_a,
++            MindmapWorkflowCreateInput(
++                name="flow",
++                stages=[
++                    {"name": "todo", "ordinal": 0, "is_initial": True},
++                    {"name": "in_progress", "ordinal": 1},
++                    {"name": "done", "ordinal": 2, "is_terminal": True},
++                ],
++                transitions=[
++                    {"from_stage": "todo", "to_stage": "in_progress", "requires_signoff": True, "signoff_min": 1},
++                    {"from_stage": "in_progress", "to_stage": "done"},
++                ],
++            ),
++        )
++        wf_id = wf.workflow_id
++
++        await MindmapWorkflowActivateTool()(ctx_a, MindmapWorkflowActivateInput(workflow_id=wf_id))
++
++        async with pg_pool.acquire() as conn:
++            await conn.execute(
++                "UPDATE work_items SET workflow_id = $1, current_stage = 'todo' WHERE memory_id = $2 AND tenant_id = $3",
++                wf_id,
++                node_id,
++                tenant_a,
++            )
++
++        prop = await MindmapWorkflowProposeMoveTool()(
++            ctx_a,
++            MindmapWorkflowProposeMoveInput(map_key=map_key, node_id=node_id, to_stage="in_progress"),
++        )
++        assert prop.awaiting_signoff is True
++        assert prop.request_id is not None
++        assert prop.current_stage == "todo"
++
++        async with pg_pool.acquire() as conn:
++            st = await conn.fetchval(
++                "SELECT status FROM workflow_signoff_requests WHERE request_id = $1", prop.request_id
++            )
++        assert st == "pending"
++
++        sig = await MindmapWorkflowSignoffTool()(
++            ctx_b,
++            MindmapWorkflowSignoffInput(request_id=prop.request_id),
++        )
++        assert sig.committed is True
++        async with pg_pool.acquire() as conn:
++            cs = await conn.fetchval("SELECT current_stage FROM work_items WHERE memory_id = $1", node_id)
++        assert cs == "in_progress"
++
++        prop2 = await MindmapWorkflowProposeMoveTool()(
++            ctx_a,
++            MindmapWorkflowProposeMoveInput(map_key=map_key, node_id=node_id, to_stage="done"),
++        )
++        assert prop2.awaiting_signoff is False
++
++        async with pg_pool.acquire() as conn:
++            await conn.execute(
++                "UPDATE work_items SET workflow_id = $1, current_stage = 'todo', status = 'todo' WHERE memory_id = $2",
++                wf_id,
++                node_id,
++            )
++        try:
++            await MindmapWorkSetStatusTool()(
++                ctx_a,
++                MindmapWorkSetStatusInput(map_key=map_key, node_id=node_id, status="in_progress"),
++            )
++            raise AssertionError("expected move_blocked")
++        except JsonRpcError as e:
++            assert e.code == -32602
++            assert e.data is not None and e.data.get("code") == "move_blocked"
++
++        wl = await MindmapWorkListTool()(ctx_a, MindmapWorkListInput(map_key=map_key))
++        assert len(wl.items) >= 1
++
++        await MindmapWorkflowRemapTool()(
++            ctx_a,
++            MindmapWorkflowRemapInput(map_key=map_key, mappings={"todo": "todo"}),
++        )
++
++        ps = await MindmapWorkflowPendingSignoffsTool()(ctx_b, MindmapWorkflowPendingSignoffsInput())
++        assert isinstance(ps, list)
++
++    finally:
++        await _cleanup(pg_pool, tenant_a, tenant_b, team, client_id)
++
++
+<email>
++async def test_signoff_exclusion_owner_keeps_pending(pg_pool: Any) -> None:
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant_a, tenant_b, team, client_id = s["tenant_a"], s["tenant_b"], s["team"], s["client_id"]
++    ctx_a = _ctx(pg_pool, tenant_a, client_id)
++    try:
++        opened = await MindmapOpenTool()(ctx_a, MindmapOpenInput(title="WF2", root_question="Q?"))
++        map_key = opened.map_key
++
++        node = await MindmapWriteNodeTool()(ctx_a, MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"))
++        node_id = node.node_id
++        await MindmapWorkMarkTool()(ctx_a, MindmapWorkMarkInput(map_key=map_key, node_id=node_id, kind="story"))
++
++        wf = await MindmapWorkflowCreateTool()(
++            ctx_a,
++            MindmapWorkflowCreateInput(
++                name="flow2",
++                stages=[
++                    {"name": "todo", "ordinal": 0, "is_initial": True},
++                    {"name": "in_progress", "ordinal": 1},
++                ],
++                transitions=[
++                    {"from_stage": "todo", "to_stage": "in_progress", "requires_signoff": True, "signoff_min": 1},
++                ],
++            ),
++        )
++        await MindmapWorkflowActivateTool()(ctx_a, MindmapWorkflowActivateInput(workflow_id=wf.workflow_id))
++        async with pg_pool.acquire() as conn:
++            await conn.execute(
++                "UPDATE work_items SET workflow_id = $1, current_stage = 'todo' WHERE memory_id = $2",
++                wf.workflow_id,
++                node_id,
++            )
++        prop = await MindmapWorkflowProposeMoveTool()(
++            ctx_a,
++            MindmapWorkflowProposeMoveInput(map_key=map_key, node_id=node_id, to_stage="in_progress"),
++        )
++        try:
++            await MindmapWorkflowSignoffTool()(
++                ctx_a,
++                MindmapWorkflowSignoffInput(request_id=prop.request_id),
++            )
++        except JsonRpcError:
++            pass
++        async with pg_pool.acquire() as conn:
++            st = await conn.fetchval(
++                "SELECT status FROM workflow_signoff_requests WHERE request_id = $1", prop.request_id
++            )
++            cs = await conn.fetchval("SELECT current_stage FROM work_items WHERE memory_id = $1", node_id)
++        assert st == "pending"
++        assert cs == "todo"
++    finally:
++        await _cleanup(pg_pool, tenant_a, tenant_b, team, client_id)
++
++
+<email>
++async def test_role_restricted_signer_rejected(pg_pool: Any) -> None:
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            s = await _setup(conn)
++    tenant_a, tenant_b, team, client_id = s["tenant_a"], s["tenant_b"], s["team"], s["client_id"]
++    ctx_a = _ctx(pg_pool, tenant_a, client_id)
++    ctx_b = _ctx(pg_pool, tenant_b, client_id)
++    try:
++        opened = await MindmapOpenTool()(ctx_a, MindmapOpenInput(title="WF3", root_question="Q?"))
++        map_key = opened.map_key
++
++        node = await MindmapWriteNodeTool()(ctx_a, MindmapWriteNodeInput(map_key=map_key, content="Task", node_role="position"))
++        node_id = node.node_id
++        await MindmapWorkMarkTool()(ctx_a, MindmapWorkMarkInput(map_key=map_key, node_id=node_id, kind="story"))
++
++        wf = await MindmapWorkflowCreateTool()(
++            ctx_a,
++            MindmapWorkflowCreateInput(
++                name="flow3",
++                stages=[
++                    {"name": "todo", "ordinal": 0, "is_initial": True},
++                    {"name": "in_progress", "ordinal": 1},
++                ],
++                transitions=[
++                    {
++                        "from_stage": "todo",
++                        "to_stage": "in_progress",
++                        "requires_signoff": True,
++                        "signoff_min": 1,
++                        "signoff_roles": ["admin"],
++                    },
++                ],
++            ),
++        )
++        await MindmapWorkflowActivateTool()(ctx_a, MindmapWorkflowActivateInput(workflow_id=wf.workflow_id))
++        async with pg_pool.acquire() as conn:
++            await conn.execute(
++                "UPDATE work_items SET workflow_id = $1, current_stage = 'todo' WHERE memory_id = $2",
++                wf.workflow_id,
++                node_id,
++            )
++        prop = await MindmapWorkflowProposeMoveTool()(
++            ctx_a,
++            MindmapWorkflowProposeMoveInput(map_key=map_key, node_id=node_id, to_stage="in_progress"),
++        )
++        with pytest.raises(JsonRpcError) as exc:
++            await MindmapWorkflowSignoffTool()(
++                ctx_b,
++                MindmapWorkflowSignoffInput(request_id=prop.request_id),
++            )
++        assert exc.value.code == -32602
++    finally:
++        await _cleanup(pg_pool, tenant_a, tenant_b, team, client_id)
+diff --git a/tests/unit/mindmap/test_workflow.py b/tests/unit/mindmap/test_workflow.py
+new file mode 100644
+index 0000000..9ad1198
+--- /dev/null
++++ b/tests/unit/mindmap/test_workflow.py
+@@ -0,0 +1,352 @@
++"""Tests for workflow lifecycle (create/activate/get/legacy/remap/resolve)."""
++
++from __future__ import annotations
++
++from uuid import uuid4
++
++import asyncpg
++import pytest
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mindmap import work_items, workflow_crud
++from mem_mcp.mindmap.workflow_errors import (
++    WorkflowAlreadyActiveError,
++    WorkflowError,
++    WorkflowPermissionDeniedError,
++)
++from mem_mcp.teams.assignments import assign_role
++
++pytestmark = pytest.mark.asyncio
++
++
+<email>
++async def tenant_a(pg_pool: asyncpg.Pool):
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            return await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"tenant-a-{uuid4()}@example.test",
++            )
++
++
+<email>
++async def tenant_b(pg_pool: asyncpg.Pool):
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            return await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"tenant-b-{uuid4()}@example.test",
++            )
++
++
+<email>
++async def team_a(pg_pool: asyncpg.Pool, tenant_a):
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++                f"team-a-{uuid4().hex[:8]}",
++                tenant_a,
++            )
++            await assign_role(
++                conn,
++                parent_team_id=tid,
++                member_kind="user",
++                member_id=tenant_a,
++                role_key="owner",
++                assigned_by_user_id=tenant_a,
++            )
++            return tid
++
++
+<email>
++async def viewer_tenant(pg_pool: asyncpg.Pool, tenant_a, team_a):
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            tid = await conn.fetchval(
++                "INSERT INTO tenants (email) VALUES ($1) RETURNING id",
++                f"viewer-{uuid4()}@example.test",
++            )
++            await assign_role(
++                conn,
++                parent_team_id=team_a,
++                member_kind="user",
++                member_id=tid,
++                role_key="viewer",
++                assigned_by_user_id=tenant_a,
++            )
++            return tid
++
++
++async def test_create_writes_rows(pg_pool, tenant_a, team_a):
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf = await workflow_crud.create_team_workflow(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            name="w1",
++            stages=[
++                {"name": "todo", "ordinal": 0, "is_initial": True},
++                {"name": "done", "ordinal": 1, "is_terminal": True},
++            ],
++            transitions=[{"from_stage": "todo", "to_stage": "done", "requires_reason": False}],
++            created_by=tenant_a,
++        )
++        assert wf.is_active is False
++        assert wf.version == 1
++        n_wf = await conn.fetchval(
++            "SELECT COUNT(*) FROM team_workflows WHERE workflow_id=$1 AND tenant_id=$2",
++            wf.workflow_id,
++            tenant_a,
++        )
++        assert n_wf == 1
++        n_stages = await conn.fetchval(
++            "SELECT COUNT(*) FROM workflow_stages WHERE workflow_id=$1 AND tenant_id=$2",
++            wf.workflow_id,
++            tenant_a,
++        )
++        assert n_stages == 2
++        n_trans = await conn.fetchval(
++            "SELECT COUNT(*) FROM workflow_transitions WHERE workflow_id=$1 AND tenant_id=$2",
++            wf.workflow_id,
++            tenant_a,
++        )
++        assert n_trans == 1
++
++
++async def test_create_invalid_allowed_kinds(pg_pool, tenant_a, team_a):
++    with pytest.raises(WorkflowError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await workflow_crud.create_team_workflow(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                name="w-bad",
++                stages=[{"name": "todo", "ordinal": 0, "is_initial": True}],
++                transitions=[
++                    {"from_stage": "todo", "to_stage": "todo", "allowed_kinds": ["bogus"]}
++                ],
++                created_by=tenant_a,
++            )
++
++
++async def test_create_dup_name(pg_pool, tenant_a, team_a):
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await workflow_crud.create_team_workflow(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            name="dup",
++            stages=[{"name": "todo", "ordinal": 0, "is_initial": True}],
++            transitions=[],
++            created_by=tenant_a,
++        )
++    with pytest.raises(WorkflowError):
++        async with tenant_tx(pg_pool, tenant_a) as conn:
++            await workflow_crud.create_team_workflow(
++                conn,
++                tenant_id=tenant_a,
++                team_id=team_a,
++                name="dup",
++                stages=[{"name": "todo", "ordinal": 0, "is_initial": True}],
++                transitions=[],
++                created_by=tenant_a,
++            )
++
++
++async def test_create_permission_denied(pg_pool, viewer_tenant, team_a):
++    with pytest.raises(WorkflowPermissionDeniedError):
++        async with tenant_tx(pg_pool, viewer_tenant) as conn:
++            await workflow_crud.create_team_workflow(
++                conn,
++                tenant_id=viewer_tenant,
++                team_id=team_a,
++                name="w",
++                stages=[{"name": "todo", "ordinal": 0, "is_initial": True}],
++                transitions=[],
++                created_by=viewer_tenant,
++            )
++
++
++async def test_activate_one_active_bumps_version(pg_pool, tenant_a, team_a):
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf1 = await workflow_crud.create_team_workflow(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            name="w1",
++            stages=[{"name": "todo", "ordinal": 0, "is_initial": True}],
++            transitions=[],
++            created_by=tenant_a,
++        )
++        wf2 = await workflow_crud.create_team_workflow(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            name="w2",
++            stages=[{"name": "todo", "ordinal": 0, "is_initial": True}],
++            transitions=[],
++            created_by=tenant_a,
++        )
++        aw = await workflow_crud.activate_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf1.workflow_id, actor_tenant_id=tenant_a
++        )
++        assert aw.is_active is True
++        assert aw.version == 2
++        with pytest.raises(WorkflowAlreadyActiveError):
++            await workflow_crud.activate_workflow(
++                conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf1.workflow_id, actor_tenant_id=tenant_a
++            )
++        aw2 = await workflow_crud.activate_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf2.workflow_id, actor_tenant_id=tenant_a
++        )
++        assert aw2.is_active is True
++        cnt = await conn.fetchval(
++            "SELECT COUNT(*) FROM team_workflows WHERE team_id=$1 AND is_active=TRUE", team_a
++        )
++        assert cnt == 1
++
++
++async def test_get_workflow_active_or_named(pg_pool, tenant_a, team_a):
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        wf = await workflow_crud.create_team_workflow(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            name="w",
++            stages=[
++                {"name": "todo", "ordinal": 0, "is_initial": True},
++                {"name": "done", "ordinal": 1, "is_terminal": True},
++            ],
++            transitions=[],
++            created_by=tenant_a,
++        )
++        await workflow_crud.activate_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf.workflow_id, actor_tenant_id=tenant_a
++        )
++        g = await workflow_crud.get_workflow(conn, tenant_id=tenant_a, team_id=team_a)
++        assert g.workflow_id == wf.workflow_id
++        assert [s.ordinal for s in g.stages] == sorted(s.ordinal for s in g.stages)
++        g2 = await workflow_crud.get_workflow(conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf.workflow_id)
++        assert g2.workflow_id == wf.workflow_id
++
++
++async def test_materialise_legacy_idempotent(pg_pool, tenant_a, team_a):
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        lid1 = await workflow_crud.materialise_legacy_workflow(conn, tenant_id=tenant_a, team_id=team_a)
++        lid2 = await workflow_crud.materialise_legacy_workflow(conn, tenant_id=tenant_a, team_id=team_a)
++        assert lid1 == lid2
++        stages = await conn.fetch(
++            "SELECT name FROM workflow_stages WHERE workflow_id=$1 ORDER BY ordinal", lid1
++        )
++        assert [r["name"] for r in stages] == list(work_items.WORK_STATUSES)
++        row = await conn.fetchrow("SELECT is_active, name FROM team_workflows WHERE workflow_id=$1", lid1)
++        assert row["is_active"] is False
++        assert row["name"] == workflow_crud.LEGACY_WORKFLOW_NAME
++        trans = await conn.fetch(
++            "SELECT requires_signoff FROM workflow_transitions WHERE workflow_id=$1", lid1
++        )
++        assert all(r["requires_signoff"] is False for r in trans)
++        assert len(trans) == len(work_items.TRANSITIONS)
++
++
++async def test_resolve_workflow_null(pg_pool, tenant_a, team_a):
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        lid = await workflow_crud.materialise_legacy_workflow(conn, tenant_id=tenant_a, team_id=team_a)
++        rid = await work_items._resolve_workflow(conn, tenant_id=tenant_a, team_id=team_a, workflow_id=None)
++        assert rid == lid
++
++
++async def test_workflow_change_preservation(pg_pool, tenant_a, team_a):
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            root_mem_id = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'r', $3, array_fill(0::real, ARRAY[1024])::vector, 'api', 'question', 'team')
++                RETURNING id
++                """,
++                tenant_a,
++                team_a,
++                f"h-{uuid4().hex}",
++            )
++            await conn.execute(
++                "INSERT INTO memory_maps (root_memory_id, tenant_id, team_id, title, state) VALUES ($1,$2,$3,'m','live')",
++                root_mem_id,
++                tenant_a,
++                team_a,
++            )
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        legacy_id = await workflow_crud.materialise_legacy_workflow(conn, tenant_id=tenant_a, team_id=team_a)
++        await conn.execute(
++            """
++            INSERT INTO work_items (memory_id, root_memory_id, tenant_id, team_id, kind, created_by, status, status_changed_at, workflow_id, current_stage)
++            VALUES ($1, $1, $2, $3, 'story', $2, 'todo', now(), $4, 'todo')
++            """,
++            root_mem_id,
++            tenant_a,
++            team_a,
++            legacy_id,
++        )
++        wf_new = await workflow_crud.create_team_workflow(
++            conn,
++            tenant_id=tenant_a,
++            team_id=team_a,
++            name="new-wf",
++            stages=[{"name": "todo", "ordinal": 0, "is_initial": True}],
++            transitions=[],
++            created_by=tenant_a,
++        )
++        await workflow_crud.activate_workflow(
++            conn, tenant_id=tenant_a, team_id=team_a, workflow_id=wf_new.workflow_id, actor_tenant_id=tenant_a
++        )
++        row = await conn.fetchrow(
++            "SELECT workflow_id, current_stage FROM work_items WHERE memory_id=$1", root_mem_id
++        )
++        assert row["workflow_id"] == legacy_id
++        assert row["current_stage"] == "todo"
++
++
++async def test_remap_requires_permission(pg_pool, viewer_tenant, tenant_a, team_a):
++    with pytest.raises(WorkflowPermissionDeniedError):
++        async with tenant_tx(pg_pool, viewer_tenant) as conn:
++            await workflow_crud.remap_workflow_stages(
++                conn, tenant_id=viewer_tenant, team_id=team_a, mappings={"a": "b"}, actor_tenant_id=viewer_tenant
++            )
++
++
++async def test_remap_updates_current_stage(pg_pool, tenant_a, team_a):
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            root_mem_id = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'r', $3, array_fill(0::real, ARRAY[1024])::vector, 'api', 'question', 'team')
++                RETURNING id
++                """,
++                tenant_a,
++                team_a,
++                f"h-{uuid4().hex}",
++            )
++            await conn.execute(
++                "INSERT INTO memory_maps (root_memory_id, tenant_id, team_id, title, state) VALUES ($1,$2,$3,'m','live')",
++                root_mem_id,
++                tenant_a,
++                team_a,
++            )
++    async with tenant_tx(pg_pool, tenant_a) as conn:
++        await conn.execute(
++            """
++            INSERT INTO work_items (memory_id, root_memory_id, tenant_id, team_id, kind, created_by, status, status_changed_at, current_stage)
++            VALUES ($1, $1, $2, $3, 'story', $2, 'todo', now(), 'todo')
++            """,
++            root_mem_id,
++            tenant_a,
++            team_a,
++        )
++        cnt = await workflow_crud.remap_workflow_stages(
++            conn, tenant_id=tenant_a, team_id=team_a, mappings={"todo": "in_progress"}, actor_tenant_id=tenant_a
++        )
++        assert cnt == 1
++        stage = await conn.fetchval("SELECT current_stage FROM work_items WHERE memory_id=$1", root_mem_id)
++        assert stage == "in_progress"
+diff --git a/tests/unit/mindmap/test_workflow_signoff.py b/tests/unit/mindmap/test_workflow_signoff.py
+new file mode 100644
+index 0000000..b205ed5
+--- /dev/null
++++ b/tests/unit/mindmap/test_workflow_signoff.py
+@@ -0,0 +1,302 @@
++"""Tests for workflow_moves (propose/sign/cancel) + workflow_reads + error types."""
++
++from __future__ import annotations
++
++from uuid import uuid4
++
++import pytest
++
++from mem_mcp.db import tenant_tx
++from mem_mcp.mindmap import work_items, workflow_moves, workflow_reads
++from mem_mcp.mindmap.workflow_crud import (
++    activate_workflow,
++    create_team_workflow,
++)
++from mem_mcp.mindmap.workflow_errors import (
++    MoveBlockedError,
++    ReasonRequiredError,
++    SignoffNotAllowedError,
++    SignoffRequiredError,
++    WorkflowPermissionDeniedError,
++)
++from mem_mcp.teams.assignments import assign_role
++
++pytestmark = pytest.mark.asyncio
++
++
++async def _setup(pg_pool, tenant_a, tenant_b):
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            team = await conn.fetchval(
++                "INSERT INTO teams (name, created_by_tenant_id) VALUES ($1, $2) RETURNING id",
++                f"team-{uuid4().hex[:8]}",
++                tenant_a,
++            )
++            await assign_role(conn, parent_team_id=team, member_kind="user", member_id=tenant_a, role_key="owner", assigned_by_user_id=tenant_a)
++            await assign_role(conn, parent_team_id=team, member_kind="user", member_id=tenant_b, role_key="member", assigned_by_user_id=tenant_a)
++
++            root_mem_id = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'Root', $3, array_fill(0::real, ARRAY[1024])::vector, 'api', 'question', 'team')
++                RETURNING id
++                """,
++                tenant_a, team, f"h-root-{uuid4().hex}",
++            )
++            child_mem_id = await conn.fetchval(
++                """
++                INSERT INTO memories (tenant_id, team_id, content, content_hash, embedding, source_kind, type, visibility)
++                VALUES ($1, $2, 'Child', $3, array_fill(0::real, ARRAY[1024])::vector, 'api', 'note', 'team')
++                RETURNING id
++                """,
++                tenant_a, team, f"h-child-{uuid4().hex}",
++            )
++            await conn.execute(
++                "INSERT INTO memory_maps (root_memory_id, tenant_id, team_id, title, state) VALUES ($1,$2,$3,'m','live')",
++                root_mem_id, tenant_a, team,
++            )
++            await conn.execute(
++                "INSERT INTO memory_map_membership (memory_id, root_memory_id, tenant_id, node_role, turn, authored_by) VALUES ($1,$2,$3,'position','owner','owner')",
++                child_mem_id, root_mem_id, tenant_a,
++            )
++            map_key = f"map-{uuid4().hex[:8]}"
++            await conn.execute(
++                "INSERT INTO slugs (memory_id, team_id, resource_type, slug, title) VALUES ($1,$2,'map',$3,'m')",
++                root_mem_id, team, map_key,
++            )
++    return team, root_mem_id, child_mem_id, map_key
++
++
+<email>
++async def tenant_a(pg_pool):
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            return await conn.fetchval("INSERT INTO tenants (email) VALUES ($1) RETURNING id", f"ta-{uuid4()}@example.test")
++
++
+<email>
++async def tenant_b(pg_pool):
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            return await conn.fetchval("INSERT INTO tenants (email) VALUES ($1) RETURNING id", f"tb-{uuid4()}@example.test")
++
++
+<email>
++async def ctx(pg_pool, tenant_a, tenant_b):
++    team, root, child, mk = await _setup(pg_pool, tenant_a, tenant_b)
++    return {"tenant_a": tenant_a, "tenant_b": tenant_b, "team": team, "root": root, "child": child, "map_key": mk}
++
++
++async def _create_wf(conn, tenant_id, team_id, signoff=True):
++    stages = [
++        {"name": "todo", "ordinal": 0, "is_initial": True, "is_terminal": False},
++        {"name": "done", "ordinal": 1, "is_initial": False, "is_terminal": True},
++        {"name": "in_progress", "ordinal": 2, "is_initial": False, "is_terminal": False},
++    ]
++    transitions = [
++        {"from_stage": "todo", "to_stage": "done", "requires_reason": True, "requires_signoff": False},
++        {"from_stage": "todo", "to_stage": "in_progress", "requires_reason": False, "requires_signoff": signoff, "signoff_min": 1, "signoff_roles": ["member"]},
++    ]
++    wf = await create_team_workflow(conn, tenant_id=tenant_id, team_id=team_id, name=f"wf-{uuid4().hex[:6]}", stages=stages, transitions=transitions, created_by=tenant_id)
++    await activate_workflow(conn, tenant_id=tenant_id, team_id=team_id, workflow_id=wf.workflow_id, actor_tenant_id=tenant_id)
++    return wf
++
++
++async def test_propose_no_signoff_commits(ctx, pg_pool):
++    ta, _tb, team, _root, child, mk = ctx["tenant_a"], ctx["tenant_b"], ctx["team"], ctx["root"], ctx["child"], ctx["map_key"]
++    async with tenant_tx(pg_pool, ta) as conn:
++        await _create_wf(conn, ta, team, signoff=False)
++    async with tenant_tx(pg_pool, ta) as conn:
++        await work_items.mark_work_item(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, kind="story")
++    async with tenant_tx(pg_pool, ta) as conn:
++        await workflow_moves.propose_move(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, to_stage="done", reason="r", proposer_tenant_id=ta)
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            stage = await conn.fetchval("SELECT current_stage FROM work_items WHERE memory_id=$1", child)
++            assert stage == "done"
++            hist = await conn.fetch("SELECT change_type, stage_before, stage_after, workflow_id FROM work_item_history WHERE memory_id=$1", child)
++            assert any(h["change_type"] == "stage" and h["stage_before"] == "todo" and h["stage_after"] == "done" and h["workflow_id"] is not None for h in hist)
++
++
++async def test_propose_signoff_gated_pending(ctx, pg_pool):
++    ta, _tb, team, _root, child, mk = ctx["tenant_a"], ctx["tenant_b"], ctx["team"], ctx["root"], ctx["child"], ctx["map_key"]
++    async with tenant_tx(pg_pool, ta) as conn:
++        await _create_wf(conn, ta, team, signoff=True)
++    async with tenant_tx(pg_pool, ta) as conn:
++        await work_items.mark_work_item(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, kind="story")
++    async with tenant_tx(pg_pool, ta) as conn:
++        res = await workflow_moves.propose_move(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, to_stage="in_progress", reason="r", proposer_tenant_id=ta)
++        assert type(res).__name__ == "WorkflowSignoffRequest"
++        assert res.status == "pending"
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            stage = await conn.fetchval("SELECT current_stage FROM work_items WHERE memory_id=$1", child)
++            assert stage == "todo"
++            req = await conn.fetchrow("SELECT status FROM workflow_signoff_requests WHERE work_item_memory_id=$1", child)
++            assert req["status"] == "pending"
++            hist = await conn.fetch("SELECT change_type FROM work_item_history WHERE memory_id=$1", child)
++            assert any(h["change_type"] == "signoff_requested" for h in hist)
++
++
++async def test_sign_commits_at_min(ctx, pg_pool):
++    ta, tb, team, _root, child, mk = ctx["tenant_a"], ctx["tenant_b"], ctx["team"], ctx["root"], ctx["child"], ctx["map_key"]
++    async with tenant_tx(pg_pool, ta) as conn:
++        await _create_wf(conn, ta, team, signoff=True)
++    async with tenant_tx(pg_pool, ta) as conn:
++        await work_items.mark_work_item(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, kind="story")
++    req_id = None
++    async with tenant_tx(pg_pool, ta) as conn:
++        res = await workflow_moves.propose_move(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, to_stage="in_progress", reason="r", proposer_tenant_id=ta)
++        req_id = res.request_id
++    async with tenant_tx(pg_pool, tb) as conn:
++        out = await workflow_moves.sign_workflow_move(conn, tenant_id=ta, team_id=team, request_id=req_id, signatory_tenant_id=tb)
++        assert out is not None
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            stage = await conn.fetchval("SELECT current_stage FROM work_items WHERE memory_id=$1", child)
++            assert stage == "in_progress"
++            req = await conn.fetchrow("SELECT status FROM workflow_signoff_requests WHERE request_id=$1", req_id)
++            assert req["status"] == "committed"
++            hist = await conn.fetch("SELECT change_type FROM work_item_history WHERE memory_id=$1", child)
++            assert any(h["change_type"] == "stage" for h in hist)
++            assert any(h["change_type"] == "signoff_approved" for h in hist)
++
++
++async def test_owner_sign_does_not_count(ctx, pg_pool):
++    ta, _tb, team, _root, child, mk = ctx["tenant_a"], ctx["tenant_b"], ctx["team"], ctx["root"], ctx["child"], ctx["map_key"]
++    async with tenant_tx(pg_pool, ta) as conn:
++        await _create_wf(conn, ta, team, signoff=True)
++    async with tenant_tx(pg_pool, ta) as conn:
++        await work_items.mark_work_item(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, kind="story")
++    req_id = None
++    async with tenant_tx(pg_pool, ta) as conn:
++        res = await workflow_moves.propose_move(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, to_stage="in_progress", reason="r", proposer_tenant_id=ta)
++        req_id = res.request_id
++    with pytest.raises(SignoffNotAllowedError):
++        async with tenant_tx(pg_pool, ta) as conn:
++            await workflow_moves.sign_workflow_move(conn, tenant_id=ta, team_id=team, request_id=req_id, signatory_tenant_id=ta)
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            stage = await conn.fetchval("SELECT current_stage FROM work_items WHERE memory_id=$1", child)
++            assert stage == "todo"
++            req = await conn.fetchrow("SELECT status FROM workflow_signoff_requests WHERE request_id=$1", req_id)
++            assert req["status"] == "pending"
++
++
++async def test_cancel_permissions(ctx, pg_pool):
++    ta, tb, team, _root, child, mk = ctx["tenant_a"], ctx["tenant_b"], ctx["team"], ctx["root"], ctx["child"], ctx["map_key"]
++    async with tenant_tx(pg_pool, ta) as conn:
++        await _create_wf(conn, ta, team, signoff=True)
++    async with tenant_tx(pg_pool, ta) as conn:
++        await work_items.mark_work_item(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, kind="story")
++    req_id = None
++    async with tenant_tx(pg_pool, ta) as conn:
++        res = await workflow_moves.propose_move(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, to_stage="in_progress", reason="r", proposer_tenant_id=ta)
++        req_id = res.request_id
++    with pytest.raises(WorkflowPermissionDeniedError):
++        async with tenant_tx(pg_pool, tb) as conn:
++            await workflow_moves.cancel_workflow_move(conn, tenant_id=ta, team_id=team, request_id=req_id, actor_tenant_id=tb)
++    async with tenant_tx(pg_pool, ta) as conn:
++        await workflow_moves.cancel_workflow_move(conn, tenant_id=ta, team_id=team, request_id=req_id, actor_tenant_id=ta)
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            req = await conn.fetchrow("SELECT status FROM workflow_signoff_requests WHERE request_id=$1", req_id)
++            assert req["status"] == "cancelled"
++
++
++async def test_compute_item_moves(ctx, pg_pool):
++    ta, tb, team, _root, child, mk = ctx["tenant_a"], ctx["tenant_b"], ctx["team"], ctx["root"], ctx["child"], ctx["map_key"]
++    async with tenant_tx(pg_pool, ta) as conn:
++        await _create_wf(conn, ta, team, signoff=True)
++    async with tenant_tx(pg_pool, ta) as conn:
++        await work_items.mark_work_item(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, kind="story")
++    async with tenant_tx(pg_pool, ta) as conn:
++        await workflow_moves.propose_move(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, to_stage="in_progress", proposer_tenant_id=ta)
++    async with tenant_tx(pg_pool, ta) as conn:
++        moves = await workflow_reads.compute_item_moves(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, viewing_tenant_id=tb)
++        assert isinstance(moves, list)
++        for m in moves:
++            assert m.blocked_reason in {None, "reason_required", "no_transition", "role_restricted"} or (isinstance(m.blocked_reason, str) and m.blocked_reason.startswith("awaiting "))
++        other = next(m for m in moves if m.to_stage == "in_progress")
++        assert other.blocked_reason == "awaiting 1 sign-offs"
++        assert other.signoff_min == 1
++        assert other.remaining == 1
++
++
++async def test_compute_item_moves_unmapped(ctx, pg_pool):
++    ta, tb, team, _root, child, mk = ctx["tenant_a"], ctx["tenant_b"], ctx["team"], ctx["root"], ctx["child"], ctx["map_key"]
++    async with tenant_tx(pg_pool, ta) as conn:
++        await _create_wf(conn, ta, team, signoff=True)
++    async with tenant_tx(pg_pool, ta) as conn:
++        await work_items.mark_work_item(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, kind="story")
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            await conn.execute("UPDATE work_items SET current_stage='bogus' WHERE memory_id=$1", child)
++    async with tenant_tx(pg_pool, ta) as conn:
++        moves = await workflow_reads.compute_item_moves(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, viewing_tenant_id=tb)
++        assert all(m.blocked_reason == "no_transition" for m in moves)
++        assert all(m.transition_id is None for m in moves)
++
++
++async def test_list_pending_signoffs(ctx, pg_pool):
++    ta, tb, team, _root, child, mk = ctx["tenant_a"], ctx["tenant_b"], ctx["team"], ctx["root"], ctx["child"], ctx["map_key"]
++    async with tenant_tx(pg_pool, ta) as conn:
++        await _create_wf(conn, ta, team, signoff=True)
++    async with tenant_tx(pg_pool, ta) as conn:
++        await work_items.mark_work_item(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, kind="story")
++    async with tenant_tx(pg_pool, ta) as conn:
++        await workflow_moves.propose_move(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, to_stage="in_progress", reason="r", proposer_tenant_id=ta)
++    async with tenant_tx(pg_pool, tb) as conn:
++        lst = await workflow_reads.list_pending_signoffs_for_user(conn, tenant_id=ta, team_id=team, signatory_tenant_id=tb)
++        assert len(lst) == 1
++        ps = lst[0]
++        assert ps.from_stage == "todo"
++        assert ps.to_stage == "in_progress"
++        assert ps.signoff_min == 1
++        assert ps.signatory_count == 0
++        assert ps.remaining == 1
++    async with tenant_tx(pg_pool, ta) as conn:
++        lst2 = await workflow_reads.list_pending_signoffs_for_user(conn, tenant_id=ta, team_id=team, signatory_tenant_id=ta)
++        assert lst2 == []
++
++
++async def test_blank_reason_raises(ctx, pg_pool):
++    ta, _tb, team, _root, child, mk = ctx["tenant_a"], ctx["tenant_b"], ctx["team"], ctx["root"], ctx["child"], ctx["map_key"]
++    async with tenant_tx(pg_pool, ta) as conn:
++        await _create_wf(conn, ta, team, signoff=True)
++    async with tenant_tx(pg_pool, ta) as conn:
++        await work_items.mark_work_item(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, kind="story")
++    with pytest.raises(ReasonRequiredError):
++        async with tenant_tx(pg_pool, ta) as conn:
++            await workflow_moves.propose_move(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, to_stage="done", reason="   ", proposer_tenant_id=ta)
++
++
++async def test_legacy_move_blocked(ctx, pg_pool):
++    ta, _tb, team, _root, child, mk = ctx["tenant_a"], ctx["tenant_b"], ctx["team"], ctx["root"], ctx["child"], ctx["map_key"]
++    async with tenant_tx(pg_pool, ta) as conn:
++        stages = [
++            {"name": "todo", "ordinal": 0, "is_initial": True, "is_terminal": False},
++            {"name": "in_progress", "ordinal": 1, "is_initial": False, "is_terminal": False},
++        ]
++        transitions = [
++            {"from_stage": "todo", "to_stage": "in_progress", "requires_reason": False, "requires_signoff": True, "signoff_min": 1, "signoff_roles": ["member"]},
++        ]
++        wf = await create_team_workflow(conn, tenant_id=ta, team_id=team, name=f"wf-{uuid4().hex[:6]}", stages=stages, transitions=transitions, created_by=ta)
++        await activate_workflow(conn, tenant_id=ta, team_id=team, workflow_id=wf.workflow_id, actor_tenant_id=ta)
++    wf_id = None
++    async with tenant_tx(pg_pool, ta) as conn:
++        wf = await create_team_workflow(conn, tenant_id=ta, team_id=team, name=f"wf2-{uuid4().hex[:6]}", stages=[{"name":"todo","ordinal":0,"is_initial":True,"is_terminal":False},{"name":"in_progress","ordinal":1,"is_initial":False,"is_terminal":False}], transitions=[{"from_stage":"todo","to_stage":"in_progress","requires_reason":False,"requires_signoff":True,"signoff_min":1,"signoff_roles":["member"]}], created_by=ta)
++        await activate_workflow(conn, tenant_id=ta, team_id=team, workflow_id=wf.workflow_id, actor_tenant_id=ta)
++        wf_id = wf.workflow_id
++    async with tenant_tx(pg_pool, ta) as conn:
++        await work_items.mark_work_item(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, kind="story")
++    async with pg_pool.acquire() as conn:
++        async with conn.transaction():
++            await conn.execute("UPDATE work_items SET workflow_id=$1, current_stage='todo' WHERE memory_id=$2", wf_id, child)
++    with pytest.raises(MoveBlockedError):
++        async with tenant_tx(pg_pool, ta) as conn:
++            await work_items.set_work_item_status(conn, tenant_id=ta, team_id=team, map_key=mk, node_id=child, status="in_progress", reason=None)
++
++
++async def test_signoff_required_type():
++    assert issubclass(SignoffRequiredError, Exception)
+diff --git a/tests/unit/test_web_mindmaps_work_items_router.py b/tests/unit/test_web_mindmaps_work_items_router.py
+new file mode 100644
+index 0000000..abf4193
+--- /dev/null
++++ b/tests/unit/test_web_mindmaps_work_items_router.py
+@@ -0,0 +1,258 @@
++"""Web surface over the mindmap work-item board + actions."""
++
++from __future__ import annotations
++
++from contextlib import asynccontextmanager
++from typing import Any
++from unittest.mock import AsyncMock, MagicMock, patch
++from uuid import uuid4
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.web.handlers.mindmaps import make_mindmaps_router
++
++_MOD = "mem_mcp.web.handlers.mindmaps"
++TENANT = uuid4()
++
++
++def _client() -> TestClient:
++    app = FastAPI()
++    app.include_router(make_mindmaps_router(pool=MagicMock(), deps=MagicMock()))
++    return TestClient(app)
++
++
++def _session() -> Any:
++    sess = MagicMock()
++    sess.tenant_id = TENANT
++    sess.identity_id = TENANT
++    return sess
++
++
+<email>(
++    "method,path",
++    [
++        ("get", "/api/web/mindmaps/m/work-items"),
++        ("get", f"/api/web/mindmaps/m/work-items/{uuid4()}"),
++        ("get", f"/api/web/mindmaps/m/work-items/{uuid4()}/history"),
++        ("post", f"/api/web/mindmaps/m/work-items/{uuid4()}/move"),
++        ("post", f"/api/web/mindmaps/m/work-items/{uuid4()}/signoff"),
++    ],
++)
++def test_every_endpoint_requires_a_session(method: str, path: str) -> None:
++    client = _client()
++    # Build valid bodies generically
++    if "move" in path:
++        body = {"to_stage": "done"}
++    elif "signoff" in path:
++        body = {"request_id": str(uuid4())}
++    else:
++        body = None
++    kwargs: dict[str, Any] = {"json": body} if method == "post" else {}
++    res = getattr(client, method)(path, **kwargs)
++    assert res.status_code == 401
++
++
++def test_list_maps_query_params() -> None:
++    client = _client()
++    out = MagicMock()
++    out.model_dump.return_value = {"items": []}
++    captured: dict[str, Any] = {}
++
++    async def fake_call(ctx: Any, inp: Any) -> Any:
++        captured["map_key"] = inp.map_key
++        captured["status"] = inp.status
++        captured["kind"] = inp.kind
++        captured["assignee_id"] = inp.assignee_id
++        captured["unassigned"] = inp.unassigned
++        captured["map_state"] = inp.map_state
++        captured["limit"] = inp.limit
++        captured["team_id"] = inp.team_id
++        return out
++
++    aid = uuid4()
++    with (
++        patch(f"{_MOD}.lookup_session", AsyncMock(return_value=_session())),
++        patch(f"{_MOD}.MindmapWorkListTool") as tool,
++    ):
++        tool.return_value = fake_call
++        res = client.get(
++            f"/api/web/mindmaps/m/work-items?status=todo&kind=task&assignee_id={aid}&unassigned=false&map_state=live&limit=5",
++            cookies={"mem_session": "s"},
++        )
++    assert res.status_code == 200
++    assert captured == {
++        "map_key": "m",
++        "status": "todo",
++        "kind": "task",
++        "assignee_id": aid,
++        "unassigned": False,
++        "map_state": "live",
++        "limit": 5,
++        "team_id": None,
++    }
++
++
++def test_move_delegation_and_error_code() -> None:
++    client = _client()
++    nid = uuid4()
++
++    async def fake_call(ctx: Any, inp: Any) -> Any:
++        raise JsonRpcError(-32602, "move blocked", data={"code": "move_blocked"})
++
++    with (
++        patch(f"{_MOD}.lookup_session", AsyncMock(return_value=_session())),
++        patch(f"{_MOD}.MindmapWorkflowProposeMoveTool") as tool,
++    ):
++        tool.return_value = fake_call
++        res = client.post(
++            f"/api/web/mindmaps/m/work-items/{nid}/move",
++            cookies={"mem_session": "s"},
++            json={"to_stage": "done"},
++        )
++    assert res.status_code == 400
++    assert res.json()["detail"]["code"] == "move_blocked"
++
++
++@asynccontextmanager
++async def _fake_tx(pool: Any, tenant_id: Any) -> Any:
++    conn = MagicMock()
++    conn.fetchrow = AsyncMock(return_value={"req_node_id": None, "req_map_key": None})
++    # placeholder; replaced per test below via closure not possible here
++    yield conn
++
++
++def test_signoff_error_codes() -> None:
++    client = _client()
++    nid = uuid4()
++    rid = uuid4()
++
++    async def fake_call(ctx: Any, inp: Any) -> Any:
++        raise JsonRpcError(-32602, "signoff required", data={"code": "signoff_required"})
++
++    def _system_tx(pool: Any) -> Any:
++        conn = MagicMock()
++        conn.fetchrow = AsyncMock(return_value={"tenant_id": TENANT})
++
++        class _CM:
++            async def __aenter__(self) -> Any:
++                return conn
++
++            async def __aexit__(self, *a: Any) -> None:
++                return None
++
++        return _CM()
++
++    def _tenant_tx(pool: Any, tenant_id: Any) -> Any:
++        conn = MagicMock()
++        conn.fetchrow = AsyncMock(return_value={"req_node_id": nid, "req_map_key": "m"})
++
++        class _CM:
++            async def __aenter__(self) -> Any:
++                return conn
++
++            async def __aexit__(self, *a: Any) -> None:
++                return None
++
++        return _CM()
++
++    with (
++        patch(f"{_MOD}.lookup_session", AsyncMock(return_value=_session())),
++        patch("mem_mcp.db.system_tx", _system_tx),
++        patch(f"{_MOD}.tenant_tx", _tenant_tx),
++        patch(f"{_MOD}.MindmapWorkflowSignoffTool") as tool,
++    ):
++        tool.return_value = fake_call
++        res = client.post(
++            f"/api/web/mindmaps/m/work-items/{nid}/signoff",
++            cookies={"mem_session": "s"},
++            json={"request_id": str(rid)},
++        )
++    assert res.status_code == 400
++    assert res.json()["detail"]["code"] == "signoff_required"
++
++
++def _make_system_tx() -> Any:
++    def _system_tx(pool: Any) -> Any:
++        conn = MagicMock()
++        conn.fetchrow = AsyncMock(return_value={"tenant_id": TENANT})
++
++        class _CM:
++            async def __aenter__(self) -> Any:
++                return conn
++
++            async def __aexit__(self, *a: Any) -> None:
++                return None
++
++        return _CM()
++
++    return _system_tx
++
++
++def test_signoff_node_mismatch_returns_404() -> None:
++    client = _client()
++    nid = uuid4()
++    other_nid = uuid4()
++    rid = uuid4()
++
++    def _tenant_tx(pool: Any, tenant_id: Any) -> Any:
++        conn = MagicMock()
++        conn.fetchrow = AsyncMock(return_value={"req_node_id": other_nid, "req_map_key": "m"})
++
++        class _CM:
++            async def __aenter__(self) -> Any:
++                return conn
++
++            async def __aexit__(self, *a: Any) -> None:
++                return None
++
++        return _CM()
++
++    with (
++        patch(f"{_MOD}.lookup_session", AsyncMock(return_value=_session())),
++        patch("mem_mcp.db.system_tx", _make_system_tx()),
++        patch(f"{_MOD}.tenant_tx", _tenant_tx),
++        patch(f"{_MOD}.MindmapWorkflowSignoffTool") as tool,
++    ):
++        tool.return_value = AsyncMock()
++        res = client.post(
++            f"/api/web/mindmaps/m/work-items/{nid}/signoff",
++            cookies={"mem_session": "s"},
++            json={"request_id": str(rid)},
++        )
++    assert res.status_code == 404
++
++
++def test_signoff_map_key_mismatch_returns_404() -> None:
++    client = _client()
++    nid = uuid4()
++    rid = uuid4()
++
++    def _tenant_tx(pool: Any, tenant_id: Any) -> Any:
++        conn = MagicMock()
++        conn.fetchrow = AsyncMock(return_value={"req_node_id": nid, "req_map_key": "other"})
++
++        class _CM:
++            async def __aenter__(self) -> Any:
++                return conn
++
++            async def __aexit__(self, *a: Any) -> None:
++                return None
++
++        return _CM()
++
++    with (
++        patch(f"{_MOD}.lookup_session", AsyncMock(return_value=_session())),
++        patch("mem_mcp.db.system_tx", _make_system_tx()),
++        patch(f"{_MOD}.tenant_tx", _tenant_tx),
++        patch(f"{_MOD}.MindmapWorkflowSignoffTool") as tool,
++    ):
++        tool.return_value = AsyncMock()
++        res = client.post(
++            f"/api/web/mindmaps/m/work-items/{nid}/signoff",
++            cookies={"mem_session": "s"},
++            json={"request_id": str(rid)},
++        )
++    assert res.status_code == 404
+diff --git a/tests/unit/test_web_workflows_router.py b/tests/unit/test_web_workflows_router.py
+new file mode 100644
+index 0000000..40ea81b
+--- /dev/null
++++ b/tests/unit/test_web_workflows_router.py
+@@ -0,0 +1,63 @@
++from __future__ import annotations
++
++from typing import Any
++from unittest.mock import AsyncMock, MagicMock, patch
++from uuid import uuid4
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from mem_mcp.mcp.errors import JsonRpcError
++from mem_mcp.web.handlers.workflows import make_workflows_router
++
++_MOD = "mem_mcp.web.handlers.workflows"
++TENANT = uuid4()
++TEAM = uuid4()
++WF = uuid4()
++
++
++def _client() -> TestClient:
++    app = FastAPI()
++    app.include_router(make_workflows_router(pool=MagicMock(), deps=MagicMock()))
++    return TestClient(app)
++
++
++def _session() -> Any:
++    sess = MagicMock()
++    sess.tenant_id = TENANT
++    sess.identity_id = TENANT
++    return sess
++
++
+<email>(
++    "method,path,body",
++    [
++        ("get", f"/api/web/teams/{TEAM}/workflow", None),
++        ("post", f"/api/web/teams/{TEAM}/workflow", {"name": "w"}),
++        ("post", f"/api/web/teams/{TEAM}/workflow/{WF}/activate", None),
++        ("post", f"/api/web/teams/{TEAM}/workflow/remap", {"map_key": "m", "mappings": {"a": "b"}}),
++        ("get", f"/api/web/teams/{TEAM}/workflow/pending-signoffs", None),
++    ],
++)
++def test_every_endpoint_requires_a_session(method: str, path: str, body: Any) -> None:
++    client = _client()
++    kwargs: dict[str, Any] = {"json": body} if body is not None else {}
++    res = getattr(client, method)(path, **kwargs)
++    assert res.status_code == 401
++
++
++def test_code_surfaces() -> None:
++    client = _client()
++
++    async def fake_call(ctx: Any, inp: Any) -> Any:
++        raise JsonRpcError(-32602, "boom", data={"code": "workflow_error"})
++
++    with (
++        patch(f"{_MOD}._ctx_from_session", AsyncMock(return_value=_session())),
++        patch(f"{_MOD}.MindmapWorkflowGetTool") as tool,
++    ):
++        tool.return_value = fake_call
++        res = client.get(f"/api/web/teams/{TEAM}/workflow", cookies={"mem_session": "s"})
++    assert res.status_code == 400
++    assert res.json()["detail"]["code"] == "workflow_error"
+diff --git a/web/app/mindmaps/[key]/board/BoardContext.tsx b/web/app/mindmaps/[key]/board/BoardContext.tsx
+new file mode 100644
+index 0000000..d4daad9
+--- /dev/null
++++ b/web/app/mindmaps/[key]/board/BoardContext.tsx
+@@ -0,0 +1,26 @@
++"use client";
++
++import { createContext, useCallback, useContext, useState } from "react";
++
++interface BoardRefreshContextValue {
++  boardRefreshKey: number;
++  bumpRefresh: () => void;
++}
++
++const BoardRefreshContext = createContext<BoardRefreshContextValue | null>(null);
++
++export function BoardRefreshProvider({ children }: { children: React.ReactNode }) {
++  const [boardRefreshKey, setBoardRefreshKey] = useState(0);
++  const bumpRefresh = useCallback(() => setBoardRefreshKey((k) => k + 1), []);
++  return (
++    <BoardRefreshContext.Provider value={{ boardRefreshKey, bumpRefresh }}>
++      {children}
++    </BoardRefreshContext.Provider>
++  );
++}
++
++export function useBoardRefresh(): BoardRefreshContextValue {
++  const ctx = useContext(BoardRefreshContext);
++  if (!ctx) throw new Error("useBoardRefresh must be used within BoardRefreshProvider");
++  return ctx;
++}
+diff --git a/web/app/mindmaps/[key]/board/BoardView.tsx b/web/app/mindmaps/[key]/board/BoardView.tsx
+new file mode 100644
+index 0000000..ab28a19
+--- /dev/null
++++ b/web/app/mindmaps/[key]/board/BoardView.tsx
+@@ -0,0 +1,122 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import { useRouter } from "next/navigation";
++import { useBoardRefresh } from "./BoardContext";
++import ItemDetail from "./ItemDetail";
++import WaitingOnYou from "./WaitingOnYou";
++
++export interface Stage {
++  stage_id: string;
++  name: string;
++  ordinal: number;
++  is_initial: boolean;
++  is_terminal: boolean;
++}
++
++export interface AllowedMove {
++  to_stage: string;
++}
++
++export interface BoardItem {
++  node_id: string;
++  title: string;
++  status: string;
++  current_stage: string | null;
++  allowed_moves: AllowedMove[];
++  blocked_reason: string | null;
++  pending_signoff: { signatory_count: number; signoff_min: number } | null;
++}
++
++export interface BoardViewProps {
++  items: BoardItem[];
++  stages: Stage[];
++  mapKey: string;
++  teamId: string;
++}
++
++export default function BoardView({ items, stages, mapKey, teamId }: BoardViewProps) {
++  const router = useRouter();
++  const { boardRefreshKey } = useBoardRefresh();
++  const [selectedId, setSelectedId] = useState<string | null>(null);
++  const selected = items.find((x) => x.node_id === selectedId) ?? null;
++
++  useEffect(() => {
++    if (boardRefreshKey > 0) router.refresh();
++  }, [boardRefreshKey, router]);
++
++  const sortedStages = [...stages].sort((a, b) => a.ordinal - b.ordinal);
++  const stageNames = new Set(sortedStages.map((s) => s.name));
++
++  const grouped: Record<string, BoardItem[]> = {};
++  for (const s of sortedStages) grouped[s.name] = [];
++  grouped.unmapped = [];
++  for (const it of items) {
++    const st = it.current_stage;
++    if (st && stageNames.has(st)) grouped[st].push(it);
++    else grouped.unmapped.push(it);
++  }
++
++  const columns = [...sortedStages.map((s) => s.name), "unmapped"];
++
++  return (
++    <div>
++      <div className="flex gap-4 overflow-x-auto">
++        {columns.map((col) => (
++          <div key={col} className="min-w-[220px] flex-1 rounded border p-2">
++            <h3 className="mb-2 font-semibold">{col}</h3>
++            {(grouped[col] ?? []).map((it) => (
++              <div key={it.node_id} className="mb-2 rounded border p-2">
++                <div className="truncate font-medium">{it.title}</div>
++                <div className="text-xs">{it.status}</div>
++                <div className="text-xs">{it.current_stage ?? "unmapped"}</div>
++                {it.blocked_reason && (
++                  <span className="text-xs text-rose-600">
++                    {it.blocked_reason === "reason_required"
++                      ? "needs reason"
++                      : it.blocked_reason === "role_restricted"
++                        ? "role-restricted"
++                        : it.blocked_reason === "no_transition"
++                          ? "no moves"
++                          : it.blocked_reason}
++                  </span>
++                )}
++                {it.pending_signoff && (
++                  <span className="text-xs text-amber-600">
++                    awaiting {it.pending_signoff.signatory_count} of {it.pending_signoff.signoff_min}
++                  </span>
++                )}
++                {it.allowed_moves.length > 0 && (
++                  <select
++                    className="mt-1 w-full text-xs"
++                    defaultValue=""
++                    onChange={(e) => {
++                      const v = e.target.value;
++                      if (v) {
++                        setSelectedId(it.node_id);
++                      }
++                      e.target.value = "";
++                    }}
++                  >
++                    <option value="" disabled>
++                      move…
++                    </option>
++                    {it.allowed_moves.map((m) => (
++                      <option key={m.to_stage} value={m.to_stage}>
++                        {m.to_stage}
++                      </option>
++                    ))}
++                  </select>
++                )}
++              </div>
++            ))}
++          </div>
++        ))}
++      </div>
++      {selected && (
++        <ItemDetail item={selected} mapKey={mapKey} stages={stages} onClose={() => setSelectedId(null)} />
++      )}
++      <WaitingOnYou mapKey={mapKey} teamId={teamId} items={items} />
++    </div>
++  );
++}
+diff --git a/web/app/mindmaps/[key]/board/ItemDetail.tsx b/web/app/mindmaps/[key]/board/ItemDetail.tsx
+new file mode 100644
+index 0000000..4c60649
+--- /dev/null
++++ b/web/app/mindmaps/[key]/board/ItemDetail.tsx
+@@ -0,0 +1,389 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import { useRouter } from "next/navigation";
++import { useBoardRefresh } from "./BoardContext";
++import { csrfHeaders } from "@/lib/csrf";
++
++export interface ItemDetailProps {
++  item?: unknown;
++  mapKey?: string;
++  stages?: unknown[];
++  onClose?: () => void;
++}
++
++interface MoveItem {
++  to_stage: string;
++  signoff_min?: number;
++  blocked_reason?: string | null;
++  requires_signoff?: boolean;
++}
++
++interface PendingSignoff {
++  request_id?: string;
++  signatory_count: number;
++  signoff_min: number;
++  remaining?: number;
++}
++
++interface Item {
++  node_id: string;
++  title: string;
++  status: string;
++  current_stage: string | null;
++  allowed_moves: MoveItem[];
++  blocked_reason: string | null;
++  pending_signoff: PendingSignoff | null;
++  assignee_id?: string | null;
++  created_at?: string;
++  updated_at?: string;
++}
++
++interface HistoryEntry {
++  id: number;
++  change_type: string;
++  stage_before: string | null;
++  stage_after: string | null;
++  workflow_id: string | null;
++  status_before?: string | null;
++  status_after?: string;
++  created_at?: string;
++}
++
++export default function ItemDetail({ item, mapKey, onClose }: ItemDetailProps) {
++  const router = useRouter();
++  const { bumpRefresh } = useBoardRefresh();
++  const it = (item ?? {}) as Item;
++  const nodeId = it.node_id;
++  const mk = mapKey ?? "";
++
++  const [toStage, setToStage] = useState<string>(
++    it.allowed_moves?.[0]?.to_stage ?? "",
++  );
++  const [reason, setReason] = useState("");
++  const [error, setError] = useState<string | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [confirmOpen, setConfirmOpen] = useState(false);
++  const [pending, setPending] = useState<PendingSignoff | null>(
++    it.pending_signoff ?? null,
++  );
++  const [history, setHistory] = useState<HistoryEntry[]>([]);
++
++  // Re-derive seeded state when the item changes (e.g. after refresh).
++  useEffect(() => {
++    setToStage(it.allowed_moves?.[0]?.to_stage ?? "");
++    setReason("");
++    setPending(it.pending_signoff ?? null);
++    setError(null);
++  }, [nodeId, it]);
++
++  useEffect(() => {
++    let cancelled = false;
++    (async () => {
++      try {
++        const res = await fetch(
++          `/api/web/mindmaps/${encodeURIComponent(mk)}/work-items/${nodeId}/history`,
++          { credentials: "same-origin" },
++        );
++        if (res.status === 401) {
++          router.push(`/auth/login?next=${encodeURIComponent(window.location.pathname)}`);
++          return;
++        }
++        if (!res.ok) {
++          const body = (await res.json().catch(() => null)) as
++            | { detail?: { message?: string }; message?: string }
++            | null;
++          const msg = body?.detail?.message ?? body?.message ?? `Failed (${res.status})`;
++          if (!cancelled) setError(msg);
++          return;
++        }
++        const data = await res.json();
++        if (!cancelled) {
++          setHistory(Array.isArray(data) ? (data as HistoryEntry[]) : []);
++        }
++      } catch {
++        if (!cancelled) setError("Network error");
++      }
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, [mk, nodeId]);
++
++  const selectedMove = it.allowed_moves?.find((m) => m.to_stage === toStage);
++  const needsReason =
++    selectedMove?.blocked_reason === "reason_required" ||
++    selectedMove?.blocked_reason === "reason-required";
++  const needsSignoff = (selectedMove?.signoff_min ?? 0) > 0 || !!selectedMove?.requires_signoff;
++
++  const humanBlocked = (code: string | null | undefined): string => {
++    switch (code) {
++      case "reason_required":
++        return "a reason is required";
++      case "role_restricted":
++        return "role-restricted";
++      case "no_transition":
++        return "no moves";
++      default:
++        return code ?? "";
++    }
++  };
++
++  async function doMove() {
++    setError(null);
++    setBusy(true);
++    try {
++      const res = await fetch(
++        `/api/web/mindmaps/${encodeURIComponent(mk)}/work-items/${nodeId}/move`,
++        {
++          method: "POST",
++          headers: csrfHeaders({ "Content-Type": "application/json" }),
++          credentials: "same-origin",
++          body: JSON.stringify({
++            to_stage: toStage,
++            reason: reason.trim() ? reason : undefined,
++            expected_stage: it.current_stage ?? undefined,
++          }),
++        },
++      );
++      if (res.status === 401) {
++        router.push(`/auth/login?next=${encodeURIComponent(window.location.pathname)}`);
++        return;
++      }
++      if (!res.ok) {
++        const body = await res.json().catch(() => null);
++        const code = body?.detail?.code;
++        const msg = body?.detail?.message;
++        setError(
++          code && msg ? `${code}: ${msg}` : msg ?? `Failed (${res.status})`,
++        );
++        return;
++      }
++      const data = await res.json();
++      if (data.awaiting_signoff) {
++        setPending({
++          request_id: data.request_id,
++          signatory_count: 0,
++          signoff_min: data.signoff_min ?? pending?.signoff_min ?? 0,
++          remaining: data.signoff_min ?? pending?.signoff_min ?? 0,
++        });
++        bumpRefresh();
++      } else {
++        bumpRefresh();
++        onClose?.();
++      }
++    } catch {
++      setError("Network error — nothing was written.");
++    } finally {
++      setBusy(false);
++      setConfirmOpen(false);
++    }
++  }
++
++  function handleMoveClick() {
++    if (needsSignoff && !confirmOpen) {
++      setConfirmOpen(true);
++      return;
++    }
++    doMove();
++  }
++
++  async function doSignoff() {
++    if (!pending?.request_id) return;
++    setError(null);
++    setBusy(true);
++    try {
++      const res = await fetch(
++        `/api/web/mindmaps/${encodeURIComponent(mk)}/work-items/${nodeId}/signoff`,
++        {
++          method: "POST",
++          headers: csrfHeaders({ "Content-Type": "application/json" }),
++          credentials: "same-origin",
++          body: JSON.stringify({ request_id: pending.request_id }),
++        },
++      );
++      if (res.status === 401) {
++        router.push(`/auth/login?next=${encodeURIComponent(window.location.pathname)}`);
++        return;
++      }
++      if (!res.ok) {
++        const body = await res.json().catch(() => null);
++        const code = body?.detail?.code;
++        const msg = body?.detail?.message;
++        setError(
++          code && msg
++            ? `${code}: ${msg}`
++            : msg ?? `Failed (${res.status})`,
++        );
++        return;
++      }
++      const data = await res.json();
++      if (data.committed) {
++        bumpRefresh();
++        onClose?.();
++      } else {
++        setPending((p) =>
++          p
++            ? {
++                ...p,
++                signatory_count: data.signed_count ?? p.signatory_count,
++                signoff_min: data.signoff_min ?? p.signoff_min,
++                remaining:
++                  (data.signoff_min ?? p.signoff_min) -
++                  (data.signed_count ?? p.signatory_count),
++              }
++            : p,
++        );
++        bumpRefresh();
++      }
++    } catch {
++      setError("Network error — nothing was written.");
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  return (
++    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
++      <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-lg bg-white p-4 shadow-xl dark:bg-slate-900">
++        <div className="mb-3 flex items-start justify-between">
++          <div>
++            <h2 className="text-lg font-semibold">{it.title}</h2>
++            <div className="text-xs text-slate-500">
++              {it.status} · {it.current_stage ?? "unmapped"} · assignee{" "}
++              {it.assignee_id ?? "—"}
++            </div>
++            <div className="text-xs text-slate-400">
++              {it.created_at && <>created {it.created_at} · </>}
++              {it.updated_at && <>updated {it.updated_at}</>}
++            </div>
++          </div>
++          <button
++            onClick={() => onClose?.()}
++            className="text-slate-500 hover:text-slate-900"
++          >
++            ✕
++          </button>
++        </div>
++
++        {error && (
++          <div className="mb-3 rounded border border-rose-300 bg-rose-50 px-3 py-2 text-sm text-rose-800">
++            {error}
++          </div>
++        )}
++
++        {it.blocked_reason && (
++          <div className="mb-3 text-xs text-rose-600">
++            blocked: {humanBlocked(it.blocked_reason)}
++          </div>
++        )}
++        {selectedMove?.blocked_reason && selectedMove.blocked_reason !== it.blocked_reason && (
++          <div className="mb-3 text-xs text-rose-600">
++            {humanBlocked(selectedMove.blocked_reason)}
++          </div>
++        )}
++
++        {/* Move section */}
++        <section className="mb-4">
++          <h3 className="mb-1 text-sm font-semibold">Move</h3>
++          <select
++            className="w-full rounded border p-1 text-sm"
++            value={toStage}
++            onChange={(e) => setToStage(e.target.value)}
++          >
++            {(it.allowed_moves ?? []).map((m) => (
++              <option key={m.to_stage} value={m.to_stage}>
++                {m.to_stage}
++              </option>
++            ))}
++          </select>
++          {needsReason && (
++            <textarea
++              className="mt-2 w-full rounded border p-2 text-sm"
++              rows={3}
++              value={reason}
++              onChange={(e) => setReason(e.target.value)}
++              placeholder="Reason (required)"
++            />
++          )}
++          {confirmOpen && needsSignoff && (
++            <div className="mt-2 rounded border border-amber-300 bg-amber-50 p-2 text-sm">
++              This move requires sign-off from {selectedMove?.signoff_min ?? 0}{" "}
++              person(s). Confirm?
++              <div className="mt-2 flex gap-2">
++                <button
++                  onClick={doMove}
++                  disabled={busy}
++                  className="rounded bg-slate-900 px-3 py-1 text-sm text-white disabled:opacity-40"
++                >
++                  {busy ? "…" : "Confirm"}
++                </button>
++                <button
++                  onClick={() => setConfirmOpen(false)}
++                  className="rounded px-3 py-1 text-sm"
++                >
++                  Cancel
++                </button>
++              </div>
++            </div>
++          )}
++          {!confirmOpen && (
++            <button
++              onClick={handleMoveClick}
++              disabled={busy || !toStage || (needsReason && !reason.trim())}
++              className="mt-2 rounded bg-slate-900 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
++            >
++              {busy ? "Moving…" : "Move"}
++            </button>
++          )}
++        </section>
++
++        {/* Signoff panel */}
++        {pending && (
++          <section className="mb-4 rounded border border-amber-200 bg-amber-50 p-2">
++            <h3 className="text-sm font-semibold">Pending sign-off</h3>
++            <div className="text-xs">
++              {pending.signatory_count} of {pending.signoff_min} signed
++              {typeof pending.remaining === "number" && (
++                <> · {pending.remaining} remaining</>
++              )}
++            </div>
++            <button
++              onClick={doSignoff}
++              disabled={busy}
++              className="mt-2 rounded bg-slate-900 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
++            >
++              {busy ? "…" : "Sign"}
++            </button>
++          </section>
++        )}
++
++        {/* History */}
++        <section>
++          <h3 className="mb-1 text-sm font-semibold">History</h3>
++          <ul className="space-y-1 text-xs">
++            {history.map((h) => (
++              <li key={h.id} className="rounded border p-1">
++                <span className="font-medium">{h.change_type}</span>
++                {h.stage_before != null || h.stage_after != null ? (
++                  <span>
++                    {" "}
++                    {h.stage_before ?? "—"} → {h.stage_after ?? "—"}
++                  </span>
++                ) : null}
++                {h.workflow_id && (
++                  <span className="ml-1 text-slate-400">
++                    (wf {h.workflow_id})
++                  </span>
++                )}
++              </li>
++            ))}
++            {history.length === 0 && (
++              <li className="text-slate-400">No history.</li>
++            )}
++          </ul>
++        </section>
++      </div>
++    </div>
++  );
++}
+\ No newline at end of file
+diff --git a/web/app/mindmaps/[key]/board/WaitingOnYou.tsx b/web/app/mindmaps/[key]/board/WaitingOnYou.tsx
+new file mode 100644
+index 0000000..3816028
+--- /dev/null
++++ b/web/app/mindmaps/[key]/board/WaitingOnYou.tsx
+@@ -0,0 +1,163 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import { useRouter } from "next/navigation";
++import { useBoardRefresh } from "./BoardContext";
++import { csrfHeaders } from "@/lib/csrf";
++
++export interface WaitingOnYouProps {
++  mapKey?: string;
++  teamId?: string;
++  items?: { node_id: string; title: string }[];
++}
++
++interface PendingRow {
++  request_id: string;
++  node_id: string;
++  from_stage: string;
++  to_stage: string;
++  reason: string | null;
++  signoff_min: number;
++  signatory_count: number;
++  remaining: number;
++}
++
++interface SignoffResponse {
++  committed: boolean;
++  signed_count: number;
++  signoff_min: number;
++}
++
++export default function WaitingOnYou({ mapKey, teamId, items }: WaitingOnYouProps) {
++  const router = useRouter();
++  const { boardRefreshKey, bumpRefresh } = useBoardRefresh();
++  const [open, setOpen] = useState(true);
++  const [rows, setRows] = useState<PendingRow[]>([]);
++  const [error, setError] = useState<string | null>(null);
++  const [signing, setSigning] = useState<string | null>(null);
++
++  const itemTitle = (nodeId: string): string => {
++    const it = (items ?? []).find((x) => x.node_id === nodeId);
++    return it?.title ?? nodeId;
++  };
++
++  useEffect(() => {
++    if (!teamId) return;
++    let cancelled = false;
++    async function load() {
++      try {
++        const res = await fetch(
++          `/api/web/teams/${encodeURIComponent(teamId!)}/workflow/pending-signoffs`,
++          { credentials: "same-origin" },
++        );
++        if (res.status === 401) {
++          router.push(`/auth/login?next=${encodeURIComponent(window.location.pathname)}`);
++          return;
++        }
++        if (!res.ok) {
++          const body = (await res.json().catch(() => null)) as { detail?: { message?: string } } | null;
++          if (!cancelled) setError(body?.detail?.message ?? `Failed (${res.status})`);
++          return;
++        }
++        const data = (await res.json()) as PendingRow[];
++        if (!cancelled) {
++          setRows(data);
++          setError(null);
++        }
++      } catch {
++        if (!cancelled) setError("Network error");
++      }
++    }
++    void load();
++    return () => {
++      cancelled = true;
++    };
++  }, [teamId, boardRefreshKey, router]);
++
++  async function sign(row: PendingRow) {
++    if (!mapKey) return;
++    setSigning(row.request_id);
++    setError(null);
++    try {
++      const res = await fetch(
++        `/api/web/mindmaps/${encodeURIComponent(mapKey)}/work-items/${encodeURIComponent(row.node_id)}/signoff`,
++        {
++          method: "POST",
++          headers: csrfHeaders({ "Content-Type": "application/json" }),
++          credentials: "same-origin",
++          body: JSON.stringify({ request_id: row.request_id }),
++        },
++      );
++      if (res.status === 401) {
++        router.push(`/auth/login?next=${encodeURIComponent(window.location.pathname)}`);
++        return;
++      }
++      if (!res.ok) {
++        const body = (await res.json().catch(() => null)) as
++          | { detail?: { code?: string; message?: string }; code?: string; message?: string }
++          | null;
++        const code = body?.detail?.code ?? body?.code;
++        const msg = body?.detail?.message ?? body?.message ?? `Failed (${res.status})`;
++        setError(code === "signoff_complete" ? `signoff_complete: ${msg}` : msg);
++        return;
++      }
++      const data = (await res.json()) as SignoffResponse;
++      if (data.committed) {
++        bumpRefresh();
++      } else {
++        setRows((prev) =>
++          prev.map((r) =>
++            r.request_id === row.request_id
++              ? {
++                  ...r,
++                  signatory_count: data.signed_count,
++                  signoff_min: data.signoff_min,
++                  remaining: data.signoff_min - data.signed_count,
++                }
++              : r,
++          ),
++        );
++      }
++    } catch {
++      setError("Network error");
++    } finally {
++      setSigning(null);
++    }
++  }
++
++  if (!teamId) return null;
++
++  return (
++    <div className="mt-4 rounded border p-2">
++      <button type="button" onClick={() => setOpen((o) => !o)} className="font-semibold">
++        {open ? "▼" : "▶"} Waiting on you ({rows.length})
++      </button>
++      {error && <div className="text-xs text-rose-600">{error}</div>}
++      {open && (
++        <ul className="mt-2 space-y-2">
++          {rows.map((r) => (
++            <li key={r.request_id} className="rounded border p-2 text-xs">
++              <div>
++                {r.from_stage} → {r.to_stage}
++              </div>
++              <div className="truncate">{itemTitle(r.node_id)}</div>
++              {r.reason && <div>{r.reason}</div>}
++              <div>
++                awaiting {r.signatory_count} of {r.signoff_min} (remaining {r.remaining})
++              </div>
++              <button
++                type="button"
++                disabled={signing === r.request_id}
++                onClick={() => void sign(r)}
++                className="mt-1 rounded bg-slate-900 px-2 py-1 text-white disabled:opacity-40"
++              >
++                {signing === r.request_id ? "Signing…" : "Sign"}
++              </button>
++            </li>
++          ))}
++          {rows.length === 0 && <li className="text-xs text-slate-500">Nothing waiting.</li>}
++        </ul>
++      )}
++    </div>
++  );
++}
+\ No newline at end of file
+diff --git a/web/app/mindmaps/[key]/board/page.tsx b/web/app/mindmaps/[key]/board/page.tsx
+new file mode 100644
+index 0000000..30eb04d
+--- /dev/null
++++ b/web/app/mindmaps/[key]/board/page.tsx
+@@ -0,0 +1,75 @@
++import { notFound } from "next/navigation";
++import { serverApiFetchResult } from "@/lib/server-api";
++import { BoardRefreshProvider } from "./BoardContext";
++import BoardView, { type BoardItem, type Stage } from "./BoardView";
++
++export const dynamic = "force-dynamic";
++
++interface WorkListOutput {
++  team_id: string;
++  items: BoardItem[];
++}
++
++interface WorkflowOutput {
++  stages: Stage[];
++}
++
++export default async function BoardPage({
++  params,
++}: {
++  params: Promise<{ key: string }>;
++}) {
++  const { key } = await params;
++  const mapKey = decodeURIComponent(key);
++
++  const wl = await serverApiFetchResult<WorkListOutput>(
++    `/api/web/mindmaps/${encodeURIComponent(mapKey)}/work-items`,
++    { redirectTo: `/mindmaps/${key}/board` },
++  );
++
++  if (wl.status === 404 || !wl.ok || !wl.data) {
++    if (wl.status === 404) notFound();
++    // non-401/404 failure -> distinct error state
++    return (
++      <main className="mx-auto max-w-[1400px] px-4 py-6">
++        <div className="rounded border border-rose-300 bg-rose-50 px-4 py-3 text-rose-800">
++          Failed to load board ({wl.status}). Please retry.
++        </div>
++      </main>
++    );
++  }
++  // 401 handled by redirect inside helper
++  const workList = wl.data;
++
++  const teamId = workList.team_id;
++  const wf = await serverApiFetchResult<WorkflowOutput>(
++    `/api/web/teams/${teamId}/workflow`,
++    { redirectTo: `/mindmaps/${key}/board` },
++  );
++  // Fall back to empty stages on 404 / not-found / no active workflow.
++  let stages: Stage[] = [];
++  if (wf.ok && wf.data) {
++    stages = wf.data.stages ?? [];
++  } else if (wf.status !== 404 && wf.status !== 401) {
++    return (
++      <main className="mx-auto max-w-[1400px] px-4 py-6">
++        <div className="rounded border border-rose-300 bg-rose-50 px-4 py-3 text-rose-800">
++          Failed to load workflow ({wf.status}). Please retry.
++        </div>
++      </main>
++    );
++  }
++
++  return (
++    <main className="mx-auto max-w-[1400px] px-4 py-6">
++      <BoardRefreshProvider>
++        <BoardView
++          items={workList.items}
++          stages={stages}
++          mapKey={mapKey}
++          teamId={teamId}
++        />
++      </BoardRefreshProvider>
++    </main>
++  );
++}
+diff --git a/web/app/teams/[team_id]/workflow/WorkflowEditor.tsx b/web/app/teams/[team_id]/workflow/WorkflowEditor.tsx
+new file mode 100644
+index 0000000..4af5f3d
+--- /dev/null
++++ b/web/app/teams/[team_id]/workflow/WorkflowEditor.tsx
+@@ -0,0 +1,302 @@
++"use client";
++
++import { useEffect, useState } from "react";
++
++export interface WorkflowTransition {
++  from_stage: string;
++  to_stage: string;
++  requires_reason: boolean;
++  requires_signoff: boolean;
++  signoff_min: number;
++  signoff_roles: string[];
++  allowed_kinds: string[];
++}
++
++interface StageRow {
++  name: string;
++  is_initial: boolean;
++  is_terminal: boolean;
++}
++
++interface WorkflowEditorProps {
++  stages: string[];
++  teamRoles: string[];
++  workKinds: readonly string[];
++  onStagesChange: (stages: string[]) => void;
++  onTransitionsChange: (transitions: WorkflowTransition[]) => void;
++  transitions?: WorkflowTransition[];
++}
++
++export function WorkflowEditor({
++  stages,
++  teamRoles,
++  workKinds,
++  onStagesChange,
++  onTransitionsChange,
++  transitions: initialTransitions,
++}: WorkflowEditorProps) {
++  const [stageRows, setStageRows] = useState<StageRow[]>(() =>
++    (stages ?? []).map((s) => ({ name: s, is_initial: false, is_terminal: false }))
++  );
++  const [transitionRows, setTransitionRows] = useState<WorkflowTransition[]>(
++    () => (initialTransitions ?? []).slice()
++  );
++
++  // Keep local stage rows in sync when the parent passes a different list.
++  useEffect(() => {
++    setStageRows((prev) => {
++      if (prev.length === stages.length && prev.every((r, i) => r.name === stages[i])) {
++        return prev;
++      }
++      return (stages ?? []).map((s) => {
++        const existing = prev.find((r) => r.name === s);
++        return existing
++          ? { ...existing, name: s }
++          : { name: s, is_initial: false, is_terminal: false };
++      });
++    });
++  }, [stages]);
++
++  // Notify parent of stage name changes.
++  useEffect(() => {
++    onStagesChange(stageRows.map((r) => r.name));
++  }, [stageRows, onStagesChange]);
++
++  // Notify parent of transition changes.
++  useEffect(() => {
++    onTransitionsChange(transitionRows);
++  }, [transitionRows, onTransitionsChange]);
++
++  const stageNames = stageRows.map((r) => r.name).filter((n) => n.trim() !== "");
++
++  function updateStage(index: number, patch: Partial<StageRow>) {
++    setStageRows((prev) =>
++      prev.map((r, i) => (i === index ? { ...r, ...patch } : r))
++    );
++  }
++
++  function addStage() {
++    setStageRows((prev) => [...prev, { name: "", is_initial: false, is_terminal: false }]);
++  }
++
++  function removeStage(index: number) {
++    setStageRows((prev) => prev.filter((_, i) => i !== index));
++  }
++
++  function addTransition() {
++    setTransitionRows((prev) => [
++      ...prev,
++      {
++        from_stage: "any",
++        to_stage: stageNames[0] ?? "",
++        requires_reason: false,
++        requires_signoff: false,
++        signoff_min: 1,
++        signoff_roles: [],
++        allowed_kinds: [],
++      },
++    ]);
++  }
++
++  function removeTransition(index: number) {
++    setTransitionRows((prev) => prev.filter((_, i) => i !== index));
++  }
++
++  function updateTransition(index: number, patch: Partial<WorkflowTransition>) {
++    setTransitionRows((prev) =>
++      prev.map((r, i) => (i === index ? { ...r, ...patch } : r))
++    );
++  }
++
++  function toggleMulti(
++    list: string[],
++    value: string
++  ): string[] {
++    return list.includes(value)
++      ? list.filter((v) => v !== value)
++      : [...list, value];
++  }
++
++  return (
++    <div className="space-y-6">
++      <section className="space-y-2">
++        <h3 className="text-lg font-semibold">Stages</h3>
++        <div className="space-y-2">
++          {stageRows.map((row, idx) => (
++            <div key={idx} className="flex items-center gap-2 border rounded p-2">
++              <span className="text-xs text-gray-500 w-6">{idx + 1}</span>
++              <input
++                type="text"
++                value={row.name}
++                onChange={(e) => updateStage(idx, { name: e.target.value })}
++                placeholder="stage name"
++                className="border rounded px-2 py-1 flex-1"
++              />
++              <label className="flex items-center gap-1 text-sm">
++                <input
++                  type="checkbox"
++                  checked={row.is_initial}
++                  onChange={(e) => updateStage(idx, { is_initial: e.target.checked })}
++                />
++                initial
++              </label>
++              <label className="flex items-center gap-1 text-sm">
++                <input
++                  type="checkbox"
++                  checked={row.is_terminal}
++                  onChange={(e) => updateStage(idx, { is_terminal: e.target.checked })}
++                />
++                terminal
++              </label>
++              <button
++                type="button"
++                onClick={() => removeStage(idx)}
++                className="text-red-600 text-sm"
++              >
++                remove
++              </button>
++            </div>
++          ))}
++        </div>
++        <button
++          type="button"
++          onClick={addStage}
++          className="bg-blue-600 text-white rounded px-3 py-1 text-sm"
++        >
++          Add stage
++        </button>
++      </section>
++
++      <section className="space-y-2">
++        <h3 className="text-lg font-semibold">Transitions</h3>
++        <div className="space-y-3">
++          {transitionRows.map((tr, idx) => (
++            <div key={idx} className="border rounded p-3 space-y-2">
++              <div className="flex items-center gap-2">
++                <select
++                  value={tr.from_stage}
++                  onChange={(e) => updateTransition(idx, { from_stage: e.target.value })}
++                  className="border rounded px-2 py-1"
++                >
++                  <option value="any">any</option>
++                  {stageNames.map((s) => (
++                    <option key={s} value={s}>
++                      {s}
++                    </option>
++                  ))}
++                </select>
++                <span>→</span>
++                <select
++                  value={tr.to_stage}
++                  onChange={(e) => updateTransition(idx, { to_stage: e.target.value })}
++                  className="border rounded px-2 py-1"
++                >
++                  {stageNames.map((s) => (
++                    <option key={s} value={s}>
++                      {s}
++                    </option>
++                  ))}
++                </select>
++                <button
++                  type="button"
++                  onClick={() => removeTransition(idx)}
++                  className="text-red-600 text-sm"
++                >
++                  remove
++                </button>
++              </div>
++
++              <div className="flex items-center gap-4 text-sm">
++                <label className="flex items-center gap-1">
++                  <input
++                    type="checkbox"
++                    checked={tr.requires_reason}
++                    onChange={(e) =>
++                      updateTransition(idx, { requires_reason: e.target.checked })
++                    }
++                  />
++                  requires reason
++                </label>
++                <label className="flex items-center gap-1">
++                  <input
++                    type="checkbox"
++                    checked={tr.requires_signoff}
++                    onChange={(e) =>
++                      updateTransition(idx, {
++                        requires_signoff: e.target.checked,
++                        signoff_min: e.target.checked ? Math.max(1, tr.signoff_min) : tr.signoff_min,
++                      })
++                    }
++                  />
++                  requires signoff
++                </label>
++                <label className="flex items-center gap-1">
++                  signoff min
++                  <input
++                    type="number"
++                    min={1}
++                    value={tr.signoff_min}
++                    disabled={!tr.requires_signoff}
++                    onChange={(e) =>
++                      updateTransition(idx, {
++                        signoff_min: Math.max(1, parseInt(e.target.value, 10) || 1),
++                      })
++                    }
++                    className="border rounded px-2 py-1 w-16"
++                  />
++                </label>
++              </div>
++
++              <div className="text-sm">
++                <div className="font-medium">signoff roles</div>
++                <div className="flex flex-wrap gap-2">
++                  {teamRoles.map((role) => (
++                    <label key={role} className="flex items-center gap-1">
++                      <input
++                        type="checkbox"
++                        checked={tr.signoff_roles.includes(role)}
++                        onChange={() =>
++                          updateTransition(idx, {
++                            signoff_roles: toggleMulti(tr.signoff_roles, role),
++                          })
++                        }
++                      />
++                      {role}
++                    </label>
++                  ))}
++                </div>
++              </div>
++
++              <div className="text-sm">
++                <div className="font-medium">allowed kinds</div>
++                <div className="flex flex-wrap gap-2">
++                  {workKinds.map((kind) => (
++                    <label key={kind} className="flex items-center gap-1">
++                      <input
++                        type="checkbox"
++                        checked={tr.allowed_kinds.includes(kind)}
++                        onChange={() =>
++                          updateTransition(idx, {
++                            allowed_kinds: toggleMulti(tr.allowed_kinds, kind),
++                          })
++                        }
++                      />
++                      {kind}
++                    </label>
++                  ))}
++                </div>
++              </div>
++            </div>
++          ))}
++        </div>
++        <button
++          type="button"
++          onClick={addTransition}
++          className="bg-blue-600 text-white rounded px-3 py-1 text-sm"
++        >
++          Add transition
++        </button>
++      </section>
++    </div>
++  );
++}
+diff --git a/web/app/teams/[team_id]/workflow/WorkflowSettingsClient.tsx b/web/app/teams/[team_id]/workflow/WorkflowSettingsClient.tsx
+new file mode 100644
+index 0000000..5059c6e
+--- /dev/null
++++ b/web/app/teams/[team_id]/workflow/WorkflowSettingsClient.tsx
+@@ -0,0 +1,415 @@
++"use client";
++
++import { useRouter } from "next/navigation";
++import { useState } from "react";
++import { csrfHeaders } from "@/lib/csrf";
++import { WorkflowEditor, type WorkflowTransition } from "./WorkflowEditor";
++
++interface Stage {
++  stage_id: string;
++  workflow_id: string;
++  name: string;
++  ordinal: number;
++  is_initial: boolean;
++  is_terminal: boolean;
++}
++
++interface Transition {
++  transition_id: string;
++  workflow_id: string;
++  from_stage_id: string | null;
++  to_stage_id: string;
++  requires_reason: boolean;
++  requires_signoff: boolean;
++  signoff_min: number;
++  signoff_roles: string[] | null;
++  allowed_kinds: string[] | null;
++}
++
++interface Workflow {
++  workflow_id: string;
++  tenant_id: string;
++  team_id: string;
++  name: string;
++  is_active: boolean;
++  version: number;
++  created_by: string;
++  created_at: string;
++  stages: Stage[];
++  transitions: Transition[];
++}
++
++interface WorkflowSettingsClientProps {
++  workflow: Workflow;
++  teamRoles: string[];
++}
++
++const WORK_KINDS = ["story", "epic", "milestone"] as const;
++
++export function WorkflowSettingsClient({
++  workflow,
++  teamRoles,
++}: WorkflowSettingsClientProps) {
++  const router = useRouter();
++
++  // Active view state derived from workflow prop.
++  const stageById = new Map(workflow.stages.map((s) => [s.stage_id, s]));
++
++  // Create form state
++  const [createName, setCreateName] = useState("");
++  const [createStages, setCreateStages] = useState<string[]>([]);
++  const [createTransitions, setCreateTransitions] = useState<WorkflowTransition[]>([]);
++  const [createErrors, setCreateErrors] = useState<Record<string, string>>({});
++  const [createBanner, setCreateBanner] = useState("");
++  const [createdWorkflowId, setCreatedWorkflowId] = useState<string | null>(null);
++  const [activating, setActivating] = useState(false);
++  const [creating, setCreating] = useState(false);
++
++  // Remap form state
++  const [mapKey, setMapKey] = useState("");
++  const [remapRows, setRemapRows] = useState<{ old: string; neu: string }[]>([
++    { old: "", neu: "" },
++  ]);
++  const [remapBanner, setRemapBanner] = useState("");
++  const [remapToast, setRemapToast] = useState("");
++  const [remapping, setRemapping] = useState(false);
++
++  async function handleCreate(e: React.FormEvent) {
++    e.preventDefault();
++    setCreateErrors({});
++    setCreateBanner("");
++    setCreatedWorkflowId(null);
++    setCreating(true);
++    try {
++      const body = {
++        name: createName,
++        stages: createStages.map((name, idx) => ({
++          name,
++          ordinal: idx,
++          is_initial: false,
++          is_terminal: false,
++        })),
++        transitions: createTransitions.map((t) => ({
++          from_stage: t.from_stage === "any" ? null : t.from_stage,
++          to_stage: t.to_stage,
++          requires_reason: t.requires_reason,
++          requires_signoff: t.requires_signoff,
++          signoff_min: t.signoff_min,
++          signoff_roles: t.signoff_roles,
++          allowed_kinds: t.allowed_kinds,
++        })),
++      };
++      const res = await fetch(`/api/web/teams/${workflow.team_id}/workflow`, {
++        method: "POST",
++        headers: csrfHeaders({ "Content-Type": "application/json" }),
++        body: JSON.stringify(body),
++        credentials: "same-origin",
++      });
++      if (res.ok) {
++        const data = (await res.json()) as { workflow_id: string };
++        setCreatedWorkflowId(data.workflow_id);
++        router.refresh();
++      } else if (res.status === 422) {
++        const data = (await res.json()) as { detail?: unknown };
++        const errs: Record<string, string> = {};
++        if (Array.isArray(data.detail)) {
++          for (const d of data.detail as { loc?: unknown[]; msg?: string }[]) {
++            const path = Array.isArray(d.loc) ? d.loc.join(".") : "field";
++            errs[path] = d.msg ?? "invalid";
++          }
++        } else if (typeof data.detail === "string") {
++          setCreateBanner(data.detail);
++        }
++        setCreateErrors(errs);
++      } else {
++        const data = (await res.json().catch(() => ({}))) as {
++          message?: string;
++          code?: string;
++          detail?: unknown;
++        };
++        setCreateBanner(
++          data.code || data.message
++            ? `${data.code ?? ""} ${data.message ?? ""}`.trim()
++            : `HTTP ${res.status}`
++        );
++      }
++    } catch (err) {
++      setCreateBanner(err instanceof Error ? err.message : "unknown error");
++    } finally {
++      setCreating(false);
++    }
++  }
++
++  async function handleActivate() {
++    if (!createdWorkflowId) return;
++    setActivating(true);
++    setCreateBanner("");
++    try {
++      const res = await fetch(
++        `/api/web/teams/${workflow.team_id}/workflow/${createdWorkflowId}/activate`,
++        {
++          method: "POST",
++          headers: csrfHeaders(),
++          credentials: "same-origin",
++        }
++      );
++      if (res.ok) {
++        router.refresh();
++      } else {
++        const data = (await res.json().catch(() => ({}))) as {
++          message?: string;
++          code?: string;
++        };
++        setCreateBanner(
++          `${data.code ?? ""} ${data.message ?? ""}`.trim() || `HTTP ${res.status}`
++        );
++      }
++    } finally {
++      setActivating(false);
++    }
++  }
++
++  async function handleRemap(e: React.FormEvent) {
++    e.preventDefault();
++    setRemapBanner("");
++    setRemapToast("");
++    setRemapping(true);
++    try {
++      const mappings: Record<string, string> = {};
++      for (const row of remapRows) {
++        if (row.old.trim() && row.neu.trim()) {
++          mappings[row.old.trim()] = row.neu.trim();
++        }
++      }
++      const body = { map_key: mapKey, mappings };
++      const res = await fetch(`/api/web/teams/${workflow.team_id}/workflow/remap`, {
++        method: "POST",
++        headers: csrfHeaders({ "Content-Type": "application/json" }),
++        body: JSON.stringify(body),
++        credentials: "same-origin",
++      });
++      if (res.ok) {
++        const data = (await res.json()) as { updated_count: number };
++        setRemapToast(`Updated ${data.updated_count} items`);
++        router.refresh();
++      } else if (res.status === 422) {
++        const data = (await res.json()) as { detail?: unknown };
++        setRemapBanner(
++          typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`
++        );
++      } else {
++        const data = (await res.json().catch(() => ({}))) as {
++          message?: string;
++          code?: string;
++        };
++        setRemapBanner(
++          `${data.code ?? ""} ${data.message ?? ""}`.trim() || `HTTP ${res.status}`
++        );
++      }
++    } catch (err) {
++      setRemapBanner(err instanceof Error ? err.message : "unknown error");
++    } finally {
++      setRemapping(false);
++    }
++  }
++
++  return (
++    <div className="space-y-8">
++      {/* Active view */}
++      <section className="space-y-3">
++        <h2 className="text-xl font-semibold">Active workflow: {workflow.name}</h2>
++        <div className="text-sm text-gray-600">
++          version {workflow.version} {workflow.is_active ? "(active)" : ""}
++        </div>
++        <div>
++          <h3 className="font-medium">Stages (ordered)</h3>
++          <ol className="list-decimal pl-5 space-y-1">
++            {workflow.stages
++              .slice()
++              .sort((a, b) => a.ordinal - b.ordinal)
++              .map((s) => (
++                <li key={s.stage_id}>
++                  {s.name}
++                  {s.is_initial ? " [initial]" : ""}
++                  {s.is_terminal ? " [terminal]" : ""} (ordinal {s.ordinal})
++                </li>
++              ))}
++          </ol>
++        </div>
++        <div>
++          <h3 className="font-medium">Transitions</h3>
++          <table className="w-full text-sm border">
++            <thead>
++              <tr>
++                <th className="border px-2">from</th>
++                <th className="border px-2">to</th>
++                <th className="border px-2">requires_reason</th>
++                <th className="border px-2">requires_signoff</th>
++                <th className="border px-2">signoff_min</th>
++                <th className="border px-2">signoff_roles</th>
++                <th className="border px-2">allowed_kinds</th>
++              </tr>
++            </thead>
++            <tbody>
++              {workflow.transitions.map((t) => (
++                <tr key={t.transition_id}>
++                  <td className="border px-2">
++                    {t.from_stage_id
++                      ? stageById.get(t.from_stage_id)?.name ?? t.from_stage_id
++                      : "any"}
++                  </td>
++                  <td className="border px-2">
++                    {stageById.get(t.to_stage_id)?.name ?? t.to_stage_id}
++                  </td>
++                  <td className="border px-2">{String(t.requires_reason)}</td>
++                  <td className="border px-2">{String(t.requires_signoff)}</td>
++                  <td className="border px-2">{t.signoff_min}</td>
++                  <td className="border px-2">
++                    {(t.signoff_roles ?? []).join(", ")}
++                  </td>
++                  <td className="border px-2">
++                    {(t.allowed_kinds ?? []).join(", ")}
++                  </td>
++                </tr>
++              ))}
++            </tbody>
++          </table>
++        </div>
++      </section>
++
++      {/* Create form */}
++      <section className="border rounded p-4 space-y-3">
++        <h2 className="text-xl font-semibold">Create workflow</h2>
++        <form onSubmit={handleCreate} className="space-y-3">
++          <div>
++            <label className="block text-sm font-medium">Name</label>
++            <input
++              type="text"
++              value={createName}
++              onChange={(e) => setCreateName(e.target.value)}
++              className="border rounded px-2 py-1 w-full"
++            />
++            {createErrors["body.name"] || createErrors["name"] ? (
++              <p className="text-red-600 text-xs">
++                {createErrors["body.name"] ?? createErrors["name"]}
++              </p>
++            ) : null}
++          </div>
++
++          <WorkflowEditor
++            stages={createStages}
++            teamRoles={teamRoles}
++            workKinds={WORK_KINDS}
++            onStagesChange={setCreateStages}
++            onTransitionsChange={setCreateTransitions}
++          />
++
++          {Object.keys(createErrors).length > 0 && (
++            <div className="text-red-600 text-xs">
++              {Object.entries(createErrors).map(([k, v]) => (
++                <div key={k}>
++                  {k}: {v}
++                </div>
++              ))}
++            </div>
++          )}
++          {createBanner && <p className="text-red-600 text-sm">{createBanner}</p>}
++
++          <button
++            type="submit"
++            disabled={creating}
++            className="bg-blue-600 text-white rounded px-4 py-2 disabled:opacity-50"
++          >
++            {creating ? "Creating…" : "Create"}
++          </button>
++        </form>
++
++        {createdWorkflowId && (
++          <div className="space-y-2">
++            <p className="text-green-700 text-sm">
++              Created workflow: {createdWorkflowId}
++            </p>
++            <button
++              type="button"
++              onClick={handleActivate}
++              disabled={activating}
++              className="bg-green-600 text-white rounded px-4 py-2 disabled:opacity-50"
++            >
++              {activating ? "Activating…" : "Activate"}
++            </button>
++          </div>
++        )}
++      </section>
++
++      {/* Remap form */}
++      <section className="border rounded p-4 space-y-3">
++        <h2 className="text-xl font-semibold">Remap stages</h2>
++        <form onSubmit={handleRemap} className="space-y-3">
++          <div>
++            <label className="block text-sm font-medium">Map key</label>
++            <input
++              type="text"
++              value={mapKey}
++              onChange={(e) => setMapKey(e.target.value)}
++              className="border rounded px-2 py-1 w-full"
++            />
++          </div>
++          <div className="space-y-2">
++            {remapRows.map((row, idx) => (
++              <div key={idx} className="flex gap-2">
++                <input
++                  type="text"
++                  placeholder="old stage"
++                  value={row.old}
++                  onChange={(e) => {
++                    const next = [...remapRows];
++                    next[idx] = { ...next[idx], old: e.target.value };
++                    setRemapRows(next);
++                  }}
++                  className="border rounded px-2 py-1 flex-1"
++                />
++                <span>→</span>
++                <input
++                  type="text"
++                  placeholder="new stage"
++                  value={row.neu}
++                  onChange={(e) => {
++                    const next = [...remapRows];
++                    next[idx] = { ...next[idx], neu: e.target.value };
++                    setRemapRows(next);
++                  }}
++                  className="border rounded px-2 py-1 flex-1"
++                />
++                <button
++                  type="button"
++                  onClick={() =>
++                    setRemapRows((prev) => prev.filter((_, i) => i !== idx))
++                  }
++                  className="text-red-600 text-sm"
++                >
++                  remove
++                </button>
++              </div>
++            ))}
++            <button
++              type="button"
++              onClick={() => setRemapRows((prev) => [...prev, { old: "", neu: "" }])}
++              className="bg-blue-600 text-white rounded px-3 py-1 text-sm"
++            >
++              Add mapping
++            </button>
++          </div>
++          {remapBanner && <p className="text-red-600 text-sm">{remapBanner}</p>}
++          {remapToast && <p className="text-green-700 text-sm">{remapToast}</p>}
++          <button
++            type="submit"
++            disabled={remapping}
++            className="bg-blue-600 text-white rounded px-4 py-2 disabled:opacity-50"
++          >
++            {remapping ? "Remapping…" : "Remap"}
++          </button>
++        </form>
++      </section>
++    </div>
++  );
++}
+diff --git a/web/app/teams/[team_id]/workflow/page.tsx b/web/app/teams/[team_id]/workflow/page.tsx
+new file mode 100644
+index 0000000..dfd4ca4
+--- /dev/null
++++ b/web/app/teams/[team_id]/workflow/page.tsx
+@@ -0,0 +1,88 @@
++import { notFound } from "next/navigation";
++import { serverApiFetchResult } from "@/lib/server-api";
++import { WorkflowSettingsClient } from "./WorkflowSettingsClient";
++
++interface Stage {
++  stage_id: string;
++  workflow_id: string;
++  name: string;
++  ordinal: number;
++  is_initial: boolean;
++  is_terminal: boolean;
++}
++
++interface Transition {
++  transition_id: string;
++  workflow_id: string;
++  from_stage_id: string | null;
++  to_stage_id: string;
++  requires_reason: boolean;
++  requires_signoff: boolean;
++  signoff_min: number;
++  signoff_roles: string[] | null;
++  allowed_kinds: string[] | null;
++}
++
++interface Workflow {
++  workflow_id: string;
++  tenant_id: string;
++  team_id: string;
++  name: string;
++  is_active: boolean;
++  version: number;
++  created_by: string;
++  created_at: string;
++  stages: Stage[];
++  transitions: Transition[];
++}
++
++interface Member {
++  tenant_id: string;
++  role: string;
++  status: string;
++  added_at: string;
++  identity_email: string | null;
++  provider: string | null;
++}
++
++interface MembersResponse {
++  members: Member[];
++  invites: unknown[];
++}
++
++export default async function WorkflowSettingsPage({
++  params,
++}: {
++  params: Promise<{ team_id: string }>;
++}) {
++  const { team_id } = await params;
++
++  const wfRes = await serverApiFetchResult<Workflow>(
++    `/api/web/teams/${team_id}/workflow`,
++    { redirectTo: `/teams/${team_id}/workflow` }
++  );
++  if (!wfRes.ok || !wfRes.data) {
++    if (wfRes.status === 404) notFound();
++    notFound();
++  }
++
++  const memRes = await serverApiFetchResult<MembersResponse>(
++    `/api/web/teams/${team_id}/members`,
++    { redirectTo: `/teams/${team_id}/workflow` }
++  );
++  if (!memRes.ok || !memRes.data) {
++    if (memRes.status === 404) notFound();
++    notFound();
++  }
++
++  const teamRoles = Array.from(
++    new Set(memRes.data.members.map((m) => m.role))
++  );
++
++  return (
++    <main className="mx-auto max-w-5xl px-4 py-8 space-y-6">
++      <h1 className="text-2xl font-bold">Team workflow</h1>
++      <WorkflowSettingsClient workflow={wfRes.data} teamRoles={teamRoles} />
++    </main>
++  );
++}
